@@ -98,8 +98,9 @@ zoop_api:                     # fill in when the in-house APIs are ready
     retries: 3                # 429 / 5xx / timeout / connection error; 401/403 never retried
     backoff_s: 1              # 1 s, 2 s, 4 s …
     max_total_s: 400          # no new retry after this; worst case ≈ max_total_s + timeout_s
-  ocr:                        # contract: docs/api-samples/ocr/README.md (dev endpoint; production URL at Phase H)
-    url: https://dev-ai.zoop.one/parsely-top-layer/v1/ocr/do
+  ocr:                        # contract: docs/api-samples/ocr/README.md
+    url_env: ESTAMP_OCR_URL   # PRODUCTION endpoint comes from .env; dev falls back to `url` below
+    url: https://dev-ai.zoop.one/parsely-top-layer/v1/ocr/do   # dev fallback only – set ESTAMP_OCR_URL for go-live
     config_id: ocrc_2f0e4e33ae22475f976e4787d62e08e2
     api_key_env: ZOOP_OCR_API_KEY       # names of the .env variables – never the values
     org_acc_env: ZOOP_OCR_ORG_ACC

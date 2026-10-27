@@ -175,8 +175,10 @@ def _check(s, db, google) -> int:
     line(True, "split", s.get("intake.split_provider", "local"))
     ocr = s.get("intake.ocr_provider", "drive")
     if ocr == "zoop_api":
-        line(bool(s.get("zoop_api.ocr.url")) and bool(s.env("zoop_api.ocr.api_key_env")), "OCR: in-house API",
-             "url + key set" if s.get("zoop_api.ocr.url") else "zoop_api.ocr.url missing")
+        ocr_url = s.env("zoop_api.ocr.url_env") or s.get("zoop_api.ocr.url")
+        src = "env ESTAMP_OCR_URL" if s.env("zoop_api.ocr.url_env") else "config (dev fallback)"
+        line(bool(ocr_url) and bool(s.env("zoop_api.ocr.api_key_env")), "OCR: in-house API",
+             f"url via {src} + key set" if ocr_url else "OCR url missing – set ESTAMP_OCR_URL in .env")
     else:
         line(True, "OCR: Google Drive OCR")
     # A delivery channel (Slack/email) is what carries failure alerts; heartbeat is only a liveness
