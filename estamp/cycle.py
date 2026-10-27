@@ -27,7 +27,20 @@ from .outputs import run_outputs
 def run_cycle(ctx: Ctx) -> bool:
     s, db = ctx.settings, ctx.db
     if not db.try_lock():
-        log.warning("another run is in progress – skipping this cycle")
+        # Another cycle holds the lock. A brief overlap is normal, but a run still going long past a normal
+        # cycle means the holder is wedged and silently blocking all work – escalate so ops hear it (#3).
+        age = db.active_run_age_seconds()
+        wedged = float(s.get("alerts.wedged_run_minutes", 30)) * 60
+        if not ctx.dry and age is not None and age > wedged:
+            ctx.event("ERROR", "Cycle", f"a cycle has been running {age / 60:.0f} min and is blocking every new "
+                      "cycle – the process is likely wedged. Restart `python -m estamp run`.", alert_key="cycle_wedged")
+            try:
+                _send(ctx)              # we return early, so the normal end-of-cycle delivery never runs
+                ctx.heartbeat(False)    # tell the external monitor we are not healthy
+            except Exception as e:
+                log.error(f"wedged-cycle alert failed: {e}")
+        else:
+            log.warning("another run is in progress – skipping this cycle")
         return True
     run_id = db.start_run()
     ok = True
