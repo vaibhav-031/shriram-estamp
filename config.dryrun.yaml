@@ -37,6 +37,7 @@ folders:
 control_sheet_id: 18dYDpHZnjgvtSLYNCjUTB4qZUYProSd0ivs_dBfyjFc
 
 state_config_file: state_config.csv
+vendors_file: vendors.csv
 
 orders:
   settle_minutes: 0          # ignore sheets edited in the last N minutes (someone may still be filling them)
