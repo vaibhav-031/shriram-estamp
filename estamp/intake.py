@@ -12,6 +12,7 @@ Re-running is safe: pages already in the ledger are skipped.
 """
 from __future__ import annotations
 
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -348,6 +349,18 @@ def _process_upload(ctx: Ctx, f: dict, vendor_code: str = "") -> None:
     ctx.event("INFO", "Intake", f"'{f['name']}': {len(units)} paper(s) processed", ref=f["id"])
 
 
+_stock_name_locks: dict[str, threading.Lock] = {}
+_stock_name_guard = threading.Lock()
+
+
+def _stock_name_lock(name: str) -> threading.Lock:
+    """One lock per target file name, so the check-reuse-upload-insert for a given cert is serialized across
+    the intake worker threads (#9): two papers with the SAME cert in one cycle must not race the orphan check
+    and collapse onto one file. Different names never contend."""
+    with _stock_name_guard:
+        return _stock_name_locks.setdefault(name, threading.Lock())
+
+
 def _reuse_or_upload(ctx: Ctx, folder: str, name: str, data: bytes) -> str:
     """Return a Drive file id for data at folder/name. If a crashed prior attempt already uploaded this file
     (same folder+name) and no paper row points at it yet, reuse that orphan instead of creating a duplicate –
@@ -378,18 +391,22 @@ def _stock_unit(ctx: Ctx, up: dict, upload_name: str, u: Unit, vendor_code: str 
     if a.ok:
         folder = g.folder_path(s.folder(INVENTORY_ROOT), [a.state, str(a.amount)])
         name = f"{a.cert}.pdf"
-        file_id = _reuse_or_upload(ctx, folder, name, data)
-        try:
-            db.insert_paper(**fields, drive_file_id=file_id, file_name=name, status="AVAILABLE")
-            with ctx._lock:
-                ctx.stats.papers_in += 1
-            return
-        except UniqueViolation:
-            a.issues.append(f"duplicate certificate {a.cert} – already in stock")
-            reason = "; ".join(a.issues)
-            g.move_rename(file_id, g.folder_path(s.folder(NEEDS_REVIEW), [ctx.today().isoformat()]), review_name)
-            db.insert_paper(**fields, drive_file_id=file_id, file_name=review_name, status="NEEDS_REVIEW",
-                            notes=reason)
+        # Serialize per cert name so a same-cert pair in one cycle can't both pass the orphan check and lose
+        # the second paper onto one file (#9). The first to finish stocks it; the second then uploads its own
+        # file and lands in Needs Review as the duplicate it is.
+        with _stock_name_lock(name):
+            file_id = _reuse_or_upload(ctx, folder, name, data)
+            try:
+                db.insert_paper(**fields, drive_file_id=file_id, file_name=name, status="AVAILABLE")
+                with ctx._lock:
+                    ctx.stats.papers_in += 1
+                return
+            except UniqueViolation:
+                a.issues.append(f"duplicate certificate {a.cert} – already in stock")
+                reason = "; ".join(a.issues)
+                g.move_rename(file_id, g.folder_path(s.folder(NEEDS_REVIEW), [ctx.today().isoformat()]), review_name)
+                db.insert_paper(**fields, drive_file_id=file_id, file_name=review_name, status="NEEDS_REVIEW",
+                                notes=reason)
     else:
         # E-06: these reach Needs Review only AFTER the automatic second OCR attempt also failed. Where an E-code fits
         # the leftover reason, stamp it so ops see it (E120 no cert, E124 unreadable amount).
