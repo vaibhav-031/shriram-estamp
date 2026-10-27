@@ -64,3 +64,6 @@ test5: ## Run the suite 5× in a row (required before committing – CLAUDE.md)
 		echo "--- run $$i/5 ---"; \
 		ESTAMP_TEST_DB_URL=$(ESTAMP_TEST_DB_URL) uv run pytest -q tests/ || exit 1; \
 	done
+
+test-docker: ## Run the suite 5× against a throwaway Dockerized Postgres (no local DB needed)
+	@scripts/with-test-db.sh
