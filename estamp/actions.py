@@ -24,16 +24,17 @@ from .db import UniqueViolation
 from .extract import id_format_ok, parse_amount
 from .outputs import output_sheet_id
 
-REVIEW_TAB, ORDER_TAB = "Review Actions", "Order Actions"
+REVIEW_TAB, ORDER_TAB, MANUAL_TAB = "Review Actions", "Order Actions", "Manual Issues"
 REVIEW_HEADER = ["Paper ID", "Action", "Cert No", "State", "Stamp Duty", "Edited By", "Result", "Processed At"]
 ORDER_HEADER = ["LAN ID", "Action", "State", "Result", "Processed At"]
+MANUAL_HEADER = ["LAN ID", "Certificate No", "Issued By", "Result", "Processed At"]
 
 
 def run_actions(ctx: Ctx) -> None:
     sid = ctx.settings.get("control_sheet_id")
     if not sid or ctx.dry:
         return
-    ctx.google.ensure_tabs(sid, {REVIEW_TAB: REVIEW_HEADER, ORDER_TAB: ORDER_HEADER})
+    ctx.google.ensure_tabs(sid, {REVIEW_TAB: REVIEW_HEADER, ORDER_TAB: ORDER_HEADER, MANUAL_TAB: MANUAL_HEADER})
     updates = []
     for i, row in enumerate(ctx.google.read_range(sid, f"'{REVIEW_TAB}'!A2:H"), start=2):
         row = (row + [""] * 8)[:8]
@@ -43,6 +44,12 @@ def run_actions(ctx: Ctx) -> None:
         row = (row + [""] * 5)[:5]
         if row[1].strip() and not row[3].strip():
             updates.append((f"'{ORDER_TAB}'!D{i}:E{i}", [[_order(ctx, row), ctx.now_str()]]))
+    # Manual Issues: ops columns are LAN ID | Certificate No | Issued By. Process a row once all three are
+    # filled and Result is empty; fill Result + Processed At (never the ops-typed cells).
+    for i, row in enumerate(ctx.google.read_range(sid, f"'{MANUAL_TAB}'!A2:E"), start=2):
+        row = (row + [""] * 5)[:5]
+        if row[0].strip() and row[1].strip() and row[2].strip() and not row[3].strip():
+            updates.append((f"'{MANUAL_TAB}'!D{i}:E{i}", [[_manual_issue(ctx, row), ctx.now_str()]]))
     ctx.google.write_ranges(sid, updates)
     ctx.stats.actions += len(updates)
 
@@ -210,6 +217,32 @@ def _order(ctx: Ctx, row: list[str]) -> str:
         return "DONE: cancelled, paper returned to stock"
 
     return "ERROR: Action must be CANCEL, RETRY or KEEP_STATE"
+
+
+def _manual_issue(ctx: Ctx, row: list[str]) -> str:
+    """E-04: ops issued a paper by hand while the service was down and recorded it here. Validate, then
+    record it exactly like an auto issue (order→DONE, paper→ASSIGNED, allocation → Output sheet). The record
+    is a single CAS-guarded transaction (db.record_manual_issue), so a race can never double-issue a LAN."""
+    db = ctx.db
+    lan_key, cert, issued_by = row[0].strip().upper(), row[1].strip().upper(), row[2].strip()
+    o = db.q1("SELECT * FROM orders WHERE lan_key=%s AND status='PENDING' ORDER BY id", (lan_key,))
+    if not o:
+        cur = db.q1("SELECT status FROM orders WHERE lan_key=%s ORDER BY id DESC LIMIT 1", (lan_key,))
+        return f"ERROR: LAN not pending ({cur['status'] if cur else 'not found'})"
+    p = db.q1("SELECT * FROM papers WHERE cert_no=%s AND status='AVAILABLE'", (cert,))
+    if not p:
+        return f"ERROR: no AVAILABLE paper with certificate {cert}"
+    if p["state"] != o["state"] or p["denomination"] != o["denomination"]:
+        return (f"ERROR: paper {cert} is {p['state']} ₹{p['denomination']}, "
+                f"does not match the order ({o['state']} ₹{o['denomination']})")
+    try:
+        db.record_manual_issue(o, p, ctx.today(), issued_by or "ops")
+    except UniqueViolation:
+        return f"ERROR: LAN {o['lan']} was already issued (race) – not recorded again"
+    except Exception as e:  # CAS guard tripped: the LAN or paper changed under us – record nothing
+        return f"ERROR: could not record manual issue (changed under us): {e}"
+    ctx.event("INFO", "Manual issue", f"LAN {o['lan']} manually issued paper {cert} by {issued_by or 'ops'}")
+    return f"DONE: recorded manual issue of {cert} to {o['lan']}"
 
 
 def recheck_review(ctx: Ctx) -> tuple[int, int]:

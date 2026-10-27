@@ -59,6 +59,7 @@ def run_dashboard(ctx: Ctx) -> None:
         "Corrections": ["Paper ID", "API read (cert/state/₹)", "Ops value (cert/state/₹)", "Edited By", "Edited At",
                         "LAN issued to"],
         "Log": ["Time", "Level", "Action", "Details"],
+        "Daily Report": ["State", "Stamp Duty (₹)", "Quantity", "Amount (₹)"],
     }
     if ctx.dry:
         tabs["Dry Run Preview"] = PREVIEW_HEADER
@@ -109,6 +110,10 @@ def run_dashboard(ctx: Ctx) -> None:
         [r["id"], fmt(r["api_cert_no"], r["api_state"], r["api_denomination"]),
          fmt(r["cert_no"], r["state"], r["denomination"]), r["ops_edited_by"], t(r["ops_edited_at"]), r["lan"] or ""]
         for r in corr])
+
+    # Daily Report (D-2): today's issued figures in the same shape as the `report` sheet, as live formulas.
+    from .report import report_grid
+    g.overwrite_tab(sid, "Daily Report", report_grid(ctx, today, today), value_input="USER_ENTERED")
 
     ev = db.q("SELECT * FROM events ORDER BY id DESC LIMIT 500")
     g.overwrite_tab(sid, "Log", [tabs["Log"]] + [[t(e["ts"]), e["level"], e["action"], e["details"][:2000]] for e in ev])

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -10,6 +11,8 @@ from typing import Any
 
 import yaml
 from dotenv import load_dotenv
+
+log = logging.getLogger("estamp")
 
 
 @dataclass
@@ -133,5 +136,11 @@ def load_settings(config_path: str | os.PathLike = "config.yaml") -> Settings:
         raw = yaml.safe_load(fh) or {}
     s = Settings(raw=raw, base_dir=base)
     s.states = load_states(s.path("state_config_file"))
-    s.vendors = load_vendors(s.path("vendors_file"))
+    # vendors_file is optional: unset/blank, or a path that isn't a real file (e.g. s.path()
+    # resolving to the base dir when the key is missing), means "no vendors" – warn, don't crash.
+    vpath = s.path("vendors_file") if s.get("vendors_file") else None
+    if vpath and vpath.is_file():
+        s.vendors = load_vendors(vpath)
+    else:
+        log.warning("vendors_file not set or not a file (%s) – loading no vendors", vpath)
     return s

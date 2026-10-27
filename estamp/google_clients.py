@@ -206,14 +206,16 @@ class Google:
             for t in missing:
                 self.write_range(sid, f"{_tab(t)}!A1", [headers[t]])
 
-    def overwrite_tab(self, sid: str, title: str, rows: list[list[Any]]) -> None:
+    def overwrite_tab(self, sid: str, title: str, rows: list[list[Any]], value_input: str = "RAW") -> None:
+        # value_input="USER_ENTERED" lets a cell beginning with "=" become a live formula (D-2/D-3 report
+        # Amount/totals/payable columns). Default RAW keeps every existing caller's text-literal behaviour.
         self.sheets.spreadsheets().values().clear(spreadsheetId=sid, range=_tab(title), body={}).execute(num_retries=R)
         if rows:
-            self.write_range(sid, f"{_tab(title)}!A1", rows)
+            self.write_range(sid, f"{_tab(title)}!A1", rows, value_input)
 
-    def write_range(self, sid: str, a1: str, rows: list[list[Any]]) -> None:
+    def write_range(self, sid: str, a1: str, rows: list[list[Any]], value_input: str = "RAW") -> None:
         self.sheets.spreadsheets().values().update(
-            spreadsheetId=sid, range=a1, valueInputOption="RAW",
+            spreadsheetId=sid, range=a1, valueInputOption=value_input,
             body={"values": [[("" if v is None else v) for v in r] for r in rows]}).execute(num_retries=R)
 
     def write_ranges(self, sid: str, data: list[tuple[str, list[list[Any]]]]) -> None:

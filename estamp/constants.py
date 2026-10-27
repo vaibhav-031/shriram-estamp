@@ -23,5 +23,8 @@ ORDERS_REJECTED = "orders_rejected"    # order sheets rejected (bad format etc.)
 OUTPUT_ROOT = "output_root"    # DATE/STATE/<STATE-AMOUNT> delivery sheet + issued PDFs
 BACKUP_ROOT = "backup_root"    # DATE/STATE/AMOUNT/<LAN>__<CERT>.pdf – copy of each issued paper
 
+# ── Reconciliation side (ops manager report + vendor reconciliation, D-2/D-3) ─
+RECONCILIATION_ROOT = "reconciliation_root"  # DATE/<Daily Report> sheet (issued figures + vendor reconciliation)
+
 # ── Infrastructure ───────────────────────────────────────────────────────
 OCR_TEMP = "ocr_temp"    # scratch folder for the temporary OCR Doc; only needed with a service account

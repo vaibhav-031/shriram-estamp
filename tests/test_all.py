@@ -107,7 +107,7 @@ def env(settings):
     g = FakeGoogle()
     root = g.folder("Shriram eStamp (Python)")
     for key in ["upload_inbox", "upload_archive", "needs_review", "inventory_root", "orders_incoming",
-                "orders_processed", "orders_rejected", "output_root", "backup_root"]:
+                "orders_processed", "orders_rejected", "output_root", "backup_root", "reconciliation_root"]:
         settings.raw["folders"][key] = g.folder(key, root)
     settings.raw["control_sheet_id"] = g.add("control", GSHEET, root, tabs={})
     db = DB(DB_URL, "estamp_test", max_size=12)
@@ -441,6 +441,103 @@ def test_output_never_appends_a_lan_twice_across_a_crash(env):
     run_outputs(_ctx(s, db, g))
     rows = mh200()
     assert len(rows) == 3 and rows[2][5].startswith("CANCELLED"), rows
+
+
+# ============================================================ D-2/D-3 report + vendor reconciliation
+
+def _alloc(db, lan, state, denom, d, cancelled=False):
+    """Seed one allocation (and a backing paper) straight into the ledger for report tests."""
+    pid = db.insert_paper(state=state, denomination=denom, status="ASSIGNED", cert_no=f"C-{lan}")
+    oid = db.q1("""INSERT INTO orders(lan, lan_key, state, denomination, status)
+                   VALUES (%s,%s,%s,%s,'DONE') RETURNING id""", (lan, lan.lower(), state, denom))["id"]
+    db.q("""INSERT INTO allocations(order_id, paper_id, lan, cert_no, state, denomination, alloc_date, cancelled_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s, CASE WHEN %s THEN now() ELSE NULL END)""",
+         (oid, pid, lan, f"C-{lan}", state, denom, d, cancelled))
+
+
+@e2e
+def test_report_per_state_rows_and_total(env):
+    """One row per (state, stamp duty); a state with two amounts yields two rows; a Total row at the end.
+    Quantity counts non-cancelled allocations issued that date; cancelled ones never count. Amount and the
+    totals are sheet formulas (so ops edits recalc)."""
+    from datetime import date
+
+    from estamp.report import run_report
+    s, db, g = env
+    d = date(2026, 10, 28)
+    _alloc(db, "L1", "MH", 200, d)
+    _alloc(db, "L2", "MH", 200, d)
+    _alloc(db, "L3", "MH", 500, d)                 # MH has two amounts → two rows
+    _alloc(db, "L4", "KA", 500, d)
+    _alloc(db, "L5", "KA", 500, d, cancelled=True)  # cancelled → not counted
+    _alloc(db, "L6", "TN", 200, date(2026, 10, 27))  # different date → excluded
+
+    sid = run_report(_ctx(s, db, g), d, d)
+    rows = g.sheets_data[sid]["Daily Report"]
+    assert rows[0] == ["State", "Stamp Duty (₹)", "Quantity", "Amount (₹)"]
+    body = rows[1:-1]
+    quantities = {(r[0], r[1]): r[2] for r in body}
+    assert quantities == {("MH", 200): 2, ("MH", 500): 1, ("KA", 500): 1}, body
+    assert len([r for r in body if r[0] == "MH"]) == 2, "state with two amounts → two rows"
+    assert "TN" not in {r[0] for r in body}, "other dates excluded"
+    for r in body:
+        assert str(r[3]).startswith("="), f"Amount must be a formula: {r}"
+    total = rows[-1]
+    assert total[0] == "Total"
+    assert str(total[2]).startswith("=") and str(total[3]).startswith("="), "totals must be formulas"
+    assert g.path_of(sid).startswith("reconciliation_root/2026-10-28/"), g.path_of(sid)
+
+
+@e2e
+def test_report_rerun_replaces_the_sheet(env):
+    """Re-running the same date replaces the sheet – one Daily Report sheet for that date (reused, not deleted)."""
+    from datetime import date
+
+    from estamp.report import run_report
+    s, db, g = env
+    d = date(2026, 10, 28)
+    _alloc(db, "L1", "MH", 200, d)
+    sid1 = run_report(_ctx(s, db, g), d, d)
+    _alloc(db, "L2", "MH", 200, d)
+    sid2 = run_report(_ctx(s, db, g), d, d)
+
+    assert sid1 == sid2, "re-run must reuse the same sheet, never create a second"
+    daily = [f for f in g.files.values() if f["name"] == "Daily Report" and not f["trashed"]]
+    assert len(daily) == 1, f"re-run must replace, not accumulate: {len(daily)} sheets"
+    assert g.sheets_data[sid2]["Daily Report"][1][2] == 2, "re-run reflects the newer counts"
+    assert any("replace" in e["details"].lower() for e in db.q("SELECT details FROM events")), "replacement logged"
+
+
+@e2e
+def test_vendor_reconciliation_balances_and_flags_e402(env):
+    """Per vendor × state × stamp duty: received / issued / in stock / in review / rejected-or-duplicate.
+    Balance check passes when received = issued + in stock + in review + rejected; a mismatch emits E402."""
+    from datetime import date
+
+    from estamp.report import run_report
+    s, db, g = env
+    # PAPEREASE / MH / 200: 1 issued + 1 available + 1 review + 1 rejected = 4 received → balances
+    db.insert_paper(vendor_code="PAPEREASE", state="MH", denomination=200, status="ASSIGNED", cert_no="A1")
+    db.insert_paper(vendor_code="PAPEREASE", state="MH", denomination=200, status="AVAILABLE", cert_no="A2")
+    db.insert_paper(vendor_code="PAPEREASE", state="MH", denomination=200, status="NEEDS_REVIEW", cert_no="A3")
+    db.insert_paper(vendor_code="PAPEREASE", state="MH", denomination=200, status="REJECTED", cert_no="A4")
+
+    d = date(2026, 10, 28)
+    sid = run_report(_ctx(s, db, g), d, d)
+    recon = g.sheets_data[sid]["Vendor Reconciliation"]
+    hdr = recon[0]
+    for col in ["Rate per paper (₹)", "Payable", "Disputed", "Net payable"]:
+        assert any(col in c for c in hdr), hdr
+    row = next(r for r in recon[1:] if r[0] == "PAPEREASE")
+    # received, issued, in stock, in review, rejected columns (after vendor/state/duty)
+    assert row[3:8] == [4, 1, 1, 1, 1], row
+    assert all(str(c).startswith("=") for c in row[-3:]), row  # Payable / Disputed / Net payable are formulas
+    assert not any("E402" in e["details"] for e in db.q("SELECT details FROM events")), "balanced → no E402"
+
+    # Now make it NOT balance: a RESERVED paper is received but in none of the five buckets.
+    db.insert_paper(vendor_code="PAPEREASE", state="MH", denomination=200, status="RESERVED", cert_no="A5")
+    run_report(_ctx(s, db, g), d, d)
+    assert any("E402" in e["details"] for e in db.q("SELECT details FROM events")), "mismatch → E402"
 
 
 @e2e
@@ -1429,6 +1526,83 @@ def test_corrections_tab_lists_an_edited_paper(env):
     assert tab[0][:4] == ["Paper ID", "API read (cert/state/₹)", "Ops value (cert/state/₹)", "Edited By"]
     row = [r for r in tab[1:] if r[0] == pid][0]
     assert ops_cert in row[2] and row[3] == "ravi" and row[4]
+
+
+# ------------------------------------------------------------ E-04: Manual Issues tab (system-down fallback)
+
+def _manual_issue_result(ctx, s, g, row_after_lan):
+    """Append a Manual Issues row (LAN | Cert | Issued By) and run actions; return the whole result row."""
+    from estamp.actions import MANUAL_HEADER, MANUAL_TAB, run_actions
+    sid = s.get("control_sheet_id")
+    g.ensure_tabs(sid, {MANUAL_TAB: MANUAL_HEADER})
+    g.sheets_data[sid][MANUAL_TAB].append(row_after_lan)
+    run_actions(ctx)
+    return g.sheets_data[sid][MANUAL_TAB][-1]
+
+
+@e2e
+def test_manual_issue_records_allocation_and_reaches_output_sheet(env):
+    from estamp.outputs import run_outputs
+    s, db, g = env
+    cert = samples.cert("MH", 900)
+    db.insert_orders([("LAN-MAN-1", "LAN-MAN-1", "MH", 200, "f", "fid", "t", 1, "PENDING", None)])
+    o = db.q1("SELECT * FROM orders WHERE lan='LAN-MAN-1'")
+    pid = db.insert_paper(state="MH", denomination=200, status="AVAILABLE", cert_no=cert)
+    ctx = _ctx(s, db, g)
+    row = _manual_issue_result(ctx, s, g, ["LAN-MAN-1", cert, "ravi", "", ""])
+    assert row[3].startswith("DONE: recorded manual issue"), row
+    assert row[4], "Processed At must be filled"
+    assert db.q1("SELECT status FROM orders WHERE id=%s", (o["id"],))["status"] == "DONE"
+    assert db.q1("SELECT status FROM papers WHERE id=%s", (pid,))["status"] == "ASSIGNED"
+    a = db.q1("SELECT * FROM allocations WHERE order_id=%s", (o["id"],))
+    assert a and a["paper_id"] == pid and a["cert_no"] == cert
+    # reaches the Output sheet like an auto issue
+    from estamp.allocate import label_for
+    from estamp.outputs import output_sheet_id
+    run_outputs(ctx)
+    sid = output_sheet_id(ctx, a["alloc_date"], a["state"], a["denomination"])
+    out = g.sheets_data[sid][label_for("MH", 200)]
+    assert any(r[0] == "LAN-MAN-1" and r[1] == cert for r in out[1:]), out
+
+
+@e2e
+def test_manual_issue_for_already_done_lan_is_rejected_no_double_issue(env):
+    from datetime import date
+    s, db, g = env
+    cert = samples.cert("MH", 901)
+    db.insert_orders([("LAN-MAN-DONE", "LAN-MAN-DONE", "MH", 200, "f", "fid", "t", 1, "PENDING", None)])
+    order = db.claim_orders("MH", 200, 1)[0]
+    db.insert_paper(state="MH", denomination=200, status="AVAILABLE", cert_no="IN-MH-MANDONE")
+    paper = db.reserve_paper(order)
+    db.finish_allocation(order, paper, date(2026, 10, 28), "LAN-MAN-DONE.pdf", "fid", "link", "bid")
+    # a free paper sits in stock; a manual issue for the already-DONE LAN must not consume it
+    pid = db.insert_paper(state="MH", denomination=200, status="AVAILABLE", cert_no=cert)
+    ctx = _ctx(s, db, g)
+    row = _manual_issue_result(ctx, s, g, ["LAN-MAN-DONE", cert, "ravi", "", ""])
+    assert row[3].startswith("ERROR: LAN not pending"), row
+    assert db.q1("SELECT count(*) n FROM allocations WHERE lan='LAN-MAN-DONE'")["n"] == 1
+    assert db.q1("SELECT status FROM papers WHERE id=%s", (pid,))["status"] == "AVAILABLE"
+
+
+@e2e
+def test_manual_issue_with_unavailable_or_mismatched_paper_is_rejected(env):
+    s, db, g = env
+    db.insert_orders([("LAN-MAN-2", "LAN-MAN-2", "MH", 200, "f", "fid", "t", 1, "PENDING", None)])
+    o = db.q1("SELECT * FROM orders WHERE lan='LAN-MAN-2'")
+    ctx = _ctx(s, db, g)
+    # no such cert
+    assert _manual_issue_result(ctx, s, g, ["LAN-MAN-2", "NOPE-1", "ravi", "", ""])[3].startswith("ERROR")
+    # wrong denomination
+    wrong = samples.cert("MH", 902)
+    db.insert_paper(state="MH", denomination=100, status="AVAILABLE", cert_no=wrong)
+    assert _manual_issue_result(ctx, s, g, ["LAN-MAN-2", wrong, "ravi", "", ""])[3].startswith("ERROR")
+    # already assigned paper (not AVAILABLE)
+    taken = samples.cert("MH", 903)
+    db.insert_paper(state="MH", denomination=200, status="ASSIGNED", cert_no=taken)
+    assert _manual_issue_result(ctx, s, g, ["LAN-MAN-2", taken, "ravi", "", ""])[3].startswith("ERROR")
+    # no ledger change: order still PENDING, no allocation
+    assert db.q1("SELECT status FROM orders WHERE id=%s", (o["id"],))["status"] == "PENDING"
+    assert db.q1("SELECT count(*) n FROM allocations WHERE lan='LAN-MAN-2'")["n"] == 0
 
 
 # ------------------------------------------------------------ E-06: automatic second OCR attempt before Needs Review

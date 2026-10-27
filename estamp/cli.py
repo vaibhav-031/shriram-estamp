@@ -7,6 +7,7 @@
   python -m estamp run-once       one full cycle (respects dry_run in config.yaml)
   python -m estamp run            keep running a cycle every loop_seconds (refuses in dry run)
   python -m estamp status         stock + queue summary in the terminal
+  python -m estamp report         build the Daily Report + Vendor Reconciliation sheet (--date / --from --to)
   python -m estamp reconcile      find inventory files the ledger doesn't know about (and vice-versa)
   python -m estamp recheck-review re-run checks on Needs Review papers after a config fix (no re-upload)
   python -m estamp explain E111   print what an error code means and what ops should do (no DB/Google)
@@ -40,9 +41,12 @@ def _build(args, need_google=True):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="estamp")
-    ap.add_argument("command", choices=["login", "init-db", "reset-test-data", "check-setup", "run-once", "run", "status", "reconcile", "recheck-review", "explain"])
+    ap.add_argument("command", choices=["login", "init-db", "reset-test-data", "check-setup", "run-once", "run", "status", "report", "reconcile", "recheck-review", "explain"])
     ap.add_argument("code", nargs="?", help="error code for `explain` (e.g. E111)")
     ap.add_argument("--config", default="config.yaml")
+    ap.add_argument("--date", help="report: single issue date YYYY-MM-DD (default today)")
+    ap.add_argument("--from", dest="date_from", help="report: range start YYYY-MM-DD")
+    ap.add_argument("--to", dest="date_to", help="report: range end YYYY-MM-DD")
     ap.add_argument("--dry-run", action="store_true", help="force dry run for this command")
     ap.add_argument("--live", action="store_true", help="force live mode for this command")
     ap.add_argument("--yes", action="store_true", help="reset-test-data: skip the typed confirmation (scripted use)")
@@ -83,6 +87,8 @@ def main(argv=None) -> int:
             return _check(s, db, google)
         if args.command == "status":
             return _status(s, db)
+        if args.command == "report":
+            return _report(s, db, google, args)
         if args.command == "reconcile":
             return _reconcile(s, db, google)
         if args.command == "recheck-review":
@@ -205,6 +211,35 @@ def _status(s, db) -> int:
         print(f"{r[0]:<4}{r[2]:>6}{r[3]:>7}{r[4]:>7}{r[5]:>8}{r[6]:>9}{r[7]:>7}{str(r[8]):>7}  {r[13]}")
     for r in db.q("SELECT status, count(*) n FROM orders GROUP BY 1 ORDER BY 1"):
         print(f"orders {r['status']:<11} {r['n']}")
+    return 0
+
+
+# Daily Report + Vendor Reconciliation (D-2/D-3). Read-only against the ledger; writes one Google Sheet.
+def _report(s, db, google, args) -> int:
+    from datetime import date
+
+    from .context import Ctx
+    from .report import run_report
+
+    def parse(label, value):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            raise SystemExit(f"{label} must be YYYY-MM-DD, got '{value}'")
+
+    if args.date_from or args.date_to:
+        if not (args.date_from and args.date_to):
+            raise SystemExit("use --from AND --to together for a range (or --date for one day)")
+        d_from, d_to = parse("--from", args.date_from), parse("--to", args.date_to)
+        if d_from > d_to:
+            raise SystemExit("--from must not be after --to")
+    else:
+        d = parse("--date", args.date) if args.date else Ctx(s, db, google).today()
+        d_from = d_to = d
+
+    sid = run_report(Ctx(s, db, google), d_from, d_to)
+    from .google_clients import file_link
+    print("Daily Report:", file_link(sid))
     return 0
 
 

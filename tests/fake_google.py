@@ -112,10 +112,10 @@ class FakeGoogle:
         for t, h in headers.items():
             d.setdefault(t, [h])
 
-    def overwrite_tab(self, sid, title, rows):
+    def overwrite_tab(self, sid, title, rows, value_input="RAW"):
         self.sheets_data.setdefault(sid, {})[title] = [list(r) for r in rows]
 
-    def write_range(self, sid, a1, rows):
+    def write_range(self, sid, a1, rows, value_input="RAW"):
         tab = a1.split("!")[0].strip("'")
         self.sheets_data.setdefault(sid, {}).setdefault(tab, [])
         if a1.endswith("A1"):

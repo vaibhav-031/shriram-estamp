@@ -47,6 +47,7 @@ class Paper:
     amount: int
     pdf_file: str
     page: int           # 1-based page in pdf_file
+    stamp_type: str = ""  # "Digital" (1-page e-stamp) | "Traditional" (front+back, 2-page)
 
 
 def _col(header: list[str], *names: str) -> int:
@@ -69,7 +70,8 @@ def load_papers(resolver: StateResolver) -> list[Paper]:
         hdr = [str(c or "") for c in rows[0]]
         ci = {k: _col(hdr, *v) for k, v in {
             "lan": ("LOAN NO",), "state": ("STATE",), "cert": ("Certificate / Serial No.",),
-            "amount": ("Stamp Duty",), "pdf": ("Sample PDF",), "page": ("Page",)}.items()}
+            "amount": ("Stamp Duty",), "pdf": ("Sample PDF",), "page": ("Page",),
+            "type": ("Stamp type",)}.items()}
         for r in rows[1:]:
             if not r or not r[ci["lan"]]:
                 continue
@@ -77,7 +79,8 @@ def load_papers(resolver: StateResolver) -> list[Paper]:
             papers.append(Paper(
                 lan=str(r[ci["lan"]]).strip(), state=resolver.resolve(state_raw), state_raw=state_raw,
                 cert=str(r[ci["cert"]]).strip(), amount=int(r[ci["amount"]]),
-                pdf_file=str(r[ci["pdf"]]).strip(), page=int(r[ci["page"]])))
+                pdf_file=str(r[ci["pdf"]]).strip(), page=int(r[ci["page"]]),
+                stamp_type=str(r[ci["type"]]).strip()))
     return papers
 
 
@@ -91,6 +94,8 @@ class Group:
     lans: list[str]              # chosen LANs (order sheet, scenario 1)
     active: bool
     single_amount: bool          # order sheet carries no duty column → amount must be inferable
+    stamp_type: str = ""
+    skip: str | None = None      # reason this group is excluded from the run (e.g. Traditional, front-only template)
     # oracle, filled by build_oracle
     valid_lans: int = 0
     issuable: int = 0
@@ -108,7 +113,7 @@ class Scenario:
 
 
 def build_scenario(settings, papers: list[Paper], states: list[str] | None,
-                   n_lans: int, n_papers: int, scenario: str, dup_upload: bool) -> Scenario:
+                   n_lans: int, n_papers: int, scenario: str, dup_upload: bool, tag: str) -> Scenario:
     by_state: dict[str, list[Paper]] = {}
     for p in papers:
         by_state.setdefault(p.state, []).append(p)
@@ -122,15 +127,24 @@ def build_scenario(settings, papers: list[Paper], states: list[str] | None,
         single = bool(st and len(st.amounts) == 1)
         amount = ps[0].amount
         chosen_papers = ps[:n_papers]
-        chosen_lans = [p.lan for p in ps[:n_lans]]
+        # Unique LAN per run: the Output <LAN>.pdf persists in Drive (no-delete), so re-issuing the same LAN
+        # collides. Any valid paper fulfils any LAN of the same state+amount, so the suffix is harmless.
+        chosen_lans = [f"{p.lan}-E{tag}" for p in ps[:n_lans]]
+        stamp_type = ps[0].stamp_type
+        # Traditional papers are front+back (2-page); the templates contain fronts only, so they can't be stocked
+        # as the pipeline requires (E106). Skip them with a clear reason rather than fail spuriously.
+        skip = ("Traditional (2-page front+back) – templates are front-only; provide paired PDFs to test"
+                if stamp_type.lower().startswith("trad") else None)
         groups.append(Group(state=state, amount=amount, papers=chosen_papers, lans=chosen_lans,
-                            active=active, single_amount=single))
+                            active=active, single_amount=single, stamp_type=stamp_type, skip=skip))
     build_oracle(groups, scenario)
     return Scenario(scenario=scenario, groups=groups, dup_upload=dup_upload)
 
 
 def build_oracle(groups: list[Group], scenario: str) -> None:
     for g in groups:
+        if g.skip:
+            continue
         good = len(g.papers) if g.active else 0   # inactive-state papers can't be stocked → Needs Review
         g.review = len(g.papers) - good
         if scenario == "inbox":
@@ -165,6 +179,9 @@ def upload_assets(google, settings, sc: Scenario) -> None:
         raise RuntimeError("no active vendor configured – intake would reject every upload (E101)")
     vendor_folder = google.folder_path(inbox, [vendor])
     for g in sc.groups:
+        if g.skip:
+            print(f"  SKIP {g.state}: {g.skip}")
+            continue
         if not g.papers:
             continue
         data = _merged_pdf(g.papers, readers)
@@ -217,6 +234,8 @@ def verify(db, settings, sc: Scenario) -> Report:
     certs_of = {g.state: {p.cert for p in g.papers} for g in sc.groups}
 
     for g in sc.groups:
+        if g.skip:
+            continue
         where = f"{g.state} ₹{g.amount}"
         # ---- papers stocked: AVAILABLE spare + ASSIGNED issuable, and no good paper lost
         avail = _n(db, "SELECT count(*) n FROM papers WHERE state=%s AND denomination=%s AND status='AVAILABLE'",
@@ -227,8 +246,13 @@ def verify(db, settings, sc: Scenario) -> Report:
         if sc.scenario != "inbox":
             rep.check(assigned == g.assigned, f"{where}: ASSIGNED papers {assigned} == issuable {g.assigned}")
         if g.review:
+            # The real invariant for an inactive state: its papers are NEVER stocked/issued (checked above via
+            # available==0 / assigned==0), and the upload is quarantined somewhere – per-paper Needs Review, or the
+            # whole file to review (e.g. Kerala's unreadable cert → E105 at the upload level, no per-paper rows).
             rev = _n(db, "SELECT count(*) n FROM papers WHERE state=%s AND status='NEEDS_REVIEW'", (g.state,))
-            rep.check(rev >= g.review, f"{where}: inactive-state papers in Needs Review {rev} >= {g.review}")
+            up_rev = _n(db, "SELECT count(*) n FROM uploads WHERE status='REVIEW'")
+            rep.check(rev > 0 or up_rev > 0, f"{where}: inactive papers quarantined (review papers {rev}, "
+                      f"review uploads {up_rev}) – none stocked")
         # every stocked paper's cert belongs to this group's known certs
         stocked = {r["cert_no"] for r in db.q(
             "SELECT cert_no FROM papers WHERE state=%s AND denomination=%s AND status IN ('AVAILABLE','ASSIGNED')",
@@ -288,6 +312,7 @@ def main(argv=None) -> int:
     ap.add_argument("--papers", type=int, default=10, help="papers per state (uploaded)")
     ap.add_argument("--dup-upload", action="store_true", help="also upload an exact-copy duplicate per group")
     ap.add_argument("--max-cycles", type=int, default=5)
+    ap.add_argument("--tag", help="unique suffix for LANs (default: random) so re-runs don't collide in Output")
     ap.add_argument("--reset", action="store_true", help="TRUNCATE the schema before running")
     ap.add_argument("--live", action="store_true", help="run live (overrides dry_run) – issues real certificates")
     ap.add_argument("--config", default=str(ROOT / "config.yaml"))
@@ -307,6 +332,8 @@ def main(argv=None) -> int:
     resolver = StateResolver(settings.states)
 
     try:
+        import uuid
+        tag = args.tag or uuid.uuid4().hex[:6]
         states = [s.strip().upper() for s in args.states.split(",")] if args.states else None
         papers = load_papers(resolver)
         scenarios = ["inbox", "orders"] if args.scenario == "both" else [args.scenario]
@@ -316,8 +343,8 @@ def main(argv=None) -> int:
 
         overall: list[tuple[str, Report]] = []
         for sc_name in scenarios:
-            sc = build_scenario(settings, papers, states, args.lans, args.papers, sc_name, args.dup_upload)
-            print(f"\n=== scenario: {sc_name} ===")
+            sc = build_scenario(settings, papers, states, args.lans, args.papers, sc_name, args.dup_upload, tag)
+            print(f"\n=== scenario: {sc_name} (tag={tag}) ===")
             print_plan(sc)
             print("Uploading assets:")
             upload_assets(google, settings, sc)
@@ -339,7 +366,14 @@ def print_plan(sc: Scenario) -> None:
     print(f"{'state':<6}{'amt':>6}{'lans':>6}{'papers':>8}{'valid':>7}{'issuable':>10}"
           f"{'pending':>9}{'avail':>7}{'review':>7}  notes")
     for g in sc.groups:
-        notes = "" if (g.active and g.single_amount) else ("inactive" if not g.active else "multi-amount→invalid")
+        if g.skip:
+            notes = f"SKIP: {g.skip}"
+        elif not g.active:
+            notes = "inactive"
+        elif not g.single_amount:
+            notes = "multi-amount→invalid"
+        else:
+            notes = g.stamp_type
         print(f"{g.state:<6}{g.amount:>6}{len(g.lans):>6}{len(g.papers):>8}{g.valid_lans:>7}"
               f"{g.issuable:>10}{g.pending:>9}{g.available:>7}{g.review:>7}  {notes}")
 

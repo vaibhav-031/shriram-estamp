@@ -37,16 +37,18 @@ def run_outputs(ctx: Ctx) -> None:
         try:
             label = label_for(state, denom)
             sid = output_sheet_id(ctx, d, state, denom)
-            # By-LAN guard (E-01): a crash after append_rows but before mark_written leaves the row in the
-            # sheet yet the allocation unwritten, so the next cycle re-fetches it. Column A holds the LAN ID;
-            # skip any LAN already present (including dupes within this batch) so re-running is idempotent.
-            present = {row[0] for row in ctx.google.read_range(sid, f"{label}!A2:A") if row}
+            # By-(LAN, cert) guard (E-01 + C-1): a crash after append_rows but before mark_written leaves the row
+            # in the sheet yet the allocation unwritten, so the next cycle re-fetches it. Columns A/B hold the LAN
+            # and its certificate; keying on BOTH means a re-run skips the exact same issued row, while a
+            # legitimately reissued cert for a LAN (after a CANCEL) still appears. Dedupes within the batch too.
+            present = {(row[0], row[1]) for row in ctx.google.read_range(sid, f"{label}!A2:B") if len(row) >= 2}
             to_write, seen = [], set(present)
             for r in grp:
-                if r["lan"] in seen:
+                cert = r["verified_cert"] or r["cert_no"]
+                if (r["lan"], cert) in seen:
                     continue
-                seen.add(r["lan"])
-                to_write.append([r["lan"], r["verified_cert"] or r["cert_no"], r["pdf_name"], r["pdf_link"],
+                seen.add((r["lan"], cert))
+                to_write.append([r["lan"], cert, r["pdf_name"], r["pdf_link"],
                                  r["created_at"].astimezone(ctx.tz).strftime("%Y-%m-%d %H:%M:%S"), "ISSUED"])
             if to_write:
                 ctx.google.append_rows(sid, label, to_write)
