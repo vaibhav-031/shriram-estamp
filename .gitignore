@@ -1,5 +1,6 @@
 .env
-secrets/*.json
+secrets/*
+!secrets/README.txt
 logs/
 .venv/
 __pycache__/
