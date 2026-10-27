@@ -27,6 +27,26 @@ class FakeOcr:
         return OcrResult(ocr_text_of(data), self.certs.get(name, ""), "fake")
 
 
+class FakeApiOcr:
+    """Behaves like the in-house OCR API: structured fields only, no text. Pages built with samples.api_page carry
+    their fields; any other page reads as 'not found' ({}). Records every call."""
+
+    def __init__(self, fail: dict[str, Exception] | None = None):
+        self.fail = dict(fail or {})
+        self.calls: list[str] = []
+        self.lock = threading.Lock()
+
+    def read(self, data: bytes, name: str) -> OcrResult:
+        import json
+        with self.lock:
+            self.calls.append(name)
+        if name in self.fail:
+            raise self.fail[name]
+        hidden = ocr_text_of(data)
+        fields = json.loads(hidden[len("FIELDS:"):]) if hidden.startswith("FIELDS:") else {}
+        return OcrResult("", "", "fake-api", fields=fields, raw={"fake": True, "fields": fields})
+
+
 class FakeSplitter:
     def __init__(self, force_size: int | None = None):
         self.calls: list[tuple[str, int]] = []

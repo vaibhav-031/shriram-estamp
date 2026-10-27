@@ -1,0 +1,17 @@
+{
+  "status": 200,
+  "seconds": 1.26,
+  "headers": {
+    "Access-Control-Allow-Credentials": "true",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS, GET, PUT",
+    "Access-Control-Allow-Origin": "*",
+    "Content-Type": "application/json",
+    "X-Ocr-Transaction-Id": "ocrt_27c81cb1a4754c51a603ac062af75268",
+    "X-Zoop-Trace-Id": "b35755c8-c36c-4277-888a-c43724095c30",
+    "Date": "Tue, 27 Oct 2026 16:58:11 GMT",
+    "Via": "1.1 google",
+    "Alt-Svc": "h3=\":443\"; ma=2592000",
+    "Transfer-Encoding": "chunked"
+  }
+}

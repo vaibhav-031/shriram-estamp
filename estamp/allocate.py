@@ -18,7 +18,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from .context import Ctx
-from .extract import identify, normalize_ocr, safe_file_name
+from .extract import ids_in_reading, safe_file_name
 from .google_clients import file_link
 from .ocr_split import _split_local
 
@@ -29,12 +29,11 @@ class CertMismatch(RuntimeError):
 
 def verify_issued(ctx: Ctx, file_id: str, expected: str, name: str) -> tuple[str, str]:
     """OCR every page of the issued file; return (id found, via). Raises CertMismatch unless it is exactly `expected`."""
-    texts, via = [], ""
+    found, via = set(), ""
     for p in _split_local(ctx.google.download(file_id), 1):
         r = ctx.ocr.read(p.data, f"{name}_p{p.page_from}")
-        texts.append(r.text + ("\n" + r.cert if r.cert else ""))
+        found |= {h.cert for h in ids_in_reading(r.text, r.cert, r.fields, ctx.settings, ctx.matcher, ctx.resolver)}
         via = r.via
-    found = {h.cert for h in identify(normalize_ocr("\n".join(texts)), ctx.settings, ctx.matcher, ctx.resolver)}
     if found != {expected}:
         seen = ", ".join(sorted(found)) or "no certificate / serial readable"
         raise CertMismatch(f"issued PDF shows [{seen}] but ledger expected {expected}")

@@ -16,6 +16,7 @@ from typing import Any, Iterator
 import psycopg
 from psycopg import errors
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 SCHEMA_SQL = """
@@ -102,6 +103,7 @@ CREATE TABLE IF NOT EXISTS allocations (
 ALTER TABLE allocations ADD COLUMN IF NOT EXISTS verified_cert TEXT;
 ALTER TABLE allocations ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ;
 ALTER TABLE allocations ADD COLUMN IF NOT EXISTS verified_via TEXT;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS ocr_raw JSONB;      -- OCR API reading per paper (A-05)
 CREATE INDEX IF NOT EXISTS alloc_unwritten_idx ON allocations(alloc_date, state, denomination) WHERE NOT output_written;
 
 CREATE TABLE IF NOT EXISTS output_sheets (
@@ -236,7 +238,8 @@ class DB:
     def insert_paper(self, **f: Any) -> int:
         cols = ", ".join(f)
         ph = ", ".join(["%s"] * len(f))
-        return self.q1(f"INSERT INTO papers({cols}) VALUES ({ph}) RETURNING id", tuple(f.values()))["id"]
+        vals = tuple(Jsonb(v) if isinstance(v, dict) else v for v in f.values())
+        return self.q1(f"INSERT INTO papers({cols}) VALUES ({ph}) RETURNING id", vals)["id"]
 
     def update_paper(self, paper_id: int, **f: Any) -> None:
         sets = ", ".join(f"{k}=%s" for k in f)

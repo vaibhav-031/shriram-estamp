@@ -5,3 +5,6 @@ logs/
 .venv/
 __pycache__/
 .pytest_cache/
+
+# real OCR API responses from real papers – never commit (Vaibhav, 2026-10-27)
+.local/

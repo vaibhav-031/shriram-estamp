@@ -233,6 +233,17 @@ class PaperAnalysis:
         return not self.issues
 
 
+def _check_state_and_amount(a: "PaperAnalysis", settings: Settings) -> None:
+    st = settings.states.get(a.state) if a.state else None
+    if st:
+        if not st.active:
+            a.issues.append(f"state {a.state} is marked inactive in state_config.csv ({st.notes or 'no note'})")
+        if not a.amount:
+            a.issues.append("stamp duty amount not readable")
+        elif a.amount not in st.amounts:
+            a.issues.append(f"stamp duty ₹{a.amount} is not an allowed amount for {a.state} {st.amounts}")
+
+
 def analyze_paper(text: str, api_cert: str, settings: Settings, matcher: CertMatcher,
                   is_duplicate_cert, resolver: StateResolver | None = None) -> PaperAnalysis:
     """Decide where a paper belongs (state + denomination) and whether it's safe to stock.
@@ -265,14 +276,7 @@ def analyze_paper(text: str, api_cert: str, settings: Settings, matcher: CertMat
         alt = amount_fallbacks(t)
         if alt:
             a.amount = alt
-    st = settings.states.get(a.state) if a.state else None
-    if st:
-        if not st.active:
-            a.issues.append(f"state {a.state} is marked inactive in state_config.csv ({st.notes or 'no note'})")
-        if not a.amount:
-            a.issues.append("stamp duty amount not readable")
-        elif a.amount not in st.amounts:
-            a.issues.append(f"stamp duty ₹{a.amount} is not an allowed amount for {a.state} {st.amounts}")
+    _check_state_and_amount(a, settings)
 
     for needed in settings.get("intake.required_text", []) or []:
         if needed.upper() not in t:
@@ -283,20 +287,90 @@ def analyze_paper(text: str, api_cert: str, settings: Settings, matcher: CertMat
     return a
 
 
-# ============================== PAPER TYPE + PAIRING (ADR-0003) ==============================
+# ============================== OCR API FIELDS (ADR-0006) ==============================
+# The in-house OCR API returns structured fields only (no text): {"certification_no": {"value": …}, …}, `{}` when a
+# field wasn't found. Contract: docs/api-samples/ocr/README.md.
 
-def paper_type(page_text_chars: list[int], min_chars: int) -> str:
-    """Per upload, before splitting: 'digital' if every page has a real text layer (e-stamp PDF, 1 page per paper),
-    'traditional' if every page is a scan (front + back, 2 pages per paper), else 'mixed' (→ whole upload to
-    Needs Review). ADR-0002: values must come from the OCR API, not the text layer – until A-09 removes
-    `intake.use_pdf_text`, the configured reader may still read digital pages from it."""
-    if not page_text_chars:
-        return "mixed"
-    if all(c >= min_chars for c in page_text_chars):
-        return "digital"
-    if all(c < min_chars for c in page_text_chars):
-        return "traditional"
-    return "mixed"
+_GENERIC_SERIAL = re.compile(r"(?=.*\d)[A-Z0-9]{5,16}")
+
+
+def _field(fields: dict, name: str) -> str:
+    return str(((fields or {}).get(name) or {}).get("value") or "").strip().upper()
+
+
+def id_from_fields(fields: dict, settings: Settings, matcher: CertMatcher, resolver: StateResolver) -> IdHit | None:
+    """The paper's ID from the API fields: an e-stamp certificate (IN-…) as is, else its Unique Doc. Reference
+    (SUBIN-…), else a traditional serial as STATE-SERIAL (state from state_code / state_name). None = no ID."""
+    cert = re.sub(r"\s+", "", _field(fields, "certification_no"))
+    ref = re.sub(r"\s+", "", _field(fields, "unique_doc_reference"))
+    state = resolver.resolve(_field(fields, "state_code")) or resolver.resolve(_field(fields, "state_name"))
+    if cert.startswith("IN-"):
+        hits = matcher.find(normalize_ocr(cert))
+        h = hits[0] if len(hits) == 1 and hits[0].cert == cert else None
+        return IdHit(cert, (h.state if h else "") or state, h.raw_code if h else "", "estamp")
+    if ref.startswith("SUBIN-"):
+        for pat in settings.get("intake.estamp_ref_patterns") or []:
+            m = re.fullmatch(pat, ref)
+            if m:
+                raw = m.group(1) if m.groups() else ""
+                return IdHit(ref, resolver.from_cert_code(raw) or state, raw, "estamp")
+        return IdHit(ref, state, "", "estamp")
+    if cert:
+        serial = re.sub(r"[^A-Z0-9]", "", cert)
+        return IdHit(f"{state}-{serial}" if state else serial, state, state, "physical")
+    return None
+
+
+def _id_looks_valid(h: IdHit, settings: Settings, matcher: CertMatcher) -> bool:
+    if h.kind == "estamp":
+        if h.cert.startswith("IN-"):
+            return matcher.full_match(h.cert, h.state)
+        return any(re.fullmatch(p, h.cert) for p in settings.get("intake.estamp_ref_patterns") or [])
+    serial = h.cert.split("-", 1)[1] if "-" in h.cert else h.cert
+    pat = (settings.get("intake.serial_patterns") or {}).get(h.state)     # per-state pattern if configured
+    return re.fullmatch(pat, serial) is not None if pat else _GENERIC_SERIAL.fullmatch(serial) is not None
+
+
+def analyze_fields(fields: dict, settings: Settings, matcher: CertMatcher, is_duplicate_cert,
+                   resolver: StateResolver) -> PaperAnalysis:
+    """analyze_paper for an OCR API reading: same checks (one sane ID, known active state, allowed amount, no
+    duplicate). `intake.required_text` can't be checked – the API returns no text."""
+    a = PaperAnalysis()
+    h = id_from_fields(fields, settings, matcher, resolver)
+    if not h:
+        a.issues.append("no certificate / serial number found")
+    else:
+        a.cert, a.cert_state, a.state = h.cert, h.raw_code, h.state
+        if not h.state:
+            a.issues.append(f"state of '{h.cert}' is not in state_config.csv")
+        elif not _id_looks_valid(h, settings, matcher):
+            a.issues.append(f"'{h.cert}' does not look like a valid {h.state} paper ID")
+    digits = re.sub(r"[^\d]", "", _field(fields, "stamp_duty_amount").split(".")[0])
+    a.amount = int(digits) if digits else 0
+    _check_state_and_amount(a, settings)
+    if a.cert and is_duplicate_cert(a.cert):
+        a.issues.append(f"duplicate certificate {a.cert} – already in stock or used")
+    return a
+
+
+def ids_in_reading(text: str, cert: str, fields: dict | None, settings: Settings, matcher: CertMatcher,
+                   resolver: StateResolver) -> list[IdHit]:
+    """IDs on one page, whichever reader produced it: the OCR API's fields, or a text reader's text (+ cert)."""
+    if fields is not None:
+        h = id_from_fields(fields, settings, matcher, resolver)
+        return [h] if h else []
+    return identify(normalize_ocr(text + ("\n" + cert if cert else "")), settings, matcher, resolver)
+
+
+def pages_per_paper(h: IdHit, settings: Settings) -> int:
+    """1 for an e-stamp; otherwise the state's pages_per_paper (state_config.csv, default 2 = front + back)."""
+    if h.kind == "estamp":
+        return 1
+    st = settings.states.get(h.state)
+    return st.pages_per_paper if st else 2
+
+
+# ============================== PAIRING (ADR-0003) ==============================
 
 
 def first_broken_pair(id_counts: list[tuple[int, int]]) -> int | None:

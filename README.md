@@ -83,15 +83,15 @@ The service fills the Result column of the action rows; it never edits what ops 
 the stamp duty printed on the paper is that state's amount (from `state_config.csv`); no duplicate
 certificate; optional required text (e.g. "SHRIRAM"). Anything else → Needs Review.
 
-**Digital vs traditional, front + back:** the service decides per uploaded file. A digital e-stamp PDF (text
-inside the PDF) is 1 page per paper; a scanned file is traditional paper, **always front + back = 2 pages per
-paper**. Upload digital and scanned papers as separate files.
+**1 page or front + back:** the service reads every page first and decides per uploaded file. An e-stamp
+(`IN-…` certificate / `SUBIN-…` reference) is 1 page per paper; a traditional paper is **front + back = 2 pages**
+(a few states print single-page papers – `pages_per_paper` in `state_config.csv`, e.g. HR = 1). Put only one kind
+of paper in a file.
 
 | You see | Why | What you do |
 |---|---|---|
-| Whole file in Needs Review, **E105** | digital and scanned pages in one file | Split them into separate files and upload again |
-| One page in Needs Review, **E105** | a page that reads like a traditional paper (`STATE-SERIAL`) inside a digital file; the rest of the file is stocked | Check that page; if it's a scanned traditional paper, upload it with its back as a separate scanned file, then `REJECT` the entry |
-| Whole file in Needs Review, **E106** | scanned file with an odd number of pages – a front or back is missing | Find the missing page, upload the complete file again |
+| Whole file in Needs Review, **E105** | e-stamps and front + back papers mixed in one file, or no page has a readable certificate / serial | Split the file by kind and upload again (or check the scan quality) |
+| Whole file in Needs Review, **E106** | front + back papers with an odd number of pages – a front or back is missing | Find the missing page, upload the complete file again |
 | **E107 pairing broken at page N** | from page N on, a front has no serial / a back has one – one missing page shifts every pair after it | Upload the papers from page N on again as separate 2-page PDFs into the inbox, then `REJECT` the broken entries in Review Actions |
 
 Papers before page N are stocked normally.

@@ -25,6 +25,7 @@ class StateCfg:
     active: bool              # inactive states are rejected at intake and ingest
     cert_codes: list[str]     # state codes that can appear on the certificate (IN-XX...)
     notes: str = ""
+    pages_per_paper: int = 2  # non-e-stamp papers of this state: 2 = front + back, 1 = single page (ADR-0006)
 
     @property
     def low_stock_threshold(self) -> int:
@@ -96,6 +97,7 @@ def load_states(path: Path) -> dict[str, StateCfg]:
                 active=row.get("active", "yes").strip().lower() in ("yes", "y", "true", "1"),
                 cert_codes=[c.upper() for c in _split(row.get("cert_codes", ""))] or [code],
                 notes=row.get("notes", "").strip(),
+                pages_per_paper=int(row.get("pages_per_paper") or 2),
             )
     return states
 

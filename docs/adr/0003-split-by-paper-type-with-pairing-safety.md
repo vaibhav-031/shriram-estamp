@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: accepted (type detection superseded by ADR-0006; odd-page and pairing rules stand)
 ---
 
 # Split by paper type; a broken pairing stops the rest of the upload

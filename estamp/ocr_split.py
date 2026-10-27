@@ -13,6 +13,7 @@ Providers (config.yaml → intake):
 """
 from __future__ import annotations
 
+import base64
 import io
 import re
 import zipfile
@@ -35,25 +36,10 @@ class PaperPdf:
 @dataclass
 class OcrResult:
     text: str
-    cert: str           # only when the in-house API returns it directly
+    cert: str                   # an ID a reader returned outside its text (legacy)
     via: str
-
-
-def _json_path(obj, path: str):
-    if not path:
-        return None
-    for part in path.split("."):
-        if obj is None:
-            return None
-        obj = obj[int(part)] if isinstance(obj, list) and part.isdigit() else (obj.get(part) if isinstance(obj, dict) else None)
-    return obj
-
-
-def _headers(settings: Settings, section: str) -> dict:
-    key = settings.env(f"zoop_api.{section}.api_key_env")
-    if not key:
-        raise RuntimeError(f"API key env var for zoop_api.{section} is not set")
-    return {settings.get(f"zoop_api.{section}.auth_header", "x-api-key"): key}
+    fields: dict | None = None  # OCR API: structured fields (it returns no text); None for text readers
+    raw: dict | None = None     # OCR API: the full response, stored per paper
 
 
 # ---------------------------------------------------------------------------------- split
@@ -147,18 +133,6 @@ def _split_zoop(data: bytes, name: str, settings: Settings, split_size: int = 1)
 
 # ---------------------------------------------------------------------------------- OCR
 
-def page_text_chars(data: bytes) -> list[int]:
-    """Non-whitespace characters in each page's text layer, used to decide the paper type. A page whose text can't
-    be extracted counts as 0 (scan-like), so a broken font sends the file to review instead of failing every cycle."""
-    out = []
-    for pg in PdfReader(io.BytesIO(data)).pages:
-        try:
-            out.append(len(re.sub(r"\s+", "", pg.extract_text() or "")))
-        except Exception:
-            out.append(0)
-    return out
-
-
 def pdf_text(data: bytes) -> str:
     """Text already inside the PDF (digital e-stamps). Empty for scans."""
     try:
@@ -206,17 +180,34 @@ class ConfiguredSplitter:
 
 
 def _ocr_zoop(data: bytes, name: str, settings: Settings) -> OcrResult:
-    c = settings.get("zoop_api.ocr")
-    if not c.get("url"):
-        raise RuntimeError("zoop_api.ocr.url is not set")
-    res = api_call(settings, "ocr", lambda: requests.post(
-        c["url"], headers=_headers(settings, "ocr"), files={c.get("file_field", "file"): (name, data, "application/pdf")},
-        data=c.get("extra_fields") or {}, timeout=int(c.get("timeout_s", 60))))
-    if res.status_code >= 300:
-        raise RuntimeError(f"OCR API HTTP {res.status_code}: {res.content[:200].decode('utf-8', 'replace')}")
-    body = res.json()
-    text = str(_json_path(body, c.get("text_path", "")) or "")
-    cert = str(_json_path(body, c.get("cert_path", "")) or "").strip().upper()
-    if not text and not cert:
-        raise RuntimeError("OCR API returned neither text nor certificate number")
-    return OcrResult(text, cert, "zoop_api")
+    """In-house OCR API, one page per call (contract: docs/api-samples/ocr/README.md). Returns structured fields only.
+    'Not found' codes (211/212) are a normal reading – the paper checks report what is missing. Rate limit, retries
+    and the per-page time cap (timeout_s per try, max_total_s overall) come from http_api / config."""
+    c = settings.get("zoop_api.ocr") or {}
+    key, org = settings.env("zoop_api.ocr.api_key_env"), settings.env("zoop_api.ocr.org_acc_env")
+    if not c.get("url") or not c.get("config_id"):
+        raise RuntimeError("zoop_api.ocr.url / config_id is not set in config.yaml")
+    if not key or not org:
+        raise RuntimeError(f"{c.get('api_key_env')} / {c.get('org_acc_env')} must be set in .env")
+    body = {"mode": "sync", "ocr_config_id": c["config_id"], "documents": [{"data": base64.b64encode(data).decode()}]}
+    timeout = int(c.get("timeout_s", 60))
+    try:
+        res = api_call(settings, "ocr", lambda: requests.post(
+            c["url"], json=body, timeout=timeout,
+            headers={"x-zoop-key": key, "x-zoop-org-acc": org, "Content-Type": "application/json"}))
+    except requests.Timeout:
+        raise RuntimeError(f"OCR API timed out after {timeout} s ('{name}')")
+    except requests.RequestException as e:
+        raise RuntimeError(f"OCR API unreachable ({type(e).__name__})")
+    try:
+        j = res.json()
+    except ValueError:
+        raise RuntimeError(f"OCR API HTTP {res.status_code} returned something that is not JSON")
+    if res.status_code != 200 or not j.get("success"):
+        err = j.get("error") if isinstance(j.get("error"), dict) else {}
+        msg = err.get("message") or j.get("message") or res.content[:200].decode("utf-8", "replace")
+        raise RuntimeError(f"OCR API HTTP {res.status_code}: {msg}")
+    fields = ((j.get("data") or {}).get("provider_response") or {}).get("fields")
+    if not isinstance(fields, dict):
+        raise RuntimeError("OCR API returned an unexpected response (no data.provider_response.fields)")
+    return OcrResult("", "", "zoop_api", fields=fields, raw=j)

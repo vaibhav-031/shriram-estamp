@@ -151,16 +151,21 @@ def _order(ctx: Ctx, row: list[str]) -> str:
 
 
 def recheck_review(ctx: Ctx) -> tuple[int, int]:
-    """Re-run the checks on every NEEDS_REVIEW paper using its saved text (no re-upload, no new OCR).
-    Use after a config fix (new pattern, corrected amount). Passing papers move into Inventory."""
-    from .extract import analyze_paper
+    """Re-run the checks on every NEEDS_REVIEW paper using its saved reading – the OCR API's fields, or the saved
+    text (no re-upload, no new OCR). Use after a config fix (new pattern, corrected amount). Passing papers move into
+    Inventory. Papers held for a file-level reason (E105/E107 pairing) are not rechecked: they need a re-upload."""
+    from .extract import analyze_fields, analyze_paper
     db, g, s = ctx.db, ctx.google, ctx.settings
     moved = still = 0
     for p in db.q("SELECT * FROM papers WHERE status='NEEDS_REVIEW' ORDER BY id"):
-        if not p["ocr_text"]:
+        fields = (p.get("ocr_raw") or {}).get("fields")
+        if (not p["ocr_text"] and fields is None) or (p["notes"] or "").startswith(("E105", "E107")):
             still += 1
             continue
-        a = analyze_paper(p["ocr_text"], "", s, ctx.matcher, db.cert_is_live, ctx.resolver)
+        if fields is not None:
+            a = analyze_fields(fields, s, ctx.matcher, db.cert_is_live, ctx.resolver)
+        else:
+            a = analyze_paper(p["ocr_text"], "", s, ctx.matcher, db.cert_is_live, ctx.resolver)
         if not a.ok:
             db.update_paper(p["id"], notes="; ".join(a.issues))
             still += 1

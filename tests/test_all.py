@@ -18,6 +18,7 @@ from estamp.context import Ctx  # noqa: E402
 from estamp.extract import (CertMatcher, StateResolver, analyze_paper, normalize_ocr,  # noqa: E402
                             parse_order_tabs)
 from estamp.google_clients import FOLDER, GSHEET, PDF  # noqa: E402
+from estamp.http_api import ApiAuthError  # noqa: E402
 from estamp.settings import load_settings  # noqa: E402
 
 import samples  # noqa: E402
@@ -95,6 +96,9 @@ def env(settings):
     settings.raw["dry_run"] = False
     settings.raw["orders"]["settle_minutes"] = 0
     settings.raw["intake"]["settle_minutes"] = 0
+    # Default clients stay offline: pypdf split + FakeGoogle's "Drive OCR". Tests opt into the API paths with fakes.
+    settings.raw["intake"]["split_provider"] = "local"
+    settings.raw["intake"]["ocr_provider"] = "drive"
     g = FakeGoogle()
     root = g.folder("Shriram eStamp (Python)")
     for key in ["upload_inbox", "upload_archive", "needs_review", "inventory_root", "orders_incoming",
@@ -441,20 +445,92 @@ def test_split_api_is_rate_limited_and_retried(settings, split_api):
     assert [k[0] for k in http_api._limiters] == ["split"]                      # its own limiter
 
 
-def test_ocr_api_calls_go_through_the_shared_ocr_limiter(settings, split_api, monkeypatch):
+def _ocr_resp(fields: dict, code: int = 200, message: str = "Success") -> "_Resp":
+    """A 200 from the OCR API, shaped like the captured contract (docs/api-samples/ocr/README.md)."""
+    import json
+    pr = {"api_version": "v1", "success": True, "mode": "sync", "config_id": "ocrc_test", "response_code": code,
+          "message": message, "fields": fields, "metadata": {}, "time_taken": {"total_processing_time_ms": 900}}
+    body = {"success": True, "message": "ocr processed successfully", "status_code": 200,
+            "data": {"ocr_batch_id": "ocbt_test", "ocr_transaction_id": "ocrt_test", "provider_response": pr,
+                     "provider_response_raw": pr}}
+    return _Resp(200, json.dumps(body).encode(), "application/json")
+
+
+@pytest.fixture
+def ocr_api(settings, split_api, monkeypatch):
+    """OCR API configured with fake credentials; requests.post is the split_api recorder."""
+    monkeypatch.setenv("ZOOP_OCR_API_KEY", "test-key-not-real")
+    monkeypatch.setenv("ZOOP_OCR_ORG_ACC", "test-org-not-real")
+    return split_api
+
+
+def test_ocr_api_request_and_fields(settings, ocr_api):
+    import base64
+    from estamp.ocr_split import _ocr_zoop
+    calls, reply = ocr_api
+    fields = _f(certification_no="IN-HP90000000000001A", state_code="HP", stamp_duty_amount="100")
+    reply["resp"] = _ocr_resp(fields)
+    r = _ocr_zoop(b"%PDF-page", "up.pdf_p1", settings)
+    assert r.fields == fields and r.via == "zoop_api" and r.raw["data"]["provider_response"]["response_code"] == 200
+    (c,) = calls
+    assert c["url"] == settings.get("zoop_api.ocr.url")
+    assert c["headers"]["x-zoop-key"] == "test-key-not-real" and c["headers"]["x-zoop-org-acc"] == "test-org-not-real"
+    assert c["json"] == {"mode": "sync", "ocr_config_id": settings.get("zoop_api.ocr.config_id"),
+                         "documents": [{"data": base64.b64encode(b"%PDF-page").decode()}]}
+    assert c["timeout"] == settings.get("zoop_api.ocr.timeout_s")
+
+
+def test_ocr_api_not_found_is_a_reading_not_an_error(settings, ocr_api):
+    """211 'Certificate number not found' (e.g. a back page) comes back as empty fields – the checks decide."""
+    from estamp.ocr_split import _ocr_zoop
+    _, reply = ocr_api
+    reply["resp"] = _ocr_resp(_f(state_code="MP"), 211, "Certificate number not found")
+    assert _ocr_zoop(b"%PDF-page", "p2", settings).fields == _f(state_code="MP")
+
+
+@pytest.mark.parametrize("make_reply,err,needle", [
+    (lambda: {"resp": _Resp(422, b'{"success":false,"error":{"code":422,"type":"validation","message":"documents[0] '
+                                 b'only application/pdf ... accepted"}}', "application/json")},
+     RuntimeError, "OCR API HTTP 422: documents\\[0\\] only application/pdf"),
+    (lambda: {"resp": _Resp(401, b'{"success":false,"error":{"message":"invalid key"}}', "application/json")},
+     ApiAuthError, "ocr API refused the request \\(HTTP 401\\)"),
+    (lambda: {"resp": _Resp(200, b"<html>proxy</html>", "text/html")}, RuntimeError, "not JSON"),
+    (lambda: {"resp": _Resp(200, b'{"success":true,"data":{}}', "application/json")}, RuntimeError, "unexpected"),
+    (lambda: {"raise": requests.Timeout()}, RuntimeError, "timed out"),
+    (lambda: {"raise": requests.ConnectionError("pool…")}, RuntimeError, "unreachable"),
+])
+def test_ocr_api_failures_raise_clear_errors(settings, ocr_api, make_reply, err, needle):
+    from estamp.ocr_split import _ocr_zoop
+    _, reply = ocr_api
+    reply.update(make_reply())
+    with pytest.raises(err, match=needle):
+        _ocr_zoop(b"%PDF-page", "p1", settings)
+
+
+def test_ocr_api_without_credentials_never_calls(settings, ocr_api, monkeypatch):
+    from estamp.ocr_split import _ocr_zoop
+    calls, _ = ocr_api
+    monkeypatch.delenv("ZOOP_OCR_ORG_ACC")
+    with pytest.raises(RuntimeError, match="ZOOP_OCR_ORG_ACC"):
+        _ocr_zoop(b"%PDF-page", "p1", settings)
+    assert calls == []
+
+
+def test_ocr_api_calls_go_through_the_shared_ocr_limiter(settings, ocr_api):
     """A-07: OCR calls (intake and issue check use the same adapter) are rate-limited and retried, on their own
     limiter – separate from the split API's."""
     import estamp.http_api as http_api
     from estamp.ocr_split import _ocr_zoop
-    calls, reply = split_api
-    monkeypatch.setitem(settings.raw["zoop_api"]["ocr"], "url", "https://ocr.example.test/do")
-    monkeypatch.setenv("ZOOP_OCR_API_KEY", "test-key-not-real")
+    calls, reply = ocr_api
     reply["seq"] = [_Resp(503, b"{}", "application/json"),
-                    _Resp(200, b'{"data":{"text":"x","certificate_number":"IN-MH90000000000001A"}}',
-                          "application/json")]
+                    _ocr_resp(_f(certification_no="IN-MH90000000000001A", state_code="MH"))]
     r = _ocr_zoop(b"%PDF-fake", "p1", settings)
-    assert r.cert == "IN-MH90000000000001A" and len(calls) == 2
-    assert any(k[0] == "ocr" for k in http_api._limiters) and not any(k[0] == "split" for k in http_api._limiters)
+    assert _field_value(r.fields, "certification_no") == "IN-MH90000000000001A" and len(calls) == 2
+    assert [k[0] for k in http_api._limiters] == ["ocr"]
+
+
+def _field_value(fields, name):
+    return (fields.get(name) or {}).get("value")
 
 
 def test_split_api_rejects_a_pdf_with_no_pages_without_calling(settings, split_api):
@@ -512,32 +588,88 @@ def test_intake_via_split_api_keeps_front_and_back_together(env, monkeypatch):
 
 @e2e
 def test_traditional_page_with_a_text_layer_is_never_stocked_as_one_page(env):
-    """A 'searchable' scan has a text layer, so its upload looks digital. A page carrying a traditional
-    STATE-SERIAL in a digital upload must not be stocked as a 1-page paper without its back → Needs Review (E105)."""
+    """A 'searchable' scan of a traditional paper next to an e-stamp: the kinds clash (2-page vs 1-page papers), so
+    the whole file goes to Needs Review (E105) – the RJ front is never stocked as a 1-page paper without its back."""
     from estamp.cycle import run_cycle
     s, db, g = env
     g.add("searchable_scan.pdf", PDF, s.folder("upload_inbox"), samples.merged([
-        samples.physical_front("RAJASTHAN", "S 254201", 195), samples.physical_back("RAJASTHAN"),
-        samples.paper_page(samples.cert("MH", 1), 200)]))
+        samples.paper_page(samples.cert("MH", 1), 200),
+        samples.physical_front("RAJASTHAN", "S 254201", 195), samples.physical_back("RAJASTHAN")]))
     assert run_cycle(_ctx(s, db, g))
-    rows = {r["page_from"]: r for r in db.q("SELECT * FROM papers")}
-    assert rows[1]["status"] == "NEEDS_REVIEW" and "E105" in rows[1]["notes"], rows[1]
-    assert rows[3]["status"] == "AVAILABLE"                                   # the real e-stamp is fine
-    assert db.q1("SELECT count(*) n FROM papers WHERE status='AVAILABLE' AND cert_no LIKE 'RJ-%%'")["n"] == 0
+    status, notes, _ = _upload_review(db, g, s, "searchable_scan.pdf")
+    assert status == "REVIEW" and "E105" in notes and "page 2" in notes, notes
+    assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
 
 
-# ============================================================ Phase B: paper type + pairing (pure rules)
+# ============================================================ OCR API fields → paper (pure, ADR-0006)
+# Field values are made up, shaped like the real dev-API responses (structured fields only, no text).
 
-@pytest.mark.parametrize("chars,expected", [
-    ([500, 480, 512], "digital"),                 # e-stamp PDFs: every page has a real text layer
-    ([0, 0, 3, 0], "traditional"),                # scans: no / negligible text layer
-    ([500, 0], "mixed"),                          # digital and scanned in one upload
-    ([39, 41], "mixed"),                          # either side of the threshold (40)
-    ([], "mixed"),                                # nothing to decide on
+def _f(**kv):
+    """OCR API `fields`: every known field present, `{}` when not found, `{"value": …}` when found."""
+    names = ["certification_no", "state_code", "state_name", "stamp_duty_amount", "unique_doc_reference",
+             "first_party", "second_party"]
+    return {n: ({"value": kv[n]} if n in kv else {}) for n in names}
+
+
+@pytest.fixture(scope="session")
+def rm(settings):
+    r = StateResolver(settings.states)
+    return r, CertMatcher(settings.get("intake.cert_patterns"), r)
+
+
+@pytest.mark.parametrize("fields,expected", [
+    (_f(certification_no="IN-HP90000000000001A", state_code="HP", stamp_duty_amount="100",
+        unique_doc_reference="SUBIN-HPHP1904360426217599999999Y"), ("IN-HP90000000000001A", "HP", "estamp")),
+    (_f(unique_doc_reference="SUBIN-UPUP1405480472263158599999Y", state_code="UP"),          # certificate unreadable
+     ("SUBIN-UPUP1405480472263158599999Y", "UP", "estamp")),
+    (_f(certification_no="DH 318899", state_code="MP", state_name="Madhya Pradesh"), ("MP-DH318899", "MP", "physical")),
+    (_f(certification_no="g1k2026a999", state_name="HARYANA"), ("HR-G1K2026A999", "HR", "physical")),
+    (_f(state_code="MP", state_name="Madhya Pradesh"), None),                                # a back page
+    (_f(), None),
 ])
-def test_paper_type_from_text_layer(chars, expected):
-    from estamp.extract import paper_type
-    assert paper_type(chars, 40) == expected
+def test_id_from_api_fields(settings, rm, fields, expected):
+    from estamp.extract import id_from_fields
+    h = id_from_fields(fields, settings, rm[1], rm[0])
+    assert (h and (h.cert, h.state, h.kind)) == expected
+
+
+def test_analyze_fields_ok_and_failures(settings, rm):
+    from estamp.extract import analyze_fields
+    r, m = rm
+    ok = analyze_fields(_f(certification_no="IN-HP90000000000001A", state_code="HP", stamp_duty_amount="100"),
+                        settings, m, lambda c: False, r)
+    assert (ok.cert, ok.state, ok.amount, ok.issues) == ("IN-HP90000000000001A", "HP", 100, [])
+    bad_amount = analyze_fields(_f(certification_no="G1K2026A999", state_code="HR", stamp_duty_amount="101"),
+                                settings, m, lambda c: False, r)
+    assert any("₹101 is not an allowed amount for HR" in i for i in bad_amount.issues)
+    no_amount = analyze_fields(_f(certification_no="DH 318899", state_code="MP"), settings, m, lambda c: False, r)
+    assert "stamp duty amount not readable" in no_amount.issues
+    none = analyze_fields(_f(state_code="MP"), settings, m, lambda c: False, r)
+    assert "no certificate / serial number found" in none.issues
+    garbage = analyze_fields(_f(certification_no="IN-XX12", state_code="MH", stamp_duty_amount="200"),
+                             settings, m, lambda c: False, r)
+    assert any("does not look like" in i for i in garbage.issues)
+    dup = analyze_fields(_f(certification_no="DH 318899", state_code="MP", stamp_duty_amount="100"),
+                         settings, m, lambda c: True, r)
+    assert any("duplicate" in i for i in dup.issues)
+    inactive = analyze_fields(_f(certification_no="KL 123456", state_code="KL", stamp_duty_amount="200"),
+                              settings, m, lambda c: False, r)
+    assert any("inactive" in i for i in inactive.issues)
+
+
+@pytest.mark.parametrize("cert,state,kind,pages", [
+    ("IN-HP90000000000001A", "HP", "estamp", 1),     # e-stamps are always one page
+    ("MP-DH318899", "MP", "physical", 2),            # traditional paper: front + back
+    ("RJ-S254201", "RJ", "physical", 2),
+    ("HR-G1K2026A999", "HR", "physical", 1),         # state_config.csv: HR papers are one page
+    ("XX-123456", "", "physical", 2),                # unknown state → the safe default
+])
+def test_pages_per_paper(settings, cert, state, kind, pages):
+    from estamp.extract import IdHit, pages_per_paper
+    assert pages_per_paper(IdHit(cert, state, state, kind), settings) == pages
+
+
+# ============================================================ Phase B: pairing (pure rule)
 
 
 @pytest.mark.parametrize("pairs,expected", [
@@ -676,7 +808,7 @@ def test_serial_the_api_returns_for_a_back_page_breaks_the_pairing(env):
     for n in (1, 2):
         pages += [samples.scanned_front("RAJASTHAN", f"S 25420{n}", 195), samples.scanned_back("RAJASTHAN")]
     g.add("api_cert.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
-    ocr = FakeOcr(certs={"api_cert.pdf_p4": samples.cert("RJ", 9)})
+    ocr = FakeOcr(certs={"api_cert.pdf_p4": "S 254209"})      # a serial on a back page
     assert run_cycle(Ctx(s, db, g, ocr=ocr))
     rows = db.q("SELECT page_from, status, notes FROM papers ORDER BY page_from")
     assert [(r["page_from"], r["status"]) for r in rows] == [(1, "AVAILABLE"), (3, "NEEDS_REVIEW")], rows
@@ -742,28 +874,150 @@ def test_crash_mid_upload_then_rerun_stocks_nothing_twice(env, monkeypatch):
     assert not g.list_children(s.folder("upload_inbox"))
 
 
+# ------------------------------------------------------------ OCR API path (A-05 + ADR-0006), fake API from fields
+
+def _hp(n):
+    return samples.api_page(certification_no=f"IN-HP9000000000000{n}A", state_code="HP", state_name="HIMACHAL PRADESH",
+                            stamp_duty_amount="100", unique_doc_reference=f"SUBIN-HPHP19043604262175999999{n}Y")
+
+
+def _mp_front(serial):
+    return samples.api_page(certification_no=serial, state_code="MP", state_name="Madhya Pradesh", stamp_duty_amount="100")
+
+
+def _mp_back():
+    return samples.api_page(state_code="MP", state_name="Madhya Pradesh")      # 211: no certificate on a back
+
+
+@e2e
+def test_api_estamp_without_text_layer_is_stocked_and_issued(env):
+    """Real e-stamps are image PDFs (no text layer). Read through the API's fields: 1 page per paper, raw response
+    stored, and the issue check passes from the fields too."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeApiOcr
+    s, db, g = env
+    g.add("hp.pdf", PDF, s.folder("upload_inbox"), samples.merged([_hp(1), _hp(2)]))
+    g.add("orders", GSHEET, s.folder("orders_incoming"), tabs={"x": [samples.H, ["1", "LAN-HP1", "c", "b", "HP", "100"]]})
+    ocr = FakeApiOcr()
+    assert run_cycle(Ctx(s, db, g, ocr=ocr))
+    rows = db.q("SELECT cert_no, page_from, page_to, status, ocr_raw FROM papers ORDER BY page_from")
+    assert [(r["cert_no"], r["page_from"], r["page_to"]) for r in rows] == [
+        ("IN-HP90000000000001A", 1, 1), ("IN-HP90000000000002A", 2, 2)]
+    assert rows[0]["ocr_raw"]["fields"]["certification_no"]["value"] == "IN-HP90000000000001A"
+    a = db.q1("SELECT * FROM allocations")
+    assert a["lan"] == "LAN-HP1" and a["verified_cert"] == a["cert_no"] == "IN-HP90000000000001A"
+    assert "LAN-HP1.pdf_p1" in ocr.calls                                              # the issue check read it
+
+
+@e2e
+def test_api_traditional_pairs_and_one_page_state(env):
+    """MP papers are front + back (default 2); HR papers are 1 page (state_config.csv pages_per_paper=1)."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeApiOcr
+    s, db, g = env
+    g.add("mp.pdf", PDF, s.folder("upload_inbox"),
+          samples.merged([_mp_front("DH 318891"), _mp_back(), _mp_front("DH 318892"), _mp_back()]))
+    g.add("hr.pdf", PDF, s.folder("upload_inbox"), samples.merged([
+        samples.api_page(certification_no=f"G1K2026A99{n}", state_code="HR", stamp_duty_amount="100") for n in (1, 2, 3)]))
+    assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr()))
+    got = {r["cert_no"]: (r["page_from"], r["page_to"], r["status"]) for r in db.q("SELECT * FROM papers")}
+    assert got == {"MP-DH318891": (1, 2, "AVAILABLE"), "MP-DH318892": (3, 4, "AVAILABLE"),
+                   "HR-G1K2026A991": (1, 1, "AVAILABLE"), "HR-G1K2026A992": (2, 2, "AVAILABLE"),
+                   "HR-G1K2026A993": (3, 3, "AVAILABLE")}, got
+
+
+@e2e
+def test_api_file_whose_pages_disagree_goes_whole_to_review(env):
+    """An e-stamp (1 page) and a traditional MP paper (2 pages) in one file → E105, nothing split or stocked."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeApiOcr, FakeSplitter
+    s, db, g = env
+    g.add("mixed_api.pdf", PDF, s.folder("upload_inbox"), samples.merged([_hp(1), _mp_front("DH 318891"), _mp_back()]))
+    splitter = FakeSplitter()
+    assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr(), splitter=splitter))
+    status, notes, path = _upload_review(db, g, s, "mixed_api.pdf")
+    assert status == "REVIEW" and "E105" in notes and path.startswith("needs_review/"), (status, notes)
+    assert splitter.calls == [] and db.q1("SELECT count(*) n FROM papers")["n"] == 0
+
+
+@e2e
+def test_api_upload_with_no_readable_id_at_all_goes_whole_to_review(env):
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeApiOcr
+    s, db, g = env
+    g.add("blank.pdf", PDF, s.folder("upload_inbox"), samples.merged([_mp_back(), _mp_back()]))
+    assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr()))
+    status, notes, _ = _upload_review(db, g, s, "blank.pdf")
+    assert status == "REVIEW" and "E105" in notes
+
+
+@e2e
+def test_api_page_1_ocr_failure_retries_the_whole_upload(env):
+    """The type can't be decided without page 1 → the file stays in the inbox and is retried next cycle."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeApiOcr
+    s, db, g = env
+    g.add("hp_fail.pdf", PDF, s.folder("upload_inbox"), samples.merged([_hp(1), _hp(2)]))
+    ctx = Ctx(s, db, g, ocr=FakeApiOcr(fail={"hp_fail.pdf_p1": RuntimeError("OCR API HTTP 503: down")}))
+    run_cycle(ctx)
+    assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
+    assert any(f["name"] == "hp_fail.pdf" for f in g.list_children(s.folder("upload_inbox")))
+    assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr()))
+    assert db.q1("SELECT count(*) n FROM papers WHERE status='AVAILABLE'")["n"] == 2
+
+
+@e2e
+def test_api_recheck_review_uses_the_stored_fields(env, monkeypatch):
+    """HR ₹101 isn't allowed → Needs Review. After the config allows 101, recheck-review stocks it from the stored
+    API reading – no new OCR call."""
+    from estamp.actions import recheck_review
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeApiOcr
+    s, db, g = env
+    g.add("hr101.pdf", PDF, s.folder("upload_inbox"),
+          samples.api_page(certification_no="G1K2026A991", state_code="HR", stamp_duty_amount="101"))
+    assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr()))
+    p = db.q1("SELECT * FROM papers")
+    assert p["status"] == "NEEDS_REVIEW" and "₹101" in p["notes"]
+    monkeypatch.setattr(s.states["HR"], "amounts", [100, 101])
+    ocr = FakeApiOcr()
+    moved, still = recheck_review(Ctx(s, db, g, ocr=ocr))
+    assert (moved, still) == (1, 0) and ocr.calls == []
+    assert db.q1("SELECT * FROM papers")["status"] == "AVAILABLE"
+
+
 @e2e
 def test_estamps_never_grouped(env):
-    """E-stamps are one page each. One with an unreadable certificate must not swallow the next page as its 'back'."""
+    """E-stamps whose certificates are all unreadable: the kind (1 or 2 pages) can't be decided, so the whole file
+    goes to Needs Review (E105) – pages are never guessed into pairs."""
     from estamp.cycle import run_cycle
     s, db, g = env
     g.add("ka_estamps.pdf", PDF, s.folder("upload_inbox"), samples.merged([samples.estamp_no_cert() for _ in range(4)]))
     assert run_cycle(_ctx(s, db, g))
-    rows = db.q("SELECT page_from, page_to, status FROM papers ORDER BY page_from")
-    assert [(r["page_from"], r["page_to"]) for r in rows] == [(1, 1), (2, 2), (3, 3), (4, 4)], rows
-    assert all(r["status"] == "NEEDS_REVIEW" for r in rows)
+    status, notes, _ = _upload_review(db, g, s, "ka_estamps.pdf")
+    assert status == "REVIEW" and "E105" in notes
+    assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
 
 
-def test_digital_pdf_skips_ocr(settings):
-    """A digital e-stamp is read from its built-in text; OCR (google) is never called."""
+def test_configured_reader_is_the_ocr_api_only(settings, ocr_api):
+    """D1 / ADR-0002 with config.yaml as shipped: even a PDF with a text layer is read by the OCR API, and an API
+    failure is raised – never silently answered from the text layer or Drive OCR."""
     from estamp.ocr_split import read_paper
+    _, reply = ocr_api
+    settings = load_settings(ROOT / "config.yaml")             # as shipped, not the session copy tests adjust
+    assert settings.get("intake.ocr_provider") == "zoop_api" and settings.get("intake.use_pdf_text") is False
+    assert settings.get("intake.ocr_fallback_to_drive") is False
 
-    class NoOCR:
+    class NoDrive:
         def ocr_text(self, *a):
-            raise AssertionError("OCR must not be called for a digital PDF")
+            raise AssertionError("Drive OCR must never be used as a fallback")
 
-    r = read_paper(samples.paper_page(samples.cert("MH", 1), 200), "x", settings, NoOCR())
-    assert r.via == "pdf-text" and samples.cert("MH", 1) in r.text
+    reply["resp"] = _ocr_resp(_f(certification_no="IN-MH90000000000001A", state_code="MH"))
+    r = read_paper(samples.paper_page(samples.cert("MH", 1), 200), "x", settings, NoDrive())
+    assert r.via == "zoop_api" and r.fields["certification_no"]["value"] == "IN-MH90000000000001A"
+    reply["resp"] = _Resp(500, b'{"success":false,"message":"down"}', "application/json")
+    with pytest.raises(RuntimeError, match="OCR API HTTP 500"):
+        read_paper(samples.paper_page(samples.cert("MH", 1), 200), "x", settings, NoDrive())
 
 
 UP_P2 = """INDIA NON JUDICIAL Government of Uttar Pradesh\ne-Stamp\n100 100 100 100\n\\*0000000100\nCertificate No.\nCertificate Issued Date Account Reference.\nUnique Doc. Reference\nPurchased by\nStamp Duty Paid By\n23-Sep-2026 06:38 PM\nNEWIMPACC (SV)/ up14054804/ GAUTAMBUDDH NAGAR 2/ UP-GBN\n:SUBIN-UPUP1405480472263158537115Y\nSHRIRAM FINANCE LIMITED\nStamp Duty Amount(Rs.)\n100\n(One Hundred only)\n"""

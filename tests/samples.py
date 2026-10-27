@@ -150,6 +150,13 @@ def scanned_back(state_name: str, buyer="SHRIRAM FINANCE LIMITED") -> bytes:
     return scanned_page(["245117", "24.09.2026", buyer, state_name, "Licence No. 28 / 2024"])
 
 
+def api_page(**fields) -> bytes:
+    """An image-only page (like real e-stamps and scans) carrying what the OCR API would return for it, e.g.
+    api_page(certification_no="IN-HP…", state_code="HP", stamp_duty_amount="100"). Read by FakeApiOcr."""
+    import json
+    return scanned_page(["FIELDS:" + json.dumps({k: {"value": v} for k, v in fields.items()})])
+
+
 def ocr_text_of(data: bytes) -> str:
     """What a perfect OCR reads: the hidden key on scanned pages, the text layer otherwise."""
     out = []

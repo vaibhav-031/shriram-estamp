@@ -51,14 +51,13 @@ orders:
 
 intake:
   settle_minutes: 0           # ignore uploads still being copied in
-  split_provider: local       # local (pypdf) | zoop_api
-  use_pdf_text: true          # digital e-stamps: read the PDF's built-in text first (instant, exact) – off with A-09
-  # Paper type per upload (ADR-0003): every page has ≥ min_pdf_text_chars text-layer characters → digital
-  # (1 page/paper); every page below it → traditional scan (front + back, 2 pages/paper); a mix → whole upload
-  # to Needs Review (E105).
-  min_pdf_text_chars: 40
-  ocr_provider: drive         # drive | zoop_api   (only used for scanned pages)
-  ocr_fallback_to_drive: true
+  # Switched to the in-house APIs 2026-10-27 (A-05, A-07, Phase B green). D1: one reader, no silent fallback.
+  # Pages per paper are decided from the OCR'd IDs (ADR-0006) – state_config.csv → pages_per_paper.
+  split_provider: zoop_api    # local (pypdf) | zoop_api
+  ocr_provider: zoop_api      # zoop_api | drive (legacy, removed with A-09)
+  use_pdf_text: false         # legacy text-layer reading – must stay false with the OCR API (D1)
+  min_pdf_text_chars: 40      # legacy, only used when use_pdf_text is true
+  ocr_fallback_to_drive: false
   required_text: []           # e.g. ["SHRIRAM"] – turn on once sample papers confirm the party name prints
   cert_patterns:
     DEFAULT: '\bIN-([A-Z]{2})(\d{12,16})([A-Z])'      # SHCIL style IN-MH12345678901234X; group 1 = state
@@ -96,14 +95,12 @@ zoop_api:                     # fill in when the in-house APIs are ready
     retries: 3                # 429 / 5xx / timeout / connection error; 401/403 never retried
     backoff_s: 1              # 1 s, 2 s, 4 s …
     max_total_s: 400          # no new retry after this; worst case ≈ max_total_s + timeout_s
-  ocr:
-    url: ""
-    api_key_env: ZOOP_OCR_API_KEY
-    auth_header: x-api-key
-    file_field: file
-    text_path: data.text
-    cert_path: data.certificate_number
-    timeout_s: 60
+  ocr:                        # contract: docs/api-samples/ocr/README.md (dev endpoint; production URL at Phase H)
+    url: https://dev-ai.zoop.one/parsely-top-layer/v1/ocr/do
+    config_id: ocrc_2f0e4e33ae22475f976e4787d62e08e2
+    api_key_env: ZOOP_OCR_API_KEY       # names of the .env variables – never the values
+    org_acc_env: ZOOP_OCR_ORG_ACC
+    timeout_s: 60             # per try, per page (real pages took 1–3 s)
     rate_per_s: 5             # HANDOFF A3: max 5 OCR requests/second, shared by intake + issue check (A-07)
     retries: 3
     backoff_s: 1

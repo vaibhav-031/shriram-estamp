@@ -1,0 +1,1 @@
+{"success":false,"error":{"code":422,"type":"validation","message":"documents[0] only application/pdf, image/jpeg, image/png, image/tiff document types are accepted"}}
