@@ -1563,3 +1563,86 @@ def test_recover_stuck_flips_both_the_order_and_its_paper(env):
     assert (n_o, n_p) == (1, 1)
     assert db.q1("SELECT status FROM orders WHERE id=%s", (order["id"],))["status"] == "ERROR"
     assert db.q1("SELECT status FROM papers WHERE id=%s", (paper["id"],))["status"] == "ERROR"
+
+
+# ── #7 ops actions emit events + #11 CANCEL commits before the Drive move ───────────────
+@e2e
+def test_ops_actions_emit_events(env):
+    """RETRY, KEEP_STATE and CANCEL each change ledger state – each must leave a row in the events table (Log tab)."""
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    g.add("TEST_Shriram_MH_LANs_26Oct", GSHEET, s.folder("orders_incoming"),
+          tabs={"x": [samples.H, ["1", "LAN-CANCEL", "c", "b", "MH", "200"]]})
+    _stock(g, s, "MH", 200, 1)
+    assert run_cycle(_ctx(s, db, g))
+    assert db.q1("SELECT status FROM orders WHERE lan='LAN-CANCEL'")["status"] == "DONE"
+
+    db.q("INSERT INTO orders(lan, lan_key, state, denomination, status, notes) VALUES "
+         "('LAN-RETRY','LAN-RETRY','MH',200,'ERROR','boom')")
+    db.q("INSERT INTO orders(lan, lan_key, state, denomination, status) VALUES "
+         "('LAN-CONF','LAN-CONF','MH',200,'CONFLICT'), ('LAN-CONF','LAN-CONF','KA',500,'CONFLICT')")
+
+    before = db.q1("SELECT count(*) n FROM events")["n"]
+    ctl = g.sheets_data[s.get("control_sheet_id")]
+    ctl["Order Actions"].append(["LAN-RETRY", "RETRY", ""])
+    ctl["Order Actions"].append(["LAN-CONF", "KEEP_STATE", "MH"])
+    ctl["Order Actions"].append(["LAN-CANCEL", "CANCEL", ""])
+    assert run_cycle(_ctx(s, db, g))
+
+    results = [r[3] for r in ctl["Order Actions"][1:]]
+    assert results == ["DONE: back to PENDING", "DONE: MH kept, others cancelled",
+                       "DONE: cancelled, paper returned to stock"], results
+    assert db.q1("SELECT count(*) n FROM events")["n"] > before
+    for action, needle in [("Retry", "LAN-RETRY"), ("KeepState", "LAN-CONF"), ("Cancel", "LAN-CANCEL")]:
+        hit = db.q1("SELECT count(*) n FROM events WHERE action=%s AND details LIKE %s", (action, f"%{needle}%"))
+        assert hit["n"] >= 1, f"no event for {action} ({needle})"
+
+
+@e2e
+def test_cancel_after_issue_commits_before_drive_move(env):
+    """CANCEL of a fulfilled LAN returns the paper to stock (AVAILABLE) and writes a CANCELLED output row.
+    The ledger commit happens before the Drive move, so a move failure after commit leaves the ledger consistent."""
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    g.add("TEST_Shriram_MH_LANs_26Oct", GSHEET, s.folder("orders_incoming"),
+          tabs={"x": [samples.H, ["1", "LAN-X", "c", "b", "MH", "200"]]})
+    _stock(g, s, "MH", 200, 1)
+    assert run_cycle(_ctx(s, db, g))
+    o = db.q1("SELECT * FROM orders WHERE lan='LAN-X'")
+    assert o["status"] == "DONE"
+
+    ctl = g.sheets_data[s.get("control_sheet_id")]
+    ctl["Order Actions"].append(["LAN-X", "CANCEL", ""])
+    assert run_cycle(_ctx(s, db, g))
+
+    assert ctl["Order Actions"][1][3] == "DONE: cancelled, paper returned to stock"
+    p = db.q1("SELECT p.* FROM papers p WHERE p.id=%s", (o["paper_id"],))
+    assert p["status"] == "AVAILABLE" and p["order_id"] is None
+    assert g.path_of(p["drive_file_id"]).startswith("inventory_root/MH/200/")
+    out = [rows for sid, tabs in g.sheets_data.items() if sid in g.files and g.files[sid]["name"] == "MH-200"
+           for rows in tabs.values()][0]
+    assert out[-1][5].startswith("CANCELLED"), out[-1]
+
+    # move failure AFTER commit: ledger must still be consistent, and a WARN event is logged
+    g.add("TEST_Shriram_MH_LANs_26Oct_2", GSHEET, s.folder("orders_incoming"),
+          tabs={"x": [samples.H, ["1", "LAN-Y", "c", "b", "MH", "200"]]})
+    _stock(g, s, "MH", 200, 1, start=50)
+    assert run_cycle(_ctx(s, db, g))
+    oy = db.q1("SELECT * FROM orders WHERE lan='LAN-Y'")
+    assert oy["status"] == "DONE"
+
+    boom = FakeGoogle.move_rename
+    def fail_move(self, fid, new_parent, new_name=None):
+        raise RuntimeError("Drive 503")
+    FakeGoogle.move_rename = fail_move
+    try:
+        ctl["Order Actions"].append(["LAN-Y", "CANCEL", ""])
+        warn_before = db.q1("SELECT count(*) n FROM events WHERE level='WARN'")["n"]
+        assert run_cycle(_ctx(s, db, g))
+    finally:
+        FakeGoogle.move_rename = boom
+    assert ctl["Order Actions"][-1][3] == "DONE: cancelled, paper returned to stock"
+    py = db.q1("SELECT * FROM papers WHERE id=%s", (oy["paper_id"],))
+    assert py["status"] == "AVAILABLE" and py["order_id"] is None
+    assert db.q1("SELECT status FROM orders WHERE lan='LAN-Y'")["status"] == "CANCELLED"
+    assert db.q1("SELECT count(*) n FROM events WHERE level='WARN'")["n"] > warn_before

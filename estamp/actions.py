@@ -143,6 +143,7 @@ def _order(ctx: Ctx, row: list[str]) -> str:
             return f"SKIPPED: LAN is {rows[-1]['status']}, not ERROR"
         db.q("UPDATE orders SET status='PENDING', notes=%s, updated_at=now() WHERE id=%s",
              (f"retry requested | was: {errs[0]['notes']}", errs[0]["id"]))
+        ctx.event("INFO", "Retry", f"LAN {errs[0]['lan']} retried by ops (ERROR → PENDING)")
         return "DONE: back to PENDING"
 
     if action == "KEEP_STATE":
@@ -158,6 +159,7 @@ def _order(ctx: Ctx, row: list[str]) -> str:
                       "WHERE id = ANY(%s)", ([r["id"] for r in conf if r["id"] != keep[0]["id"]],))
             c.execute("UPDATE orders SET status='PENDING', notes='conflict resolved by ops', updated_at=now() WHERE id=%s",
                       (keep[0]["id"],))
+        ctx.event("INFO", "KeepState", f"LAN {keep[0]['lan']} conflict resolved by ops: {state} kept, others cancelled")
         return f"DONE: {state} kept, others cancelled"
 
     if action == "CANCEL":
@@ -167,15 +169,18 @@ def _order(ctx: Ctx, row: list[str]) -> str:
         if o["status"] != "DONE":
             db.q("UPDATE orders SET status='CANCELLED', notes='cancelled by ops', updated_at=now() WHERE lan_key=%s "
                  "AND status <> 'CANCELLED'", (lan_key,))
+            ctx.event("INFO", "Cancel", f"LAN {o['lan']} cancelled by ops (no paper had been issued)")
             return "DONE: cancelled (no paper had been issued)"
         p = db.q1("SELECT * FROM papers WHERE id=%s", (o["paper_id"],))
         a = db.q1("SELECT * FROM allocations WHERE order_id=%s AND cancelled_at IS NULL", (o["id"],))
         if not s.get("allocation.cancel_returns_paper", True):
             db.q("UPDATE orders SET status='CANCELLED', notes='cancelled by ops after issue; paper NOT returned', "
                  "updated_at=now() WHERE id=%s", (o["id"],))
+            ctx.event("INFO", "Cancel", f"LAN {o['lan']} cancelled by ops after issue; paper {p['cert_no']} kept as used")
             return "DONE: cancelled; paper kept as used"
-        g.move_rename(p["drive_file_id"], g.folder_path(s.folder(INVENTORY_ROOT), [p["state"], str(p["denomination"])]),
-                      f"{p['cert_no']}.pdf")
+        # Record in DB before any Drive change (#11): commit the ledger first, then move the file back
+        # to Inventory. A move failure after the commit is recoverable and only warns – the ledger is
+        # already correct, so a crash here can never leave the paper issued-but-marked-returned.
         with db.conn() as c, c.transaction():
             c.execute("UPDATE papers SET status='AVAILABLE', order_id=NULL, file_name=%s, "
                       "notes=%s, updated_at=now() WHERE id=%s", (f"{p['cert_no']}.pdf", f"returned from LAN {o['lan']}", p["id"]))
@@ -183,6 +188,12 @@ def _order(ctx: Ctx, row: list[str]) -> str:
                       "updated_at=now() WHERE id=%s", (o["id"],))
             if a:
                 c.execute("UPDATE allocations SET cancelled_at=now() WHERE id=%s", (a["id"],))
+        try:
+            g.move_rename(p["drive_file_id"], g.folder_path(s.folder(INVENTORY_ROOT), [p["state"], str(p["denomination"])]),
+                          f"{p['cert_no']}.pdf")
+        except Exception as e:  # ledger already consistent; the file can be relocated from wherever it is
+            ctx.event("WARN", "Cancel", f"LAN {o['lan']} cancelled; paper {p['cert_no']} marked AVAILABLE but could not "
+                      f"be moved back to Inventory: {e}")
         if a:
             sid = output_sheet_id(ctx, a["alloc_date"], a["state"], a["denomination"])
             g.append_rows(sid, label_for(a["state"], a["denomination"]),
