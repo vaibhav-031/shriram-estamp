@@ -104,7 +104,16 @@ ALTER TABLE allocations ADD COLUMN IF NOT EXISTS verified_cert TEXT;
 ALTER TABLE allocations ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ;
 ALTER TABLE allocations ADD COLUMN IF NOT EXISTS verified_via TEXT;
 ALTER TABLE papers ADD COLUMN IF NOT EXISTS ocr_raw JSONB;      -- OCR API reading per paper (A-05)
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS api_cert_no TEXT;         -- pre-edit API values vs the ops correction (E-07)
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS api_denomination INT;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS api_state TEXT;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS ops_edited_by TEXT;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS ops_edited_at TIMESTAMPTZ;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS vendor_code TEXT;   -- D-1: which inbox vendor folder the upload came from
 CREATE INDEX IF NOT EXISTS alloc_unwritten_idx ON allocations(alloc_date, state, denomination) WHERE NOT output_written;
+-- One live allocation per order, ever: the DB backstop against double-issuing a LAN (#6). A cancelled
+-- allocation (cancelled_at set) is excluded so a later re-order of a cancelled LAN is still allowed.
+CREATE UNIQUE INDEX IF NOT EXISTS allocations_order_live_uq ON allocations(order_id) WHERE cancelled_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS output_sheets (
   alloc_date     DATE NOT NULL,
@@ -160,6 +169,26 @@ class DB:
         with psycopg.connect(self.url, autocommit=True) as c:
             c.execute(SCHEMA_SQL.format(schema=self.schema))
 
+    def table_counts(self) -> dict[str, int]:
+        """Row count per table in this schema, enumerated from information_schema (not hardcoded)."""
+        return {t: self.q1(f'SELECT count(*) n FROM "{self.schema}"."{t}"')["n"] for t in self._tables()}
+
+    def reset_all_data(self) -> dict[str, int]:
+        """Wipe every table in this schema (TRUNCATE ... RESTART IDENTITY CASCADE) in one transaction.
+        Keeps the schema and tables so the service keeps working. Returns the per-table row counts it cleared."""
+        before = self.table_counts()
+        tables = list(before)
+        if tables:
+            qualified = ", ".join(f'"{self.schema}"."{t}"' for t in tables)
+            with self.conn() as c, c.transaction():
+                c.execute(f"TRUNCATE {qualified} RESTART IDENTITY CASCADE")
+        return before
+
+    def _tables(self) -> list[str]:
+        return [r["table_name"] for r in self.q(
+            """SELECT table_name FROM information_schema.tables
+               WHERE table_schema=%s AND table_type='BASE TABLE' ORDER BY table_name""", (self.schema,))]
+
     def close(self) -> None:
         self.release_lock()
         self.pool.close()
@@ -208,6 +237,14 @@ class DB:
     def start_run(self) -> int:
         return self.q1("INSERT INTO runs DEFAULT VALUES RETURNING id")["id"]
 
+    def active_run_age_seconds(self) -> float | None:
+        """Seconds since the newest still-running cycle started, or None if no cycle is running. When a new
+        cycle can't get the lock, this says how long the holder has been going – a value far past a normal
+        cycle means the holder is wedged and blocking all work (#3). A hard crash drops the lock, so if the
+        lock is held there really is a live holder and the newest unfinished run is it."""
+        row = self.q1("SELECT extract(epoch FROM now() - max(started_at)) AS age FROM runs WHERE finished_at IS NULL")
+        return float(row["age"]) if row and row["age"] is not None else None
+
     def finish_run(self, run_id: int, ok: bool, summary: dict) -> None:
         self.q("UPDATE runs SET finished_at=now(), ok=%s, summary=%s WHERE id=%s",
                (ok, json.dumps(summary, default=str), run_id))
@@ -241,9 +278,15 @@ class DB:
         vals = tuple(Jsonb(v) if isinstance(v, dict) else v for v in f.values())
         return self.q1(f"INSERT INTO papers({cols}) VALUES ({ph}) RETURNING id", vals)["id"]
 
+    def file_is_stocked(self, file_id: str) -> bool:
+        """True if some paper row already points at this Drive file – so intake can tell a reusable orphan
+        (crashed prior upload, no row) from a file that genuinely belongs to a stocked paper (#9)."""
+        return self.q1("SELECT 1 FROM papers WHERE drive_file_id=%s LIMIT 1", (file_id,)) is not None
+
     def update_paper(self, paper_id: int, **f: Any) -> None:
         sets = ", ".join(f"{k}=%s" for k in f)
-        self.q(f"UPDATE papers SET {sets}, updated_at=now() WHERE id=%s", (*f.values(), paper_id))
+        vals = tuple(Jsonb(v) if isinstance(v, dict) else v for v in f.values())
+        self.q(f"UPDATE papers SET {sets}, updated_at=now() WHERE id=%s", (*vals, paper_id))
 
     # ---------------------------------------------------------------- orders
     def existing_orders(self, lan_keys: list[str]) -> dict[str, list[dict]]:
@@ -302,8 +345,14 @@ class DB:
                        verified_cert, verified_cert, verified_via))
             c.execute("""UPDATE papers SET status='ASSIGNED', file_name=%s, notes=NULL, updated_at=now() WHERE id=%s""",
                       (pdf_name, paper["id"]))
-            c.execute("""UPDATE orders SET status='DONE', paper_id=%s, cert_no=%s, pdf_link=%s, notes=NULL, updated_at=now()
-                         WHERE id=%s""", (paper["id"], paper["cert_no"], pdf_link, order["id"]))
+            # Only finish an order that is still ALLOCATING. If recovery/ops moved it (ERROR/DONE/CANCELLED)
+            # the 0-row update raises and rolls back the whole transaction – never issue the same LAN twice (#6).
+            cur = c.execute("""UPDATE orders SET status='DONE', paper_id=%s, cert_no=%s, pdf_link=%s, notes=NULL,
+                               updated_at=now() WHERE id=%s AND status='ALLOCATING'""",
+                            (paper["id"], paper["cert_no"], pdf_link, order["id"]))
+            if cur.rowcount != 1:
+                raise RuntimeError(f"order {order['id']} ({order['lan']}) was not ALLOCATING when finishing "
+                                   "allocation – refusing to issue (its status changed under us)")
 
     def fail_allocation(self, order: dict, paper: dict | None, msg: str) -> None:
         with self.conn() as c, c.transaction():
@@ -313,12 +362,16 @@ class DB:
                           (f"{msg} | LAN {order['lan']}", paper["id"]))
 
     def recover_stuck(self, minutes: int) -> tuple[int, int]:
-        o = self.q("""UPDATE orders SET status='ERROR', updated_at=now(),
-                      notes='process stopped mid-allocation – check Output/Backup folders before retrying'
-                      WHERE status='ALLOCATING' AND updated_at < now() - make_interval(mins => %s) RETURNING id""", (minutes,))
-        p = self.q("""UPDATE papers SET status='ERROR', updated_at=now(),
-                      notes='process stopped mid-allocation – check where this file is before approving'
-                      WHERE status='RESERVED' AND updated_at < now() - make_interval(mins => %s) RETURNING id""", (minutes,))
+        # One transaction so the orders and papers flips land together – a crash can't half-recover (#8).
+        with self.conn() as c, c.transaction():
+            o = c.execute("""UPDATE orders SET status='ERROR', updated_at=now(),
+                          notes='process stopped mid-allocation – check Output/Backup folders before retrying'
+                          WHERE status='ALLOCATING' AND updated_at < now() - make_interval(mins => %s) RETURNING id""",
+                          (minutes,)).fetchall()
+            p = c.execute("""UPDATE papers SET status='ERROR', updated_at=now(),
+                          notes='process stopped mid-allocation – check where this file is before approving'
+                          WHERE status='RESERVED' AND updated_at < now() - make_interval(mins => %s) RETURNING id""",
+                          (minutes,)).fetchall()
         return len(o), len(p)
 
     # ---------------------------------------------------------------- outputs

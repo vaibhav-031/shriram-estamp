@@ -39,6 +39,11 @@ def test_projection_loaded(settings):
     assert settings.states["RJ"].amounts == [195]
 
 
+def test_vendors_loaded(settings):
+    assert set(settings.vendors) == {"PAPEREASE", "AGREXP", "SHABDA"}
+    assert settings.vendors["PAPEREASE"].name == "Paper Ease" and settings.vendors["PAPEREASE"].active
+
+
 @pytest.mark.parametrize("raw,code", [("KARTNATAKA", "KA"), ("ANDRA PRADESH", "AP"), ("UTTARPRADESH", "UP"),
                                       ("DELHI NCR", "DL"), ("KOLKATA", "WB"), ("JAMMU & KASHMIR", "JK"),
                                       ("gujarat", "GJ"), ("MH", "MH"), ("Telangana", "TS"), ("Sheet1", "")])
@@ -96,9 +101,9 @@ def env(settings):
     settings.raw["dry_run"] = False
     settings.raw["orders"]["settle_minutes"] = 0
     settings.raw["intake"]["settle_minutes"] = 0
-    # Default clients stay offline: pypdf split + FakeGoogle's "Drive OCR". Tests opt into the API paths with fakes.
+    # Default clients stay offline: pypdf split + an offline fake reader (_ctx / explicit ocr=). The live reader is
+    # the in-house OCR API; tests opt into it with FakeApiOcr. (Drive OCR was removed in A-09.)
     settings.raw["intake"]["split_provider"] = "local"
-    settings.raw["intake"]["ocr_provider"] = "drive"
     g = FakeGoogle()
     root = g.folder("Shriram eStamp (Python)")
     for key in ["upload_inbox", "upload_archive", "needs_review", "inventory_root", "orders_incoming",
@@ -112,12 +117,34 @@ def env(settings):
 
 
 def _ctx(settings, db, g):
-    return Ctx(settings, db, g)
+    from fake_apis import FakeOcr
+    return Ctx(settings, db, g, ocr=FakeOcr())   # offline reader; stands in for the live OCR API in e2e
+
+
+def _vendor_folder(g, s, name="Paper Ease"):
+    """The inbox subfolder ops drop files into (D-1: files must sit inside a vendor folder, never the root)."""
+    return g.folder_path(s.folder("upload_inbox"), [name])
+
+
+def inbox_add(g, s, name, mime, data=b"", vendor="Paper Ease", **kw):
+    """g.add into the inbox, but inside a vendor folder so intake will process it (root files are E101)."""
+    return g.add(name, mime, _vendor_folder(g, s, vendor), data, **kw)
+
+
+def _inbox_files(g, s):
+    """Every non-folder file still in the inbox, at any depth (vendor folders stay; their contents are the uploads)."""
+    files, _ = _intake_collect(g, s.folder("upload_inbox"))
+    return files
+
+
+def _intake_collect(g, folder_id):
+    from estamp.intake import _collect
+    return _collect(g, folder_id)
 
 
 def _stock(g, s, state, amount, n, start=1):
     pages = [samples.paper_page(samples.cert(state, start + i), amount) for i in range(n)]
-    return g.add(f"vendor_{state}_{amount}_{start}.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
+    return inbox_add(g, s, f"vendor_{state}_{amount}_{start}.pdf", PDF, samples.merged(pages))
 
 
 @e2e
@@ -133,13 +160,13 @@ def test_full_flow(env):
     _stock(g, s, "TN", 200, 6)
     _stock(g, s, "GJ", 300, 10)
     _stock(g, s, "UP", 100, 10)
-    g.add("vendor_KA_copy.pdf", PDF, s.folder("upload_inbox"), g.files[ka]["data"])          # exact duplicate upload
+    g.add("vendor_KA_copy.pdf", PDF, _vendor_folder(g, s), g.files[ka]["data"])          # exact duplicate upload
     bad = samples.merged([samples.paper_page(samples.cert("MH", 900), 100),                  # wrong amount for MH
                           samples.paper_page(samples.cert("MH", 1), 200),                    # duplicate cert
                           samples.paper_page("", 200),                                       # no cert
                           samples.paper_page(samples.cert("KL", 1), 200)])                   # inactive state
-    g.add("vendor_mixed_bad.pdf", PDF, s.folder("upload_inbox"), bad)
-    g.add("notes.txt", "text/plain", s.folder("upload_inbox"), b"hello")
+    g.add("vendor_mixed_bad.pdf", PDF, _vendor_folder(g, s), bad)
+    g.add("notes.txt", "text/plain", _vendor_folder(g, s), b"hello")
 
     ctx = _ctx(s, db, g)
     assert run_cycle(ctx)
@@ -172,7 +199,7 @@ def test_full_flow(env):
     assert db.q1("SELECT count(*) n FROM allocations WHERE verified_cert IS DISTINCT FROM cert_no")["n"] == 0
     # every order file left the inbox; the non-PDF and the duplicate upload went to Needs Review
     assert g.list_children(s.folder("orders_incoming")) == []
-    assert g.list_children(s.folder("upload_inbox")) == []
+    assert _inbox_files(g, s) == []
     # dashboard
     ctl = g.sheets_data[s.get("control_sheet_id")]
     assert {"Summary", "Stock", "Needs Review", "Exceptions", "Log"} <= set(ctl)
@@ -189,7 +216,7 @@ def test_full_flow(env):
     ctx2 = _ctx(s, db, g)
     assert run_cycle(ctx2)
 
-    assert [r[5] for r in ctl["Review Actions"][1:]][0].startswith("DONE: approved")
+    assert [r[6] for r in ctl["Review Actions"][1:]][0].startswith("DONE: approved")
     results = [r[3] for r in ctl["Order Actions"][1:]]
     assert results[0].startswith("DONE: MH kept") and results[1].startswith("DONE: cancelled, paper returned"), results
     st = {r["status"]: r["n"] for r in db.q("SELECT status, count(*) n FROM orders GROUP BY 1")}
@@ -197,6 +224,126 @@ def test_full_flow(env):
     up_paper = db.q1("SELECT p.* FROM papers p JOIN orders o ON o.paper_id = p.id WHERE o.lan='TEST-UP-000010'")
     assert up_paper["status"] == "AVAILABLE" and g.path_of(up_paper["drive_file_id"]).startswith("inventory_root/UP/100/")
     assert outs["UP-100"][-1][5].startswith("CANCELLED")
+
+
+@e2e
+def test_active_run_age_reports_newest_unfinished_run(env):
+    s, db, g = env
+    assert db.active_run_age_seconds() is None                 # no runs yet
+    done = db.start_run()
+    db.finish_run(done, True, {})
+    assert db.active_run_age_seconds() is None                 # finished runs don't count
+    live = db.start_run()
+    db.q("UPDATE runs SET started_at = now() - interval '40 minutes' WHERE id=%s", (live,))
+    age = db.active_run_age_seconds()
+    assert age is not None and age >= 40 * 60                  # age of the newest unfinished run
+
+
+@e2e
+def test_a_wedged_cycle_holder_raises_an_alert_instead_of_skipping_silently(env):
+    import zlib
+
+    import psycopg
+
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    # A second session holds the advisory lock and has a run that started 40 min ago but never finished –
+    # i.e. a wedged process blocking every new cycle. The skip must escalate to an alert, not stay silent.
+    holder = psycopg.connect(DB_URL, autocommit=True)
+    holder.execute("SELECT pg_advisory_lock(%s)", (zlib.crc32(f"estamp:{db.schema}".encode()),))
+    stuck = db.start_run()
+    db.q("UPDATE runs SET started_at = now() - interval '40 minutes' WHERE id=%s", (stuck,))
+    try:
+        runs_before = db.q1("SELECT count(*) n FROM runs")["n"]
+        ctx = _ctx(s, db, g)
+        assert run_cycle(ctx)                                       # returns True (skipped)
+        assert db.q1("SELECT count(*) n FROM runs")["n"] == runs_before, "a skipped cycle must not start a new run"
+        wedged = [e["details"] for e in db.q("SELECT details FROM events WHERE level='ERROR' AND action='Cycle'")]
+        assert any("wedged" in d for d in wedged), wedged
+        assert any("wedged" in a for a in ctx.alerts)
+    finally:
+        holder.close()
+
+
+@e2e
+def test_a_brief_overlap_skips_quietly_without_an_alert(env):
+    import zlib
+
+    import psycopg
+
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    # Holder started just now (normal overlap of two cycles) – no alert, just a quiet skip.
+    holder = psycopg.connect(DB_URL, autocommit=True)
+    holder.execute("SELECT pg_advisory_lock(%s)", (zlib.crc32(f"estamp:{db.schema}".encode()),))
+    db.start_run()
+    try:
+        ctx = _ctx(s, db, g)
+        assert run_cycle(ctx)
+        assert db.q1("SELECT count(*) n FROM events WHERE level='ERROR'")["n"] == 0, "brief overlap must not alert"
+        assert ctx.alerts == []
+    finally:
+        holder.close()
+
+
+@e2e
+def test_active_run_age_reports_newest_unfinished_run(env):
+    s, db, g = env
+    assert db.active_run_age_seconds() is None                 # no runs yet
+    done = db.start_run()
+    db.finish_run(done, True, {})
+    assert db.active_run_age_seconds() is None                 # finished runs don't count
+    live = db.start_run()
+    db.q("UPDATE runs SET started_at = now() - interval '40 minutes' WHERE id=%s", (live,))
+    age = db.active_run_age_seconds()
+    assert age is not None and age >= 40 * 60                  # age of the newest unfinished run
+
+
+@e2e
+def test_a_wedged_cycle_holder_raises_an_alert_instead_of_skipping_silently(env):
+    import zlib
+
+    import psycopg
+
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    # A second session holds the advisory lock and has a run that started 40 min ago but never finished –
+    # i.e. a wedged process blocking every new cycle. The skip must escalate to an alert, not stay silent.
+    holder = psycopg.connect(DB_URL, autocommit=True)
+    holder.execute("SELECT pg_advisory_lock(%s)", (zlib.crc32(f"estamp:{db.schema}".encode()),))
+    stuck = db.start_run()
+    db.q("UPDATE runs SET started_at = now() - interval '40 minutes' WHERE id=%s", (stuck,))
+    try:
+        runs_before = db.q1("SELECT count(*) n FROM runs")["n"]
+        ctx = _ctx(s, db, g)
+        assert run_cycle(ctx)                                       # returns True (skipped)
+        assert db.q1("SELECT count(*) n FROM runs")["n"] == runs_before, "a skipped cycle must not start a new run"
+        wedged = [e["details"] for e in db.q("SELECT details FROM events WHERE level='ERROR' AND action='Cycle'")]
+        assert any("wedged" in d for d in wedged), wedged
+        assert any("wedged" in a for a in ctx.alerts)
+    finally:
+        holder.close()
+
+
+@e2e
+def test_a_brief_overlap_skips_quietly_without_an_alert(env):
+    import zlib
+
+    import psycopg
+
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    # Holder started just now (normal overlap of two cycles) – no alert, just a quiet skip.
+    holder = psycopg.connect(DB_URL, autocommit=True)
+    holder.execute("SELECT pg_advisory_lock(%s)", (zlib.crc32(f"estamp:{db.schema}".encode()),))
+    db.start_run()
+    try:
+        ctx = _ctx(s, db, g)
+        assert run_cycle(ctx)
+        assert db.q1("SELECT count(*) n FROM events WHERE level='ERROR'")["n"] == 0, "brief overlap must not alert"
+        assert ctx.alerts == []
+    finally:
+        holder.close()
 
 
 @e2e
@@ -209,7 +356,7 @@ def test_crash_recovery_and_dry_run(env):
     ctx = _ctx(s, db, g)
     assert run_cycle(ctx)
     assert db.q1("SELECT count(*) n FROM orders")["n"] == 0 and db.q1("SELECT count(*) n FROM papers")["n"] == 0
-    assert len(g.list_children(s.folder("upload_inbox"))) == 1, "dry run must not move anything"
+    assert len(_inbox_files(g, s)) == 1, "dry run must not move anything"
     kinds = {r[0] for r in ctx.preview}
     assert {"PAPER", "ORDER", "ALLOCATE"} <= kinds
     alloc = [r for r in ctx.preview if r[0] == "ALLOCATE"]
@@ -253,24 +400,79 @@ def test_issue_time_ocr_catches_swapped_file(env):
 
 
 @e2e
-def test_inbox_accepts_uploaded_folders(env):
-    """Ops drag whole folders (any name, nested) into the inbox – papers inside are processed, folders archived."""
+def test_output_never_appends_a_lan_twice_across_a_crash(env):
+    """E-01: crash after append_rows but before mark_written commits must not duplicate a LAN.
+    Allocate one LAN, run outputs with mark_written crashing (row lands in the sheet, ledger NOT flagged),
+    then run outputs again normally – the sheet must still hold exactly one row for that LAN."""
+    from estamp.cycle import run_cycle
+    from estamp.outputs import run_outputs
+
+    s, db, g = env
+    _stock(g, s, "MH", 200, 1)
+    g.add("TEST_Shriram_MH_LANs_26Oct", GSHEET, s.folder("orders_incoming"),
+          tabs={"x": [samples.H, ["1", "LAN-ONLY", "c", "b", "MH", "200"]]})
+
+    # first cycle: intake + issue, but make the output write "crash" after append_rows
+    ctx = _ctx(s, db, g)
+    orig = db.mark_written
+    db.mark_written = lambda ids: (_ for _ in ()).throw(RuntimeError("crash after append"))
+    run_cycle(ctx)
+    db.mark_written = orig
+
+    def mh200():
+        return [rows for sid, tabs in g.sheets_data.items() if sid in g.files
+                and g.files[sid]["name"] == "MH-200" for rows in tabs.values()][0]
+
+    assert len(mh200()) == 2, "one header + one issued LAN after the crash"
+    assert db.q1("SELECT count(*) n FROM allocations WHERE NOT output_written")["n"] == 1, "crash left it unwritten"
+
+    # next cycle re-fetches the same allocation as unwritten – must NOT append it again
+    run_outputs(_ctx(s, db, g))
+    rows = mh200()
+    assert len(rows) == 2, f"LAN appended twice after crash+rerun: {rows}"
+    assert [r[0] for r in rows[1:]] == ["LAN-ONLY"]
+    assert db.q1("SELECT count(*) n FROM allocations WHERE NOT output_written")["n"] == 0, "rerun flagged it"
+
+    # A later CANCELLED row for the same LAN (written by the cancel action, not run_outputs) is still allowed,
+    # and a further run_outputs must leave it in place (the guard keys on LAN presence, not status).
+    label = next(t for t in g.sheets_data[next(sid for sid, f in g.files.items() if f["name"] == "MH-200")])
+    sid = next(sid for sid, f in g.files.items() if f["name"] == "MH-200")
+    g.append_rows(sid, label, [["LAN-ONLY", "IN-MH90000000000001A", "", "", "2026-10-28 02:00:00", "CANCELLED – do not use"]])
+    run_outputs(_ctx(s, db, g))
+    rows = mh200()
+    assert len(rows) == 3 and rows[2][5].startswith("CANCELLED"), rows
+
+
+@e2e
+def test_inbox_routes_by_vendor_folder(env):
+    """D-1: a file's vendor is the top-level inbox subfolder it descends from. Nested subfolders inherit it; a file
+    directly in the inbox root is E101 and is NOT processed or moved; a top-level folder that is not a known vendor
+    is also E101. The vendor_code is stamped on every paper stocked from that upload."""
     from estamp.cycle import run_cycle
     s, db, g = env
     inbox = s.folder("upload_inbox")
-    rj = g.folder("RJ", inbox)
-    batch = g.folder("vendor batch 2", rj)
-    g.add("p1.pdf", PDF, rj, samples.paper_page(samples.cert("RJ", 1), 195))
-    g.add("p2.pdf", PDF, batch, samples.merged([samples.paper_page(samples.cert("RJ", 2), 195),
-                                                samples.paper_page(samples.cert("RJ", 3), 195)]))
-    g.add("loose.pdf", PDF, inbox, samples.paper_page(samples.cert("MH", 1), 200))
+    pe = g.folder("Paper Ease", inbox)                 # recognised by vendor_name
+    nested = g.folder("batch 2", pe)                   # nested → inherits Paper Ease
+    g.add("p1.pdf", PDF, pe, samples.paper_page(samples.cert("RJ", 1), 195))
+    g.add("p2.pdf", PDF, nested, samples.merged([samples.paper_page(samples.cert("RJ", 2), 195),
+                                                 samples.paper_page(samples.cert("RJ", 3), 195)]))
+    agr = g.folder("AGREXP", inbox)                    # recognised by vendor_code
+    g.add("p3.pdf", PDF, agr, samples.paper_page(samples.cert("MH", 1), 200))
+    unknown = g.folder("Random Vendor", inbox)         # not a known vendor → E101
+    uid = g.add("rogue.pdf", PDF, unknown, samples.paper_page(samples.cert("MH", 2), 200))
+    loose = g.add("loose.pdf", PDF, inbox, samples.paper_page(samples.cert("MH", 3), 200))  # root → E101
+
     assert run_cycle(_ctx(s, db, g))
-    stocked = {r["cert_no"]: r["state"] for r in db.q("SELECT cert_no, state FROM papers WHERE status='AVAILABLE'")}
-    assert stocked == {samples.cert("RJ", 1): "RJ", samples.cert("RJ", 2): "RJ", samples.cert("RJ", 3): "RJ",
-                       samples.cert("MH", 1): "MH"}, stocked
-    assert g.list_children(inbox) == [], "inbox should be empty – files processed, folders archived"
-    paths = [g.path_of(f["id"]) for f in g.files.values() if f["name"] == "RJ"]
-    assert paths and paths[0].startswith("upload_archive/"), paths
+
+    stocked = {r["cert_no"]: r["vendor_code"] for r in db.q("SELECT cert_no, vendor_code FROM papers WHERE status='AVAILABLE'")}
+    assert stocked == {samples.cert("RJ", 1): "PAPEREASE", samples.cert("RJ", 2): "PAPEREASE",
+                       samples.cert("RJ", 3): "PAPEREASE", samples.cert("MH", 1): "AGREXP"}, stocked
+    # E101 files are left exactly where they are – never stocked, never moved.
+    assert g.files[loose]["parents"] == [inbox], "root file must not move"
+    assert g.files[uid]["parents"] == [unknown], "unknown-vendor file must not move"
+    assert db.q1("SELECT count(*) n FROM papers WHERE cert_no IN (%s,%s)",
+                 (samples.cert("MH", 2), samples.cert("MH", 3)))["n"] == 0
+    assert "E101" in " ".join(e["details"] for e in db.q("SELECT details FROM events WHERE level='WARN'"))
 
 
 @e2e
@@ -324,7 +526,6 @@ def test_intake_and_issue_check_read_through_the_context_clients(env):
 
 
 @e2e
-@pytest.mark.xfail(strict=True, reason="ticket A-08 not built: today one failed page goes to Needs Review on its own")
 def test_ocr_failure_keeps_the_whole_upload_in_the_inbox(env):
     """A-08: a read failure leaves the whole upload in the Upload Inbox for the next cycle – nothing half-stocked."""
     from estamp.cycle import run_cycle
@@ -333,7 +534,55 @@ def test_ocr_failure_keeps_the_whole_upload_in_the_inbox(env):
     up = _stock(g, s, "MH", 200, 3)
     assert run_cycle(Ctx(s, db, g, ocr=FakeOcr(fail={"vendor_MH_200_1.pdf_p2": RuntimeError("OCR API HTTP 503")})))
     assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
-    assert [f["id"] for f in g.list_children(s.folder("upload_inbox"))] == [up]
+    assert [f["id"] for f in _inbox_files(g, s)] == [up]
+    assert db.q1("SELECT status FROM uploads")["status"] == "PROCESSING"   # still retryable next cycle
+
+
+@e2e
+def test_ocr_failure_escalates_to_needs_review_after_the_give_up_window(env):
+    """A-08/D1: once an upload has failed to read for longer than intake.ocr_fail_give_up_minutes, the WHOLE upload
+    moves to Needs Review (not stocked page by page) with a clear reason + ops alert, instead of retrying forever."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeOcr
+    s, db, g = env
+    up = _stock(g, s, "MH", 200, 3)
+    ocr = FakeOcr(fail={"vendor_MH_200_1.pdf_p2": RuntimeError("OCR API HTTP 503")})
+    # First cycle: failure, upload stays in the inbox, first-failure time recorded as now().
+    assert run_cycle(Ctx(s, db, g, ocr=ocr))
+    assert [f["id"] for f in _inbox_files(g, s)] == [up]
+    # Simulate the give-up window having elapsed since the first failure.
+    give_up = int(s.get("intake.ocr_fail_give_up_minutes", 30))
+    db.q("UPDATE uploads SET created_at = now() - make_interval(mins => %s)", (give_up + 1,))
+    assert run_cycle(Ctx(s, db, g, ocr=ocr))
+    assert db.q1("SELECT count(*) n FROM papers")["n"] == 0, "whole upload to review, never stocked page by page"
+    assert db.q1("SELECT status FROM uploads")["status"] == "REVIEW"
+    assert "OCR" in (db.q1("SELECT notes FROM uploads")["notes"] or "")
+    assert _inbox_files(g, s) == [], "upload left the inbox"
+    assert db.q1("SELECT count(*) n FROM events WHERE action='Needs review' AND level='WARN'")["n"] >= 1
+
+
+@e2e
+def test_ocr_auth_failure_stops_the_upload_loudly_without_retrying(env):
+    """A-08: a 401/403 (ApiAuthError) must surface clearly and keep the upload in the inbox – not loop silently."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeOcr
+    s, db, g = env
+    up = _stock(g, s, "MH", 200, 2)
+    ocr = FakeOcr(fail={"vendor_MH_200_1.pdf_p1": ApiAuthError("refused (HTTP 401)")})
+    assert run_cycle(Ctx(s, db, g, ocr=ocr))
+    assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
+    assert [f["id"] for f in _inbox_files(g, s)] == [up]
+    assert db.q1("SELECT count(*) n FROM events WHERE level='ERROR' AND details ILIKE '%401%'")["n"] >= 1
+
+
+@e2e
+def test_non_pdf_upload_event_carries_the_error_code(env):
+    """A non-PDF upload is routed to Needs Review/Not PDF and its ops event carries the E102 code."""
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    g.add("notes.txt", "text/plain", _vendor_folder(g, s), b"hello")
+    assert run_cycle(_ctx(s, db, g))
+    assert db.q1("SELECT count(*) n FROM events WHERE level='WARN' AND details LIKE '%E102%'")["n"] >= 1
 
 
 # ============================================================ split API (replays docs/api-samples/split)
@@ -379,14 +628,13 @@ def _pages(data: bytes) -> int:
 
 
 def test_split_api_digital_one_page_per_part(settings, split_api):
-    from estamp.ocr_split import pdf_text, split_pdf
+    from estamp.ocr_split import split_pdf
     calls, reply = split_api
     reply["resp"] = _Resp(200, (SPLIT_SAMPLES / "response_splitSize1.zip").read_bytes())
     pdf = (SPLIT_SAMPLES / "test_input_4pages.pdf").read_bytes()
     parts = split_pdf(pdf, "vendor.pdf", settings)
     assert [(p.page_from, p.page_to) for p in parts] == [(1, 1), (2, 2), (3, 3), (4, 4)]
     assert all(_pages(p.data) == 1 for p in parts)
-    assert samples.cert("MH", 3) in pdf_text(parts[2].data)
     (c,) = calls
     assert c["url"] == "https://live.zoopsign.com/api/pdf-utils/split"
     assert c["data"] == {"ranges[0][startPage]": "1", "ranges[0][endPage]": "4", "splitSize": "1"}
@@ -576,7 +824,7 @@ def test_intake_via_split_api_keeps_front_and_back_together(env, monkeypatch):
         return _Resp(200, buf.getvalue())
 
     monkeypatch.setattr(ocr_split.requests, "post", fake_api)
-    g.add("scan.pdf", PDF, s.folder("upload_inbox"), samples.merged([
+    g.add("scan.pdf", PDF, _vendor_folder(g, s), samples.merged([
         samples.scanned_front("RAJASTHAN", "S 254201", 195), samples.scanned_back("RAJASTHAN"),
         samples.scanned_front("RAJASTHAN", "S 254202", 195), samples.scanned_back("RAJASTHAN")]))
     assert run_cycle(_ctx(s, db, g))
@@ -592,7 +840,7 @@ def test_traditional_page_with_a_text_layer_is_never_stocked_as_one_page(env):
     the whole file goes to Needs Review (E105) – the RJ front is never stocked as a 1-page paper without its back."""
     from estamp.cycle import run_cycle
     s, db, g = env
-    g.add("searchable_scan.pdf", PDF, s.folder("upload_inbox"), samples.merged([
+    g.add("searchable_scan.pdf", PDF, _vendor_folder(g, s), samples.merged([
         samples.paper_page(samples.cert("MH", 1), 200),
         samples.physical_front("RAJASTHAN", "S 254201", 195), samples.physical_back("RAJASTHAN")]))
     assert run_cycle(_ctx(s, db, g))
@@ -705,7 +953,7 @@ def test_physical_papers_front_and_back(env):
     pages = []
     for serial in ["S 254201", "S 254202", "AB 100003", "(serial smudged)"]:
         pages += [samples.scanned_front("RAJASTHAN", serial, 195), samples.scanned_back("RAJASTHAN")]
-    g.add("vendor_scan.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
+    g.add("vendor_scan.pdf", PDF, _vendor_folder(g, s), samples.merged(pages))
     g.add("orders", GSHEET, s.folder("orders_incoming"),
           tabs={"x": [["LOAN NO", "STATE"], ["RJLAN0001", "RAJASTHAN"], ["RJLAN0002", "RAJASTHAN"]]})
     ctx = _ctx(s, db, g)
@@ -736,13 +984,13 @@ def _upload_review(db, g, s, name):
 def test_mixed_upload_goes_whole_to_needs_review(env):
     """B-01: digital and scanned pages in one upload → whole file to Needs Review (E105), nothing split or stocked."""
     from estamp.cycle import run_cycle
-    from fake_apis import FakeSplitter
+    from fake_apis import FakeOcr, FakeSplitter
     s, db, g = env
-    g.add("mixed.pdf", PDF, s.folder("upload_inbox"), samples.merged([
+    g.add("mixed.pdf", PDF, _vendor_folder(g, s), samples.merged([
         samples.paper_page(samples.cert("MH", 1), 200),
         samples.scanned_front("RAJASTHAN", "S 254201", 195), samples.scanned_back("RAJASTHAN")]))
     splitter = FakeSplitter()
-    assert run_cycle(Ctx(s, db, g, splitter=splitter))
+    assert run_cycle(Ctx(s, db, g, ocr=FakeOcr(), splitter=splitter))
     status, notes, path = _upload_review(db, g, s, "mixed.pdf")
     assert status == "REVIEW" and "E105" in notes and path.startswith("needs_review/"), (status, notes, path)
     assert splitter.calls == [] and db.q1("SELECT count(*) n FROM papers")["n"] == 0
@@ -752,13 +1000,13 @@ def test_mixed_upload_goes_whole_to_needs_review(env):
 def test_traditional_odd_page_count_goes_whole_to_review_before_split(env):
     """B-02: the split API would happily return a 1-page last part, so the odd count is caught BEFORE calling it."""
     from estamp.cycle import run_cycle
-    from fake_apis import FakeSplitter
+    from fake_apis import FakeOcr, FakeSplitter
     s, db, g = env
-    g.add("odd.pdf", PDF, s.folder("upload_inbox"), samples.merged([
+    g.add("odd.pdf", PDF, _vendor_folder(g, s), samples.merged([
         samples.scanned_front("RAJASTHAN", "S 254201", 195), samples.scanned_back("RAJASTHAN"),
         samples.scanned_front("RAJASTHAN", "S 254202", 195)]))
     splitter = FakeSplitter()
-    assert run_cycle(Ctx(s, db, g, splitter=splitter))
+    assert run_cycle(Ctx(s, db, g, ocr=FakeOcr(), splitter=splitter))
     status, notes, path = _upload_review(db, g, s, "odd.pdf")
     assert status == "REVIEW" and "E106" in notes and path.startswith("needs_review/"), (status, notes, path)
     assert splitter.calls == [] and db.q1("SELECT count(*) n FROM papers")["n"] == 0
@@ -772,7 +1020,7 @@ def test_traditional_upload_is_split_in_pairs_and_each_page_ocrd(env):
     pages = []
     for serial in ["S 254201", "S 254202"]:
         pages += [samples.scanned_front("RAJASTHAN", serial, 195), samples.scanned_back("RAJASTHAN")]
-    g.add("pairs.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
+    g.add("pairs.pdf", PDF, _vendor_folder(g, s), samples.merged(pages))
     ocr, splitter = FakeOcr(), FakeSplitter()
     assert run_cycle(Ctx(s, db, g, ocr=ocr, splitter=splitter))
     assert splitter.calls == [("pairs.pdf", 2)]
@@ -790,7 +1038,7 @@ def test_missing_back_page_sends_that_pair_and_all_later_pairs_to_review(env):
     s, db, g = env
     f = lambda n: samples.scanned_front("RAJASTHAN", f"S 25420{n}", 195)
     b = lambda: samples.scanned_back("RAJASTHAN")
-    g.add("broken.pdf", PDF, s.folder("upload_inbox"), samples.merged([f(1), b(), f(2), f(3), b(), f(4)]))
+    g.add("broken.pdf", PDF, _vendor_folder(g, s), samples.merged([f(1), b(), f(2), f(3), b(), f(4)]))
     assert run_cycle(_ctx(s, db, g))
     rows = db.q("SELECT page_from, page_to, status, notes FROM papers ORDER BY page_from")
     assert [(r["page_from"], r["page_to"], r["status"]) for r in rows] == [
@@ -807,7 +1055,7 @@ def test_serial_the_api_returns_for_a_back_page_breaks_the_pairing(env):
     pages = []
     for n in (1, 2):
         pages += [samples.scanned_front("RAJASTHAN", f"S 25420{n}", 195), samples.scanned_back("RAJASTHAN")]
-    g.add("api_cert.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
+    g.add("api_cert.pdf", PDF, _vendor_folder(g, s), samples.merged(pages))
     ocr = FakeOcr(certs={"api_cert.pdf_p4": "S 254209"})      # a serial on a back page
     assert run_cycle(Ctx(s, db, g, ocr=ocr))
     rows = db.q("SELECT page_from, status, notes FROM papers ORDER BY page_from")
@@ -819,16 +1067,16 @@ def test_serial_the_api_returns_for_a_back_page_breaks_the_pairing(env):
 def test_traditional_parts_must_be_two_pages(env):
     """A split that ignores splitSize (4-page parts) must not stock paper 2's front inside paper 1."""
     from estamp.cycle import run_cycle
-    from fake_apis import FakeSplitter
+    from fake_apis import FakeOcr, FakeSplitter
     s, db, g = env
     pages = []
     for n in (1, 2):
         pages += [samples.scanned_front("RAJASTHAN", f"S 25420{n}", 195), samples.scanned_back("RAJASTHAN")]
-    g.add("bad_split.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
-    ctx = Ctx(s, db, g, splitter=FakeSplitter(force_size=4))
+    g.add("bad_split.pdf", PDF, _vendor_folder(g, s), samples.merged(pages))
+    ctx = Ctx(s, db, g, ocr=FakeOcr(), splitter=FakeSplitter(force_size=4))
     run_cycle(ctx)
     assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
-    assert any(f["name"] == "bad_split.pdf" for f in g.list_children(s.folder("upload_inbox")))   # retried later
+    assert any(f["name"] == "bad_split.pdf" for f in _inbox_files(g, s))   # retried later
     assert any("not 2 page(s) each" in a for a in ctx.alerts), ctx.alerts
 
 
@@ -837,7 +1085,7 @@ def test_digital_page_with_two_ids_goes_alone_to_review(env):
     from estamp.cycle import run_cycle
     s, db, g = env
     two = f"{samples.cert('MH', 1)} {samples.cert('MH', 2)}"
-    g.add("two_ids.pdf", PDF, s.folder("upload_inbox"), samples.merged([
+    g.add("two_ids.pdf", PDF, _vendor_folder(g, s), samples.merged([
         samples.paper_page(two, 200), samples.paper_page(samples.cert("MH", 3), 200)]))
     assert run_cycle(_ctx(s, db, g))
     rows = db.q("SELECT page_from, status, notes FROM papers ORDER BY page_from")
@@ -855,7 +1103,7 @@ def test_crash_mid_upload_then_rerun_stocks_nothing_twice(env, monkeypatch):
     pages = []
     for n in (1, 2, 3):
         pages += [samples.scanned_front("RAJASTHAN", f"S 25420{n}", 195), samples.scanned_back("RAJASTHAN")]
-    g.add("crash.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
+    g.add("crash.pdf", PDF, _vendor_folder(g, s), samples.merged(pages))
     real = intake._stock_unit
 
     def crashing(ctx, up, name, u):
@@ -866,12 +1114,12 @@ def test_crash_mid_upload_then_rerun_stocks_nothing_twice(env, monkeypatch):
     monkeypatch.setattr(intake, "_stock_unit", crashing)
     run_cycle(_ctx(s, db, g))
     assert db.q1("SELECT count(*) n FROM papers WHERE page_from=3")["n"] == 0
-    assert any(f["name"] == "crash.pdf" for f in g.list_children(s.folder("upload_inbox")))
+    assert any(f["name"] == "crash.pdf" for f in _inbox_files(g, s))
     monkeypatch.setattr(intake, "_stock_unit", real)
     assert run_cycle(_ctx(s, db, g))
     rows = db.q("SELECT cert_no, page_from FROM papers ORDER BY page_from")
     assert [(r["cert_no"], r["page_from"]) for r in rows] == [("RJ-S254201", 1), ("RJ-S254202", 3), ("RJ-S254203", 5)]
-    assert not g.list_children(s.folder("upload_inbox"))
+    assert not _inbox_files(g, s)
 
 
 # ------------------------------------------------------------ OCR API path (A-05 + ADR-0006), fake API from fields
@@ -896,7 +1144,7 @@ def test_api_estamp_without_text_layer_is_stocked_and_issued(env):
     from estamp.cycle import run_cycle
     from fake_apis import FakeApiOcr
     s, db, g = env
-    g.add("hp.pdf", PDF, s.folder("upload_inbox"), samples.merged([_hp(1), _hp(2)]))
+    g.add("hp.pdf", PDF, _vendor_folder(g, s), samples.merged([_hp(1), _hp(2)]))
     g.add("orders", GSHEET, s.folder("orders_incoming"), tabs={"x": [samples.H, ["1", "LAN-HP1", "c", "b", "HP", "100"]]})
     ocr = FakeApiOcr()
     assert run_cycle(Ctx(s, db, g, ocr=ocr))
@@ -915,9 +1163,9 @@ def test_api_traditional_pairs_and_one_page_state(env):
     from estamp.cycle import run_cycle
     from fake_apis import FakeApiOcr
     s, db, g = env
-    g.add("mp.pdf", PDF, s.folder("upload_inbox"),
+    g.add("mp.pdf", PDF, _vendor_folder(g, s),
           samples.merged([_mp_front("DH 318891"), _mp_back(), _mp_front("DH 318892"), _mp_back()]))
-    g.add("hr.pdf", PDF, s.folder("upload_inbox"), samples.merged([
+    g.add("hr.pdf", PDF, _vendor_folder(g, s), samples.merged([
         samples.api_page(certification_no=f"G1K2026A99{n}", state_code="HR", stamp_duty_amount="100") for n in (1, 2, 3)]))
     assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr()))
     got = {r["cert_no"]: (r["page_from"], r["page_to"], r["status"]) for r in db.q("SELECT * FROM papers")}
@@ -932,7 +1180,7 @@ def test_api_file_whose_pages_disagree_goes_whole_to_review(env):
     from estamp.cycle import run_cycle
     from fake_apis import FakeApiOcr, FakeSplitter
     s, db, g = env
-    g.add("mixed_api.pdf", PDF, s.folder("upload_inbox"), samples.merged([_hp(1), _mp_front("DH 318891"), _mp_back()]))
+    g.add("mixed_api.pdf", PDF, _vendor_folder(g, s), samples.merged([_hp(1), _mp_front("DH 318891"), _mp_back()]))
     splitter = FakeSplitter()
     assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr(), splitter=splitter))
     status, notes, path = _upload_review(db, g, s, "mixed_api.pdf")
@@ -945,7 +1193,7 @@ def test_api_upload_with_no_readable_id_at_all_goes_whole_to_review(env):
     from estamp.cycle import run_cycle
     from fake_apis import FakeApiOcr
     s, db, g = env
-    g.add("blank.pdf", PDF, s.folder("upload_inbox"), samples.merged([_mp_back(), _mp_back()]))
+    g.add("blank.pdf", PDF, _vendor_folder(g, s), samples.merged([_mp_back(), _mp_back()]))
     assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr()))
     status, notes, _ = _upload_review(db, g, s, "blank.pdf")
     assert status == "REVIEW" and "E105" in notes
@@ -957,11 +1205,11 @@ def test_api_page_1_ocr_failure_retries_the_whole_upload(env):
     from estamp.cycle import run_cycle
     from fake_apis import FakeApiOcr
     s, db, g = env
-    g.add("hp_fail.pdf", PDF, s.folder("upload_inbox"), samples.merged([_hp(1), _hp(2)]))
+    g.add("hp_fail.pdf", PDF, _vendor_folder(g, s), samples.merged([_hp(1), _hp(2)]))
     ctx = Ctx(s, db, g, ocr=FakeApiOcr(fail={"hp_fail.pdf_p1": RuntimeError("OCR API HTTP 503: down")}))
     run_cycle(ctx)
     assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
-    assert any(f["name"] == "hp_fail.pdf" for f in g.list_children(s.folder("upload_inbox")))
+    assert any(f["name"] == "hp_fail.pdf" for f in _inbox_files(g, s))
     assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr()))
     assert db.q1("SELECT count(*) n FROM papers WHERE status='AVAILABLE'")["n"] == 2
 
@@ -974,7 +1222,7 @@ def test_api_recheck_review_uses_the_stored_fields(env, monkeypatch):
     from estamp.cycle import run_cycle
     from fake_apis import FakeApiOcr
     s, db, g = env
-    g.add("hr101.pdf", PDF, s.folder("upload_inbox"),
+    g.add("hr101.pdf", PDF, _vendor_folder(g, s),
           samples.api_page(certification_no="G1K2026A991", state_code="HR", stamp_duty_amount="101"))
     assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr()))
     p = db.q1("SELECT * FROM papers")
@@ -992,7 +1240,7 @@ def test_estamps_never_grouped(env):
     goes to Needs Review (E105) – pages are never guessed into pairs."""
     from estamp.cycle import run_cycle
     s, db, g = env
-    g.add("ka_estamps.pdf", PDF, s.folder("upload_inbox"), samples.merged([samples.estamp_no_cert() for _ in range(4)]))
+    g.add("ka_estamps.pdf", PDF, _vendor_folder(g, s), samples.merged([samples.estamp_no_cert() for _ in range(4)]))
     assert run_cycle(_ctx(s, db, g))
     status, notes, _ = _upload_review(db, g, s, "ka_estamps.pdf")
     assert status == "REVIEW" and "E105" in notes
@@ -1001,23 +1249,18 @@ def test_estamps_never_grouped(env):
 
 def test_configured_reader_is_the_ocr_api_only(settings, ocr_api):
     """D1 / ADR-0002 with config.yaml as shipped: even a PDF with a text layer is read by the OCR API, and an API
-    failure is raised – never silently answered from the text layer or Drive OCR."""
+    failure is raised – never silently answered from the text layer or Drive OCR (no fallback path exists)."""
     from estamp.ocr_split import read_paper
     _, reply = ocr_api
     settings = load_settings(ROOT / "config.yaml")             # as shipped, not the session copy tests adjust
-    assert settings.get("intake.ocr_provider") == "zoop_api" and settings.get("intake.use_pdf_text") is False
-    assert settings.get("intake.ocr_fallback_to_drive") is False
-
-    class NoDrive:
-        def ocr_text(self, *a):
-            raise AssertionError("Drive OCR must never be used as a fallback")
+    assert settings.get("intake.ocr_provider") == "zoop_api"
 
     reply["resp"] = _ocr_resp(_f(certification_no="IN-MH90000000000001A", state_code="MH"))
-    r = read_paper(samples.paper_page(samples.cert("MH", 1), 200), "x", settings, NoDrive())
+    r = read_paper(samples.paper_page(samples.cert("MH", 1), 200), "x", settings)
     assert r.via == "zoop_api" and r.fields["certification_no"]["value"] == "IN-MH90000000000001A"
     reply["resp"] = _Resp(500, b'{"success":false,"message":"down"}', "application/json")
     with pytest.raises(RuntimeError, match="OCR API HTTP 500"):
-        read_paper(samples.paper_page(samples.cert("MH", 1), 200), "x", settings, NoDrive())
+        read_paper(samples.paper_page(samples.cert("MH", 1), 200), "x", settings)
 
 
 UP_P2 = """INDIA NON JUDICIAL Government of Uttar Pradesh\ne-Stamp\n100 100 100 100\n\\*0000000100\nCertificate No.\nCertificate Issued Date Account Reference.\nUnique Doc. Reference\nPurchased by\nStamp Duty Paid By\n23-Sep-2026 06:38 PM\nNEWIMPACC (SV)/ up14054804/ GAUTAMBUDDH NAGAR 2/ UP-GBN\n:SUBIN-UPUP1405480472263158537115Y\nSHRIRAM FINANCE LIMITED\nStamp Duty Amount(Rs.)\n100\n(One Hundred only)\n"""
@@ -1055,3 +1298,468 @@ def test_up_estamp_amount_layout_variants(settings, variant):
     r = StateResolver(settings.states); m = CertMatcher(settings.get("intake.cert_patterns"), r)
     a = analyze_paper(variant, "", settings, m, lambda c: False)
     assert (a.state, a.amount, a.issues) == ("UP", 100, [])
+
+
+# ============================================================ reset-test-data (F-03)
+
+@e2e
+def test_reset_all_data_clears_tables_and_restarts_identity(env):
+    s, db, g = env
+    # seed a couple of rows across tables that use BIGSERIAL identities
+    db.q("INSERT INTO uploads(drive_file_id, file_name, md5) VALUES ('f1','a.pdf','m1'),('f2','b.pdf','m2')")
+    db.event("INFO", "seed", "hello")
+    assert db.table_counts()["uploads"] == 2
+    assert db.table_counts()["events"] == 1
+
+    cleared = db.reset_all_data()
+    assert cleared["uploads"] == 2 and cleared["events"] == 1
+
+    # every table empty now
+    assert all(n == 0 for n in db.table_counts().values())
+    # identity restarted: next insert gets id 1 again
+    new_id = db.q1("INSERT INTO uploads(drive_file_id) VALUES ('f3') RETURNING id")["id"]
+    assert new_id == 1
+
+
+@e2e
+def test_cli_reset_refuses_production_schema_without_force(env, monkeypatch):
+    import io
+    from contextlib import redirect_stdout
+    from estamp import cli
+    s, db, g = env
+    # seed one row we can prove survives
+    db.q("INSERT INTO uploads(drive_file_id) VALUES ('keep')")
+
+    # Point the CLI at the SAME test DB but a prod-looking schema name, so the guard sees production.
+    # Give the CLI its own DB handle (it calls db.close() in finally) so the fixture's pool stays open.
+    from estamp.db import DB
+    def fake_build(args, need_google=True):
+        s.raw["db"]["schema"] = "shriram_estamp"   # looks like prod to the guard
+        return s, DB(DB_URL, "shriram_estamp", max_size=2), None
+    monkeypatch.setattr(cli, "_build", fake_build)
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli.main(["reset-test-data", "--yes"])   # --yes, but NO --force
+    out = buf.getvalue()
+    assert rc != 0
+    assert "refus" in out.lower()
+    # nothing was truncated
+    assert db.q1("SELECT count(*) n FROM uploads")["n"] == 1
+
+
+# ------------------------------------------------------------ E-07: ops-correction audit + RE-OCR + Corrections tab
+
+def _needs_review_paper(db, g, s, drive_data, cert, state, amount, notes):
+    """A NEEDS_REVIEW paper backed by a real stored PDF in Needs Review, ready for APPROVE / RE-OCR."""
+    fid = g.add("review.pdf", PDF, s.folder("needs_review"), drive_data)
+    return db.insert_paper(drive_file_id=fid, file_name="review.pdf", cert_no=cert, state=state,
+                           denomination=amount, status="NEEDS_REVIEW", notes=notes)
+
+
+def _review_result(ctx, s, g, pid, row_after_action):
+    """Append a Review Actions row and run actions; return (result string, paper row)."""
+    from estamp.actions import run_actions
+    sid = s.get("control_sheet_id")
+    g.ensure_tabs(sid, {"Review Actions": ["Paper ID", "Action", "Cert No", "State", "Stamp Duty", "Edited By",
+                                           "Result", "Processed At"]})
+    g.sheets_data[sid]["Review Actions"].append([str(pid)] + row_after_action)
+    run_actions(ctx)
+    res = g.sheets_data[sid]["Review Actions"][-1]
+    return res, ctx.db.q1("SELECT * FROM papers WHERE id=%s", (pid,))
+
+
+@e2e
+def test_approve_with_correction_records_audit_and_still_approves(env):
+    s, db, g = env
+    pid = _needs_review_paper(db, g, s, samples.paper_page(samples.cert("MH", 1), 200),
+                              cert="", state="MH", amount=200, notes="no certificate / serial number found")
+    ctx = _ctx(s, db, g)
+    res, p = _review_result(ctx, s, g, pid, ["APPROVE", samples.cert("MH", 777), "MH", "200", "ravi"])
+    assert res[6].startswith("DONE: approved"), res
+    assert p["status"] == "AVAILABLE" and p["cert_no"] == samples.cert("MH", 777)
+    # audit: pre-edit API value captured, ops identity recorded
+    assert p["api_cert_no"] == "" and p["api_state"] == "MH" and p["api_denomination"] == 200
+    assert p["ops_edited_by"] == "ravi" and p["ops_edited_at"] is not None
+    # approval behaviour preserved: file moved into Inventory
+    assert g.path_of(p["drive_file_id"]).startswith("inventory_root/MH/200/")
+
+
+@e2e
+def test_approve_without_correction_records_no_audit(env):
+    s, db, g = env
+    cert = samples.cert("MH", 5)
+    pid = _needs_review_paper(db, g, s, samples.paper_page(cert, 200),
+                              cert=cert, state="MH", amount=200, notes="duplicate certificate – held")
+    ctx = _ctx(s, db, g)
+    res, p = _review_result(ctx, s, g, pid, ["APPROVE", "", "", "", ""])
+    assert res[6].startswith("DONE: approved"), res
+    assert p["status"] == "AVAILABLE"
+    assert p["ops_edited_at"] is None and p["ops_edited_by"] is None and p["api_cert_no"] is None
+
+
+@e2e
+def test_re_ocr_rereads_and_moves_a_now_passing_paper_to_inventory(env):
+    from fake_apis import FakeApiOcr
+    s, db, g = env
+    # stored PDF reads cleanly through the API, but the paper sits in Needs Review (e.g. an earlier bad reading)
+    good = samples.merged([samples.api_page(certification_no="IN-HP90000000000009A", state_code="HP",
+                                            state_name="HIMACHAL PRADESH", stamp_duty_amount="100")])
+    pid = _needs_review_paper(db, g, s, good, cert="", state="", amount=0, notes="no certificate / serial number found")
+    ocr = FakeApiOcr()
+    ctx = Ctx(s, db, g, ocr=ocr)
+    res, p = _review_result(ctx, s, g, pid, ["RE-OCR", "", "", "", ""])
+    assert res[6].startswith("DONE: re-OCR'd →"), res
+    assert p["status"] == "AVAILABLE" and p["cert_no"] == "IN-HP90000000000009A"
+    assert g.path_of(p["drive_file_id"]).startswith("inventory_root/HP/100/")
+    assert ocr.calls, "RE-OCR must make a new OCR call"
+
+
+@e2e
+def test_corrections_tab_lists_an_edited_paper(env):
+    from estamp.dashboard import run_dashboard
+    s, db, g = env
+    pid = _needs_review_paper(db, g, s, samples.paper_page(samples.cert("MH", 2), 200),
+                              cert="", state="MH", amount=200, notes="no certificate / serial number found")
+    ctx = _ctx(s, db, g)
+    ops_cert = samples.cert("MH", 778)
+    _review_result(ctx, s, g, pid, ["APPROVE", ops_cert, "MH", "200", "ravi"])
+    run_dashboard(ctx)
+    tab = g.sheets_data[s.get("control_sheet_id")]["Corrections"]
+    assert tab[0][:4] == ["Paper ID", "API read (cert/state/₹)", "Ops value (cert/state/₹)", "Edited By"]
+    row = [r for r in tab[1:] if r[0] == pid][0]
+    assert ops_cert in row[2] and row[3] == "ravi" and row[4]
+
+
+# ------------------------------------------------------------ E-06: automatic second OCR attempt before Needs Review
+
+def _hp_fields(cert="IN-HP90000000000055A", amount="100"):
+    from estamp.ocr_split import OcrResult
+    return OcrResult("", "", "fake-api", raw={"fake": True},
+                     fields={"certification_no": {"value": cert}, "state_code": {"value": "HP"},
+                             "state_name": {"value": "HIMACHAL PRADESH"}, "stamp_duty_amount": {"value": amount}})
+
+
+@e2e
+def test_second_ocr_attempt_rescues_a_paper_that_failed_the_first_reading(env):
+    """A paper whose type reads fine but whose FIRST reading fails a check (amount not allowed) is re-OCR'd ONCE; the
+    better second reading passes, so it is STOCKED – exactly two OCR calls for that paper."""
+    from estamp.cycle import run_cycle
+    from fake_apis import ScriptedOcr
+    s, db, g = env
+    g.add("retry.pdf", PDF, _vendor_folder(g, s), samples.api_page(state_code="HP"))
+    # 1st reading: valid HP cert (type decides) but a bad amount → fails checks; retry: clean HP ₹100.
+    ocr = ScriptedOcr(script={"retry.pdf_p1": [_hp_fields(amount="999")]}, default=_hp_fields(amount="100"))
+    assert run_cycle(Ctx(s, db, g, ocr=ocr))
+    p = db.q1("SELECT * FROM papers")
+    assert p["status"] == "AVAILABLE" and p["cert_no"] == "IN-HP90000000000055A" and p["denomination"] == 100, p
+    # one read in _read_units + one retry in _stock_unit = two calls for this single paper
+    assert len(ocr.calls) == 2, ocr.calls
+
+
+@e2e
+def test_paper_failing_both_ocr_attempts_goes_to_needs_review(env):
+    """When the retry reading also fails the checks, the paper lands in Needs Review (coded E124 for a bad amount) –
+    the API output is still on the row, and no third attempt is made."""
+    from estamp.cycle import run_cycle
+    from fake_apis import ScriptedOcr
+    s, db, g = env
+    g.add("retry2.pdf", PDF, _vendor_folder(g, s), samples.api_page(state_code="HP"))
+    ocr = ScriptedOcr(script={}, default=_hp_fields(amount="999"))   # valid cert, bad amount both times
+    run_cycle(Ctx(s, db, g, ocr=ocr))
+    p = db.q1("SELECT * FROM papers")
+    assert p["status"] == "NEEDS_REVIEW" and "E124" in (p["notes"] or ""), p
+    assert len(ocr.calls) == 2, ocr.calls
+
+
+# ------------------------------------------------------------ E-08: issue check accepts the ops-corrected ID OR the API original
+
+@e2e
+def test_issue_check_accepts_api_original_cert_when_ops_corrected(env):
+    """E-07 corrected the ledger cert_no; the physical PDF still prints the API's ORIGINAL cert. The issue check must
+    accept EITHER value, so the LAN fulfils and the API original is recorded as the verifying cert."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeApiOcr
+    s, db, g = env
+    api_cert, ledger_cert = "IN-MH90000000000010A", "IN-MH90000000000011A"   # PDF prints api_cert; ledger was corrected
+    fid = g.add("p.pdf", PDF, s.folder("inventory_root"),
+                samples.api_page(certification_no=api_cert, state_code="MH", stamp_duty_amount="200"))
+    db.insert_paper(drive_file_id=fid, file_name="p.pdf", cert_no=ledger_cert, api_cert_no=api_cert,
+                    state="MH", denomination=200, status="AVAILABLE")
+    g.add("orders", GSHEET, s.folder("orders_incoming"),
+          tabs={"x": [samples.H, ["1", "LAN-MH9", "c", "b", "MH", "200"]]})
+    assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr()))
+    a = db.q1("SELECT * FROM allocations")
+    assert a and a["lan"] == "LAN-MH9" and a["cert_no"] == ledger_cert
+    assert a["verified_cert"] == api_cert and a["verified_at"] is not None   # the value the PDF actually showed
+
+
+@e2e
+def test_issue_check_still_errors_when_pdf_matches_neither_value(env):
+    """Safety: an issued PDF showing NEITHER the ledger cert NOR the stored api_cert still mismatches → ERROR."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeApiOcr
+    s, db, g = env
+    fid = g.add("q.pdf", PDF, s.folder("inventory_root"),
+                samples.api_page(certification_no="IN-MH90000000000099A", state_code="MH", stamp_duty_amount="200"))
+    db.insert_paper(drive_file_id=fid, file_name="q.pdf", cert_no="IN-MH90000000000011A",
+                    api_cert_no="IN-MH90000000000010A", state="MH", denomination=200, status="AVAILABLE")
+    g.add("orders", GSHEET, s.folder("orders_incoming"),
+          tabs={"x": [samples.H, ["1", "LAN-MHX", "c", "b", "MH", "200"]]})
+    assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr()))
+    assert db.q1("SELECT count(*) n FROM allocations")["n"] == 0
+    assert db.q1("SELECT status FROM orders")["status"] == "ERROR"
+    assert db.q1("SELECT status FROM papers")["status"] == "ERROR"
+
+
+# ── #6 double-issue invariant + #8 atomic recovery (ledger safety) ──────────────────────
+def _one_allocating_order(db, lan, cert):
+    """Helper: a PENDING order claimed into ALLOCATING, with one AVAILABLE paper reserved to it."""
+    db.insert_orders([(lan, lan.lower(), "MH", 200, "f", "fid", "t", 1, "PENDING", None)])
+    order = db.claim_orders("MH", 200, 1)[0]
+    db.insert_paper(state="MH", denomination=200, status="AVAILABLE", cert_no=cert)
+    paper = db.reserve_paper(order)
+    return order, paper
+
+
+@e2e
+def test_finish_allocation_wont_issue_the_same_order_twice(env):
+    from datetime import date
+
+    import pytest
+    s, db, g = env
+    order, paper = _one_allocating_order(db, "LAN-DUP-1", "IN-MH-DUP-1")
+    db.finish_allocation(order, paper, date(2026, 10, 28), "LAN-DUP-1.pdf", "fid", "link", "bid")
+    assert db.q1("SELECT status FROM orders WHERE id=%s", (order["id"],))["status"] == "DONE"
+    assert db.q1("SELECT count(*) n FROM allocations WHERE order_id=%s", (order["id"],))["n"] == 1
+    # the order is DONE now, not ALLOCATING – a second finish must refuse, never a 2nd issuance
+    with pytest.raises(Exception):
+        db.finish_allocation(order, paper, date(2026, 10, 28), "LAN-DUP-1.pdf", "fid2", "link2", "bid2")
+    assert db.q1("SELECT count(*) n FROM allocations WHERE order_id=%s AND cancelled_at IS NULL",
+                 (order["id"],))["n"] == 1
+
+
+@e2e
+def test_finish_allocation_refuses_an_order_not_in_allocating(env):
+    from datetime import date
+
+    import pytest
+    s, db, g = env
+    order, paper = _one_allocating_order(db, "LAN-GUARD-1", "IN-MH-GUARD-1")
+    db.q("UPDATE orders SET status='ERROR' WHERE id=%s", (order["id"],))   # recovery/ops moved it out of ALLOCATING
+    with pytest.raises(Exception):
+        db.finish_allocation(order, paper, date(2026, 10, 28), "LAN-GUARD-1.pdf", "fid", "link", "bid")
+    assert db.q1("SELECT status FROM orders WHERE id=%s", (order["id"],))["status"] == "ERROR"   # not flipped to DONE
+    assert db.q1("SELECT count(*) n FROM allocations WHERE order_id=%s", (order["id"],))["n"] == 0
+
+
+@e2e
+def test_recover_stuck_flips_both_the_order_and_its_paper(env):
+    s, db, g = env
+    order, paper = _one_allocating_order(db, "LAN-STUCK-1", "IN-MH-STUCK-1")
+    db.q("UPDATE orders SET updated_at = now() - interval '30 minutes' WHERE id=%s", (order["id"],))
+    db.q("UPDATE papers SET updated_at = now() - interval '30 minutes' WHERE id=%s", (paper["id"],))
+    n_o, n_p = db.recover_stuck(15)
+    assert (n_o, n_p) == (1, 1)
+    assert db.q1("SELECT status FROM orders WHERE id=%s", (order["id"],))["status"] == "ERROR"
+    assert db.q1("SELECT status FROM papers WHERE id=%s", (paper["id"],))["status"] == "ERROR"
+
+
+# ── #7 ops actions emit events + #11 CANCEL commits before the Drive move ───────────────
+@e2e
+def test_ops_actions_emit_events(env):
+    """RETRY, KEEP_STATE and CANCEL each change ledger state – each must leave a row in the events table (Log tab)."""
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    g.add("TEST_Shriram_MH_LANs_26Oct", GSHEET, s.folder("orders_incoming"),
+          tabs={"x": [samples.H, ["1", "LAN-CANCEL", "c", "b", "MH", "200"]]})
+    _stock(g, s, "MH", 200, 1)
+    assert run_cycle(_ctx(s, db, g))
+    assert db.q1("SELECT status FROM orders WHERE lan='LAN-CANCEL'")["status"] == "DONE"
+
+    db.q("INSERT INTO orders(lan, lan_key, state, denomination, status, notes) VALUES "
+         "('LAN-RETRY','LAN-RETRY','MH',200,'ERROR','boom')")
+    db.q("INSERT INTO orders(lan, lan_key, state, denomination, status) VALUES "
+         "('LAN-CONF','LAN-CONF','MH',200,'CONFLICT'), ('LAN-CONF','LAN-CONF','KA',500,'CONFLICT')")
+
+    before = db.q1("SELECT count(*) n FROM events")["n"]
+    ctl = g.sheets_data[s.get("control_sheet_id")]
+    ctl["Order Actions"].append(["LAN-RETRY", "RETRY", ""])
+    ctl["Order Actions"].append(["LAN-CONF", "KEEP_STATE", "MH"])
+    ctl["Order Actions"].append(["LAN-CANCEL", "CANCEL", ""])
+    assert run_cycle(_ctx(s, db, g))
+
+    results = [r[3] for r in ctl["Order Actions"][1:]]
+    assert results == ["DONE: back to PENDING", "DONE: MH kept, others cancelled",
+                       "DONE: cancelled, paper returned to stock"], results
+    assert db.q1("SELECT count(*) n FROM events")["n"] > before
+    for action, needle in [("Retry", "LAN-RETRY"), ("KeepState", "LAN-CONF"), ("Cancel", "LAN-CANCEL")]:
+        hit = db.q1("SELECT count(*) n FROM events WHERE action=%s AND details LIKE %s", (action, f"%{needle}%"))
+        assert hit["n"] >= 1, f"no event for {action} ({needle})"
+
+
+@e2e
+def test_cancel_after_issue_commits_before_drive_move(env):
+    """CANCEL of a fulfilled LAN returns the paper to stock (AVAILABLE) and writes a CANCELLED output row.
+    The ledger commit happens before the Drive move, so a move failure after commit leaves the ledger consistent."""
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    g.add("TEST_Shriram_MH_LANs_26Oct", GSHEET, s.folder("orders_incoming"),
+          tabs={"x": [samples.H, ["1", "LAN-X", "c", "b", "MH", "200"]]})
+    _stock(g, s, "MH", 200, 1)
+    assert run_cycle(_ctx(s, db, g))
+    o = db.q1("SELECT * FROM orders WHERE lan='LAN-X'")
+    assert o["status"] == "DONE"
+
+    ctl = g.sheets_data[s.get("control_sheet_id")]
+    ctl["Order Actions"].append(["LAN-X", "CANCEL", ""])
+    assert run_cycle(_ctx(s, db, g))
+
+    assert ctl["Order Actions"][1][3] == "DONE: cancelled, paper returned to stock"
+    p = db.q1("SELECT p.* FROM papers p WHERE p.id=%s", (o["paper_id"],))
+    assert p["status"] == "AVAILABLE" and p["order_id"] is None
+    assert g.path_of(p["drive_file_id"]).startswith("inventory_root/MH/200/")
+    out = [rows for sid, tabs in g.sheets_data.items() if sid in g.files and g.files[sid]["name"] == "MH-200"
+           for rows in tabs.values()][0]
+    assert out[-1][5].startswith("CANCELLED"), out[-1]
+
+    # move failure AFTER commit: ledger must still be consistent, and a WARN event is logged
+    g.add("TEST_Shriram_MH_LANs_26Oct_2", GSHEET, s.folder("orders_incoming"),
+          tabs={"x": [samples.H, ["1", "LAN-Y", "c", "b", "MH", "200"]]})
+    _stock(g, s, "MH", 200, 1, start=50)
+    assert run_cycle(_ctx(s, db, g))
+    oy = db.q1("SELECT * FROM orders WHERE lan='LAN-Y'")
+    assert oy["status"] == "DONE"
+
+    boom = FakeGoogle.move_rename
+    def fail_move(self, fid, new_parent, new_name=None):
+        raise RuntimeError("Drive 503")
+    FakeGoogle.move_rename = fail_move
+    try:
+        ctl["Order Actions"].append(["LAN-Y", "CANCEL", ""])
+        warn_before = db.q1("SELECT count(*) n FROM events WHERE level='WARN'")["n"]
+        assert run_cycle(_ctx(s, db, g))
+    finally:
+        FakeGoogle.move_rename = boom
+    assert ctl["Order Actions"][-1][3] == "DONE: cancelled, paper returned to stock"
+    py = db.q1("SELECT * FROM papers WHERE id=%s", (oy["paper_id"],))
+    assert py["status"] == "AVAILABLE" and py["order_id"] is None
+    assert db.q1("SELECT status FROM orders WHERE lan='LAN-Y'")["status"] == "CANCELLED"
+    assert db.q1("SELECT count(*) n FROM events WHERE level='WARN'")["n"] > warn_before
+
+
+# ── #10 wrap-up guard (lock never leaks) + Slack HTTP errors surfaced ────────────────────
+def test_send_alerts_logs_when_slack_returns_http_error(settings, monkeypatch, caplog):
+    # A Slack 4xx/5xx must surface in the log, not be silently swallowed (#10b).
+    monkeypatch.setenv("ESTAMP_SLACK_WEBHOOK", "https://hooks.example/slack")
+
+    class FakeResp:
+        ok = False
+        def raise_for_status(self):
+            raise requests.HTTPError("500 Server Error")
+
+    monkeypatch.setattr(requests, "post", lambda *a, **k: FakeResp())
+    ctx = Ctx(settings, db=None, google=None, ocr=object(), splitter=object())
+    with caplog.at_level("ERROR"):
+        ctx.send_alerts("subj", ["line"])
+    assert any("Slack alert failed" in r.message for r in caplog.records), caplog.text
+
+
+@e2e
+def test_lock_released_even_if_send_raises(env):
+    # If _send blows up in the finally block, the advisory lock must still be released and the run
+    # must still be recorded (#10a) – otherwise a single alert failure wedges every future cycle.
+    import estamp.cycle as _c
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    g.add("TEST_Shriram_MH_LANs_26Oct", GSHEET, s.folder("orders_incoming"), tabs={"x": samples.mh()})
+    _stock(g, s, "MH", 200, 2)
+    def boom(ctx):
+        raise RuntimeError("boom in _send")
+    orig = _c._send
+    _c._send = boom
+    try:
+        run_cycle(_ctx(s, db, g))
+    finally:
+        _c._send = orig
+    assert db.try_lock(), "advisory lock leaked after _send raised"
+    db.release_lock()
+    assert db.q1("SELECT count(*) n FROM runs WHERE finished_at IS NOT NULL")["n"] >= 1
+
+
+# ── #9 intake crash between Drive upload and ledger insert must not duplicate the file ───
+@e2e
+def test_intake_crash_between_upload_and_insert_reuses_the_orphan(env, monkeypatch):
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    _stock(g, s, "MH", 200, 1)                       # one paper waiting in the inbox
+
+    def boom(**f):
+        raise RuntimeError("crash after Drive upload, before the ledger insert")
+    monkeypatch.setattr(db, "insert_paper", boom)
+    run_cycle(_ctx(s, db, g))                         # uploads the file, then the insert blows up → orphan
+    monkeypatch.undo()
+
+    # one orphan PDF now sits in Inventory with no ledger row
+    inv = [f for f in g.files.values() if f["mimeType"] == PDF
+           and g.path_of(f["id"]).startswith("inventory_root/MH/200/")]
+    assert len(inv) == 1 and db.q1("SELECT count(*) n FROM papers")["n"] == 0
+
+    run_cycle(_ctx(s, db, g))                         # re-run must adopt the orphan, not upload a second file
+    inv = [f for f in g.files.values() if f["mimeType"] == PDF
+           and g.path_of(f["id"]).startswith("inventory_root/MH/200/")]
+    assert len(inv) == 1, [g.path_of(f["id"]) for f in inv]      # still exactly one physical file
+    assert db.q1("SELECT count(*) n FROM papers WHERE status='AVAILABLE' AND state='MH'")["n"] == 1
+    assert db.q1("SELECT drive_file_id FROM papers")["drive_file_id"] == inv[0]["id"]   # row points at it
+
+
+# ── #4 alert dedup is hourly by default (a stuck condition keeps surfacing), daily when asked ──
+@e2e
+def test_alert_dedup_is_hourly_by_default_and_daily_when_asked(env):
+    s, db, g = env
+    ctx = _ctx(s, db, g)
+    ctx.event("WARN", "X", "stuck", alert_key="failK")           # hourly (default)
+    ctx.event("WARN", "X", "still stuck", alert_key="failK")     # same hour → deduped, no second alert
+    assert len([a for a in ctx.alerts if a.startswith("WARN · X")]) == 1
+    keys = [r["alert_key"] for r in db.q("SELECT alert_key FROM alerts_sent")]
+    assert any(k.startswith("failK|") for k in keys), keys       # the hour is folded into the dedup key
+    assert "failK" not in keys                                   # never the bare key when hourly
+
+    ctx.event("WARN", "Y", "shortage", alert_key="shortK", dedup="day")   # daily opt-out
+    keys = [r["alert_key"] for r in db.q("SELECT alert_key FROM alerts_sent")]
+    assert "shortK" in keys, keys                                # stored bare: one a day, no hour bucket
+
+
+# ── CANCEL marker: a failed output-sheet write must be loud, never a silently-lost "do not use" ──
+@e2e
+def test_cancel_sheet_marker_failure_is_loud_not_silent(env):
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    g.add("TEST_Shriram_MH_LANs_26Oct", GSHEET, s.folder("orders_incoming"),
+          tabs={"x": [samples.H, ["1", "LAN-M", "c", "b", "MH", "200"]]})
+    _stock(g, s, "MH", 200, 1)
+    assert run_cycle(_ctx(s, db, g))
+    o = db.q1("SELECT * FROM orders WHERE lan='LAN-M'")
+    assert o["status"] == "DONE"
+
+    ctl = g.sheets_data[s.get("control_sheet_id")]
+    orig = FakeGoogle.append_rows
+    def boom(self, sid, title, rows):   # only the CANCELLED marker append fails; everything else works
+        if any(len(r) > 5 and "do not use" in str(r[5]) for r in rows):
+            raise RuntimeError("Sheets 500")
+        return orig(self, sid, title, rows)
+    FakeGoogle.append_rows = boom
+    try:
+        ctl["Order Actions"].append(["LAN-M", "CANCEL", ""])
+        err_before = db.q1("SELECT count(*) n FROM events WHERE level='ERROR'")["n"]
+        assert run_cycle(_ctx(s, db, g))
+    finally:
+        FakeGoogle.append_rows = orig
+    # cancellation still committed despite the failed sheet write
+    assert ctl["Order Actions"][-1][3] == "DONE: cancelled, paper returned to stock"
+    assert db.q1("SELECT status FROM papers WHERE id=%s", (o["paper_id"],))["status"] == "AVAILABLE"
+    assert db.q1("SELECT status FROM orders WHERE lan='LAN-M'")["status"] == "CANCELLED"
+    # and the missing marker was reported loudly, not silently dropped
+    assert db.q1("SELECT count(*) n FROM events WHERE level='ERROR' AND action='Cancel' "
+                 "AND details LIKE '%do not use%'")["n"] >= 1
+    assert db.q1("SELECT count(*) n FROM events WHERE level='ERROR'")["n"] > err_before

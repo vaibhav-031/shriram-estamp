@@ -17,7 +17,9 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+from .constants import BACKUP_ROOT, NEEDS_REVIEW, OUTPUT_ROOT
 from .context import Ctx
+from .errors import line
 from .extract import ids_in_reading, safe_file_name
 from .google_clients import file_link
 from .ocr_split import _split_local
@@ -27,17 +29,22 @@ class CertMismatch(RuntimeError):
     pass
 
 
-def verify_issued(ctx: Ctx, file_id: str, expected: str, name: str) -> tuple[str, str]:
-    """OCR every page of the issued file; return (id found, via). Raises CertMismatch unless it is exactly `expected`."""
+def verify_issued(ctx: Ctx, file_id: str, allowed: list[str], name: str) -> tuple[str, str]:
+    """OCR every page of the issued file; return (the allowed id the PDF showed, via). `allowed` holds the values the
+    PDF may legitimately show: the ledger cert_no and – when ops corrected the paper (E-07) – the API's original
+    printed cert (api_cert_no), which is what the physical PDF still prints. Raises CertMismatch unless the OCR'd set
+    is exactly one of the allowed values."""
+    allowed = [a for a in allowed if a]
     found, via = set(), ""
     for p in _split_local(ctx.google.download(file_id), 1):
         r = ctx.ocr.read(p.data, f"{name}_p{p.page_from}")
         found |= {h.cert for h in ids_in_reading(r.text, r.cert, r.fields, ctx.settings, ctx.matcher, ctx.resolver)}
         via = r.via
-    if found != {expected}:
-        seen = ", ".join(sorted(found)) or "no certificate / serial readable"
-        raise CertMismatch(f"issued PDF shows [{seen}] but ledger expected {expected}")
-    return expected, via
+    for cand in allowed:
+        if found == {cand}:
+            return cand, via
+    seen = ", ".join(sorted(found)) or "no certificate / serial readable"
+    raise CertMismatch(f"issued PDF shows [{seen}] but ledger expected {' or '.join(allowed)}")
 
 
 def label_for(state: str, denom: int) -> str:
@@ -83,8 +90,8 @@ def run_allocation(ctx: Ctx, deadline: float, report_shortage: bool = True) -> N
     for key, n in short.items():
         st, d = key.split("|")
         ctx.stats.waiting += n
-        ctx.event("WARN", "Shortage", f"{st} ₹{d}: {n} LAN(s) waiting – not enough AVAILABLE papers. "
-                  "They fulfil automatically once stock is uploaded.", alert_key=f"short|{key}")
+        ctx.event("WARN", "Shortage", line("E301", f"{st} ₹{d}: {n} LAN(s) waiting – not enough AVAILABLE papers. "
+                  "They fulfil automatically once stock is uploaded."), alert_key=f"short|{key}", dedup="day")
 
 
 def _preview(ctx: Ctx) -> None:
@@ -128,11 +135,11 @@ def _allocate_one(ctx: Ctx, order: dict) -> str:
     pdf_name = f"{lan_safe}.pdf"
     step = "prepare folders"
     try:
-        out_folder = g.folder_path(s.folder("output_root"), [d.isoformat(), state, f"{label} PDFs"])
+        out_folder = g.folder_path(s.folder(OUTPUT_ROOT), [d.isoformat(), state, f"{label} PDFs"])
         if g.child_exists(out_folder, pdf_name):
             raise RuntimeError(f"'{pdf_name}' already exists in the output folder")
         step = "backup copy"
-        backup_folder = g.folder_path(s.folder("backup_root"), [d.isoformat(), state, str(denom)])
+        backup_folder = g.folder_path(s.folder(BACKUP_ROOT), [d.isoformat(), state, str(denom)])
         backup_id = g.copy(paper["drive_file_id"], backup_folder, f"{lan_safe}__{paper['cert_no']}.pdf")
         step = "rename + move"
         g.move_rename(paper["drive_file_id"], out_folder, pdf_name)
@@ -140,10 +147,11 @@ def _allocate_one(ctx: Ctx, order: dict) -> str:
         if s.get("allocation.verify_ocr", True):
             step = "verify OCR on issued PDF"
             try:
-                verified, via = verify_issued(ctx, paper["drive_file_id"], paper["cert_no"], pdf_name)
+                verified, via = verify_issued(ctx, paper["drive_file_id"],
+                                              [paper["cert_no"], paper.get("api_cert_no")], pdf_name)
             except CertMismatch:
                 g.move_rename(paper["drive_file_id"],
-                              g.folder_path(s.folder("needs_review"), [d.isoformat(), "Cert mismatch"]),
+                              g.folder_path(s.folder(NEEDS_REVIEW), [d.isoformat(), "Cert mismatch"]),
                               f"{lan_safe}__expected_{paper['cert_no']}.pdf")
                 raise
         step = "update ledger"
@@ -157,5 +165,8 @@ def _allocate_one(ctx: Ctx, order: dict) -> str:
         try:
             db.fail_allocation(order, paper, msg)
         finally:
-            ctx.event("ERROR", "Allocate", f"LAN {order['lan']} ({label}): {msg}", ref=str(order["id"]))
+            # Only an issued-PDF cert mismatch (E302) gets a code; other failing steps stay plain text.
+            details = line("E302", f"LAN {order['lan']} ({label}): {msg}") if isinstance(e, CertMismatch) \
+                else f"LAN {order['lan']} ({label}): {msg}"
+            ctx.event("ERROR", "Allocate", details, ref=str(order["id"]))
         return "ERROR"

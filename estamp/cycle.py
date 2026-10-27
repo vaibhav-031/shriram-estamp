@@ -27,7 +27,20 @@ from .outputs import run_outputs
 def run_cycle(ctx: Ctx) -> bool:
     s, db = ctx.settings, ctx.db
     if not db.try_lock():
-        log.warning("another run is in progress – skipping this cycle")
+        # Another cycle holds the lock. A brief overlap is normal, but a run still going long past a normal
+        # cycle means the holder is wedged and silently blocking all work – escalate so ops hear it (#3).
+        age = db.active_run_age_seconds()
+        wedged = float(s.get("alerts.wedged_run_minutes", 30)) * 60
+        if not ctx.dry and age is not None and age > wedged:
+            ctx.event("ERROR", "Cycle", f"a cycle has been running {age / 60:.0f} min and is blocking every new "
+                      "cycle – the process is likely wedged. Restart `python -m estamp run`.", alert_key="cycle_wedged")
+            try:
+                _send(ctx)              # we return early, so the normal end-of-cycle delivery never runs
+                ctx.heartbeat(False)    # tell the external monitor we are not healthy
+            except Exception as e:
+                log.error(f"wedged-cycle alert failed: {e}")
+        else:
+            log.warning("another run is in progress – skipping this cycle")
         return True
     run_id = db.start_run()
     ok = True
@@ -53,10 +66,24 @@ def run_cycle(ctx: Ctx) -> bool:
         try:
             _step(ctx, "Dashboard", lambda: run_dashboard(ctx))
         finally:
-            db.finish_run(run_id, ok, ctx.stats.as_dict())
-            _send(ctx)
-            ctx.heartbeat(ok)
+            # Each wrap-up call is independent: a failure in one must not skip the others, and
+            # release_lock() MUST always run or the advisory lock wedges every future cycle (#10).
+            try:
+                db.finish_run(run_id, ok, ctx.stats.as_dict())
+            except Exception as e:
+                log.error(f"finish_run failed: {e}")
+            try:
+                _send(ctx)
+            except Exception as e:
+                log.error(f"sending alerts failed: {e}")
+            try:
+                ctx.heartbeat(ok)
+            except Exception as e:
+                log.error(f"heartbeat failed: {e}")
             db.release_lock()
+    st = ctx.stats
+    ctx.event("INFO", "Cycle", f"summary: received {st.uploads} · stocked {st.papers_in} · in review {st.papers_review} "
+              f"· issued {st.allocated} · waiting {st.waiting} · errors {st.errors}")
     log.info(f"cycle done in {time.time() - t0:.0f}s: {ctx.stats.as_dict()}")
     return ok
 

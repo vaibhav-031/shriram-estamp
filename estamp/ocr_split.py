@@ -8,8 +8,7 @@ Providers (config.yaml → intake):
   split_provider: local     – pypdf (works today)
                   zoop_api  – in-house split API, contract in docs/api-samples/split/README.md (no auth)
   Both split into parts of 1 page (digital e-stamps) or 2 pages (traditional papers: front + back).
-  ocr_provider:   drive     – Google Drive OCR (works today, ~3–5 s per paper)
-                  zoop_api  – your in-house OCR API; falls back to Drive if ocr_fallback_to_drive
+  ocr_provider:   zoop_api  – your in-house OCR API (the only reader; on failure it raises, never falls back – D1)
 """
 from __future__ import annotations
 
@@ -133,40 +132,20 @@ def _split_zoop(data: bytes, name: str, settings: Settings, split_size: int = 1)
 
 # ---------------------------------------------------------------------------------- OCR
 
-def pdf_text(data: bytes) -> str:
-    """Text already inside the PDF (digital e-stamps). Empty for scans."""
-    try:
-        return "\n".join((pg.extract_text() or "") for pg in PdfReader(io.BytesIO(data)).pages)
-    except Exception:
-        return ""
-
-
-def read_paper(data: bytes, name: str, settings: Settings, google) -> OcrResult:
-    # 1. Digital PDF (e-stamp): use its built-in text – instant and exact, no OCR needed.
-    if settings.get("intake.use_pdf_text", True):
-        layer = pdf_text(data)
-        if len(re.sub(r"\s+", "", layer)) >= int(settings.get("intake.min_pdf_text_chars", 40)):
-            return OcrResult(layer, "", "pdf-text")
-    # 2. Scanned page: OCR.
-    provider = settings.get("intake.ocr_provider", "drive")
-    if provider == "zoop_api":
-        try:
-            return _ocr_zoop(data, name, settings)
-        except Exception as e:
-            if not settings.get("intake.ocr_fallback_to_drive", True):
-                raise
-            return OcrResult(google.ocr_text(data, name), "", f"drive (API failed: {str(e)[:100]})")
-    return OcrResult(google.ocr_text(data, name), "", "drive")
+def read_paper(data: bytes, name: str, settings: Settings) -> OcrResult:
+    """Read one paper with the in-house OCR API only (D1). On failure it raises – never falls back to Drive OCR
+    or the PDF text layer, so a wrong reading can't be silently issued."""
+    return _ocr_zoop(data, name, settings)
 
 
 class ConfiguredOcr:
-    """Default OCR client: reads a paper with the providers set in config."""
+    """Default OCR client: reads a paper with the OCR API set in config."""
 
-    def __init__(self, settings: Settings, google):
-        self.settings, self.google = settings, google
+    def __init__(self, settings: Settings):
+        self.settings = settings
 
     def read(self, data: bytes, name: str) -> OcrResult:
-        return read_paper(data, name, self.settings, self.google)
+        return read_paper(data, name, self.settings)
 
 
 class ConfiguredSplitter:

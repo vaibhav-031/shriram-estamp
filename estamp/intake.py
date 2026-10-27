@@ -12,40 +12,73 @@ Re-running is safe: pages already in the ledger are skipped.
 """
 from __future__ import annotations
 
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
+from .constants import INVENTORY_ROOT, NEEDS_REVIEW, UPLOAD_ARCHIVE, UPLOAD_INBOX
 from .context import Ctx, log
 from .db import UniqueViolation
+from .errors import line
 from dataclasses import dataclass
 
 from .extract import (PaperAnalysis, analyze_fields, analyze_paper, first_broken_pair, ids_in_reading,
                       pages_per_paper, safe_file_name)
 from .google_clients import FOLDER, PDF, parse_time
+from .http_api import ApiAuthError
 from .ocr_split import _split_local, merge_pdfs
 
 
-def _collect(g, folder_id: str, depth: int = 0, max_depth: int = 4) -> tuple[list[dict], list[dict]]:
-    """All files in the inbox, including inside any folders ops uploaded (RJ/, Vendor batch 3/, …).
-    Returns (files, subfolders). Folder names are ignored – every paper is routed by its certificate."""
+def _collect(g, folder_id: str, vendor: str | None = None, depth: int = 0,
+             max_depth: int = 4) -> tuple[list[dict], list[dict]]:
+    """All files in the inbox, including inside any folders ops uploaded (Paper Ease/, batch 3/, …).
+    Returns (files, subfolders). Each file carries `_vendor_folder`: the name of the top-level inbox subfolder
+    it descends from (None if it sits directly in the inbox root). Nested folders inherit the top-level name, so
+    the vendor is decided by the immediate child of the Upload Inbox, not by how deep the file is buried (D-1)."""
     files, folders = [], []
     for item in g.list_children(folder_id):
         if item.get("mimeType") == FOLDER:
             if depth < max_depth:
                 folders.append(item)
-                sub_files, sub_folders = _collect(g, item["id"], depth + 1, max_depth)
+                # top-level subfolder (depth 0) names the vendor; deeper folders keep the one they inherited.
+                sub_vendor = item["name"] if depth == 0 else vendor
+                sub_files, sub_folders = _collect(g, item["id"], sub_vendor, depth + 1, max_depth)
                 files += sub_files
                 folders += sub_folders
         else:
-            files.append(item)
+            files.append({**item, "_vendor_folder": vendor})
     return files, folders
+
+
+def _resolve_vendor(s, folder_name: str | None):
+    """Map an inbox top-level folder name to its vendor code, matching vendor_name or vendor_code case-insensitively.
+    Returns the VendorCfg, or None when the file is in the inbox root / the folder is not a known vendor (E101)."""
+    if not folder_name:
+        return None
+    key = folder_name.strip().lower()
+    for v in s.vendors.values():
+        if key in (v.name.lower(), v.code.lower()):
+            return v
+    return None
+
+
+def _ensure_vendor_folders(ctx: Ctx) -> None:
+    """One subfolder per ACTIVE vendor exists in the Upload Inbox (created by vendor_name if missing). Never deletes."""
+    if ctx.dry:
+        return
+    g, s = ctx.google, ctx.settings
+    inbox = s.folder(UPLOAD_INBOX)
+    for v in s.vendors.values():
+        if v.active:
+            g.folder_path(inbox, [v.name])
 
 
 def run_intake(ctx: Ctx, deadline: float) -> None:
     g, s = ctx.google, ctx.settings
-    inbox = s.folder("upload_inbox")
+    inbox = s.folder(UPLOAD_INBOX)
     settle = int(s.get("intake.settle_minutes", 5)) * 60
+    _ensure_vendor_folders(ctx)
     files, folders = _collect(g, inbox)
     for f in sorted(files, key=lambda x: x["modifiedTime"]):
         if time.time() > deadline:
@@ -54,15 +87,26 @@ def run_intake(ctx: Ctx, deadline: float) -> None:
         age = (datetime.now(timezone.utc) - parse_time(f["modifiedTime"])).total_seconds()
         if age < settle:
             continue
+        vendor = _resolve_vendor(s, f.get("_vendor_folder"))
+        if vendor is None:
+            # E101: not inside a known vendor folder. Leave the file where it is – never move/delete/process it.
+            where = f.get("_vendor_folder")
+            why = f"folder '{where}' is not a known vendor" if where else "file sits directly in the inbox root"
+            ctx.event("WARN", "Intake", line("E101", f"'{f['name']}' – {why}; moved nowhere, not stocked"),
+                      ref=f["id"], alert_key=f"intakevendor|{f['id']}")
+            continue
         try:
-            _process_upload(ctx, f)
+            _process_upload(ctx, f, vendor.code)
         except Exception as e:
             ctx.event("ERROR", "Intake", f"'{f['name']}' failed: {e} – stays in the inbox and is retried next cycle",
                       ref=f["id"], alert_key=f"intakefail|{f['id']}")
-    # Uploaded folders that are now empty go to the archive (deepest first), so the inbox stays clean.
+    # Uploaded folders that are now empty go to the archive (deepest first), so the inbox stays clean. The vendor
+    # folders themselves are permanent – they are left in place even when empty (ops drop the next batch into them).
     if not ctx.dry:
-        archive = g.folder_path(s.folder("upload_archive"), [ctx.today().isoformat()])
+        archive = g.folder_path(s.folder(UPLOAD_ARCHIVE), [ctx.today().isoformat()])
         for fo in reversed(folders):
+            if _resolve_vendor(s, fo["name"]) is not None:
+                continue
             try:
                 if not g.list_children(fo["id"]):
                     g.move_rename(fo["id"], archive)
@@ -118,9 +162,11 @@ def _read_units(ctx: Ctx, data: bytes, name: str) -> list[Unit]:
 
     def read(no):
         try:
-            return no, (ctx.ocr.read(singles[no - 1].data, f"{name}_p{no}"), "")
+            return no, (ctx.ocr.read(singles[no - 1].data, f"{name}_p{no}"), "", None)
+        except ApiAuthError as e:
+            return no, (None, f"OCR failed on page {no}: {e}", e)   # auth failure: surfaced loudly, never retried
         except Exception as e:
-            return no, (None, f"OCR failed on page {no}: {e}")
+            return no, (None, f"OCR failed on page {no}: {e}", None)
         finally:
             with ctx._lock:
                 done[0] += 1
@@ -130,20 +176,25 @@ def _read_units(ctx: Ctx, data: bytes, name: str) -> list[Unit]:
     with ThreadPoolExecutor(max_workers=int(s.get("workers", 8))) as ex:
         reads = dict(ex.map(read, range(1, len(singles) + 1)))
 
+    # A-08/D1: if ANY page failed OCR, the whole upload stays in the inbox and is retried next cycle – never
+    # stocked or reviewed page by page on a transient blip. An auth failure (401/403) surfaces loudly, not looped.
+    auth = next((reads[no][2] for no in sorted(reads) if reads[no][2] is not None), None)
+    if auth is not None:
+        raise auth
+    first_err = next((reads[no][1] for no in sorted(reads) if reads[no][1]), "")
+    if first_err:
+        raise RuntimeError(f"{first_err} – whole upload stays in the inbox, retried next cycle")
+
+    # Past this point every page read cleanly (any failure raised above).
     def ids(no):
-        r, e = reads[no]
-        return [] if e else ids_in_reading(r.text, r.cert, r.fields, s, ctx.matcher, ctx.resolver)
+        r = reads[no][0]
+        return ids_in_reading(r.text, r.cert, r.fields, s, ctx.matcher, ctx.resolver)
 
     page_ids = {no: ids(no) for no in reads}
     deciding = next((no for no in sorted(reads) if len(page_ids[no]) == 1), None)
     if deciding is None:
-        first_err = next((e for r, e in reads.values() if e), "")
-        if first_err:       # can't tell the type while pages are unreadable – retry the whole file next cycle
-            raise RuntimeError(f"{first_err} – the paper type can't be decided, retried next cycle")
         raise WholeUploadReview("E105", "no page has a readable certificate / serial, so 1- or 2-page papers can't "
                                         "be told apart. Check the file")
-    if any(e for no, (r, e) in reads.items() if no < deciding):
-        raise RuntimeError(f"{reads[min(no for no, (r, e) in reads.items() if e)][1]} – retried next cycle")
     size = pages_per_paper(page_ids[deciding][0], s)
     clash = [(no, h.cert) for no in sorted(reads) for h in page_ids[no] if pages_per_paper(h, s) != size]
     if clash:
@@ -163,19 +214,16 @@ def _read_units(ctx: Ctx, data: bytes, name: str) -> list[Unit]:
 
     def unit(p):
         pages = range(p.page_from, p.page_to + 1)
-        first, err = reads[p.page_from]
-        texts = [reads[no][0].text if reads[no][0] else "" for no in pages]
-        error = next((reads[no][1] for no in pages if reads[no][1]), "")
+        first = reads[p.page_from][0]
+        texts = [reads[no][0].text for no in pages]
         raw = None
-        if first is not None and first.fields is not None:
-            raw = {"fields": first.fields, "responses": {str(no): reads[no][0].raw for no in pages if reads[no][0]}}
-        return Unit(p.page_from, p.page_to, [p.data], texts, first.cert if first else "",
-                    first.via if first else "error", error, first.fields if first else None, raw)
+        if first.fields is not None:
+            raw = {"fields": first.fields, "responses": {str(no): reads[no][0].raw for no in pages}}
+        return Unit(p.page_from, p.page_to, [p.data], texts, first.cert, first.via, "", first.fields, raw)
 
     units = [unit(p) for p in pieces]
     if size == 2:
-        # A pair whose OCR failed can't prove or disprove the pairing; it goes to review on its own error.
-        counts = [(1, 0) if u.error else (len(page_ids[u.page_from]), len(page_ids[u.page_to])) for u in units]
+        counts = [(len(page_ids[u.page_from]), len(page_ids[u.page_to])) for u in units]
         k = first_broken_pair(counts)
         if k is not None:
             at = pieces[k].page_from
@@ -193,13 +241,32 @@ def _analyze(ctx: Ctx, u: Unit):
     return analyze_paper(u.text, u.api_cert, ctx.settings, ctx.matcher, ctx.db.cert_is_live, ctx.resolver)
 
 
-def _process_upload(ctx: Ctx, f: dict) -> None:
+def _reread(ctx: Ctx, up: dict, upload_name: str, u: Unit) -> None:
+    """E-06: one extra OCR call for this single paper, in place. A first reading that SUCCEEDED but failed the checks
+    (no cert, amount not allowed, …) often reads clean on a retry – before the paper lands in Needs Review we re-OCR
+    its own PDF once and adopt the retry's reading. On a traditional (2-page) paper the retry reads the merged PDF as
+    one call, like the live OCR API. A read FAILURE here is left to Needs Review – it is not the A-08 transient-call
+    case (that keeps the WHOLE upload in the inbox and is handled in _read_units before any paper is stocked)."""
+    try:
+        r = ctx.ocr.read(u.data, f"{upload_name}_p{u.page_from}-{u.page_to}#retry")
+    except Exception as e:
+        ctx.event("INFO", "Intake", f"{upload_name} pages {u.page_from}-{u.page_to}: second OCR attempt failed ({e}) "
+                  "– keeping the first reading", ref=up.get("drive_file_id"))
+        return
+    if r.fields is not None:
+        u.fields, u.raw = r.fields, {"fields": r.fields, "responses": {str(u.page_from): r.raw}}
+    else:
+        u.texts, u.api_cert, u.fields, u.raw = [r.text], r.cert, None, None
+    u.via = r.via
+
+
+def _process_upload(ctx: Ctx, f: dict, vendor_code: str = "") -> None:
     g, s, db = ctx.google, ctx.settings, ctx.db
     today = ctx.today().isoformat()
     if f.get("mimeType") != PDF:
-        ctx.event("WARN", "Intake", f"'{f['name']}' is not a PDF – moved to Needs Review/Not PDF", ref=f["id"])
+        ctx.event("WARN", "Intake", line("E102", f"'{f['name']}' – moved to Needs Review/Not PDF"), ref=f["id"])
         if not ctx.dry:
-            g.move_rename(f["id"], g.folder_path(s.folder("needs_review"), ["Not PDF"]))
+            g.move_rename(f["id"], g.folder_path(s.folder(NEEDS_REVIEW), ["Not PDF"]))
         return
 
     if ctx.dry:
@@ -207,7 +274,8 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
             units = _read_units(ctx, g.download(f["id"]), f["name"])
         except WholeUploadReview as w:
             ctx.preview.append(["UPLOAD", f["name"], "all pages", "", "", "", "Needs Review (whole file)", str(w)])
-            ctx.event("WARN", "Intake", f"'{f['name']}' would go to Needs Review as a whole – {w}", ref=f["id"])
+            ctx.event("WARN", "Intake",
+                      line(w.code, f"'{f['name']}' would go to Needs Review as a whole – {w.reason}"), ref=f["id"])
             return
         rows = []
         for u in units:
@@ -224,18 +292,19 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
 
     up = db.upload_get_or_create(f["id"], f["name"], f.get("md5Checksum", ""))
     if up["status"] in ("DONE", "DUPLICATE"):
-        g.move_rename(f["id"], g.folder_path(s.folder("upload_archive"), [today]))
+        g.move_rename(f["id"], g.folder_path(s.folder(UPLOAD_ARCHIVE), [today]))
         return
     if up["status"] == "REVIEW":          # decided earlier (crash before the move, or ops moved it back)
-        g.move_rename(f["id"], g.folder_path(s.folder("needs_review"), [today]))
+        g.move_rename(f["id"], g.folder_path(s.folder(NEEDS_REVIEW), [today]))
         ctx.event("WARN", "Needs review", f"'{f['name']}' was already sent to Needs Review as a whole ({up['notes']}) – "
                   "moved back there. To process it after a fix, upload it again as a new file.", ref=f["id"])
         return
     twin = db.upload_same_md5_done(f.get("md5Checksum", ""), up["id"])
     if twin:
         db.upload_finish(up["id"], "DUPLICATE", 0, f"same file content as '{twin['file_name']}' (upload {twin['id']})")
-        g.move_rename(f["id"], g.folder_path(s.folder("needs_review"), ["Duplicate uploads"]))
-        ctx.event("WARN", "Intake", f"'{f['name']}' is an exact duplicate of '{twin['file_name']}' – not stocked again",
+        g.move_rename(f["id"], g.folder_path(s.folder(NEEDS_REVIEW), ["Duplicate uploads"]))
+        ctx.event("WARN", "Intake",
+                  line("E104", f"'{f['name']}' is an exact duplicate of '{twin['file_name']}' – not stocked again"),
                   ref=f["id"])
         return
 
@@ -243,50 +312,112 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
         units = _read_units(ctx, g.download(f["id"]), f["name"])
     except WholeUploadReview as w:
         db.upload_finish(up["id"], "REVIEW", 0, str(w))
-        g.move_rename(f["id"], g.folder_path(s.folder("needs_review"), [today]))
+        g.move_rename(f["id"], g.folder_path(s.folder(NEEDS_REVIEW), [today]))
         ctx.stats.uploads += 1
-        ctx.event("WARN", "Needs review", f"'{f['name']}' (whole file): {w}", ref=f["id"])
+        ctx.event("WARN", "Needs review", line(w.code, f"'{f['name']}' (whole file): {w.reason}"), ref=f["id"])
+        return
+    except ApiAuthError as e:
+        # A-08: a bad key is a human fix, not a timeout – stop this upload loudly, keep it in the inbox, never loop.
+        ctx.event("ERROR", "Intake", f"'{f['name']}': OCR API refused the request – {e}. Fix the API key, then it "
+                  "reads next cycle. Not retried this cycle.", ref=f["id"], alert_key=f"intakeauth|{f['id']}")
+        return
+    except RuntimeError as e:
+        # A-08/D1: OCR (or split) failed. The whole upload stays in the inbox and is retried next cycle – unless it
+        # has been failing for longer than the give-up window, when it moves to Needs Review as a whole with an alert.
+        give_up = int(s.get("intake.ocr_fail_give_up_minutes", 30))
+        failing_for = (datetime.now(timezone.utc) - up["created_at"]).total_seconds()
+        if failing_for < give_up * 60:
+            ctx.event("WARN", "Intake", f"'{f['name']}': {e} – stays in the inbox, retried next cycle", ref=f["id"],
+                      alert_key=f"intakefail|{f['id']}")
+            return
+        reason = (f"Reading this upload kept failing for over {give_up} min ({e}). Moved to Needs Review as a whole – "
+                  "nothing was stocked. Check the API / the file, then upload it again as a new file.")
+        db.upload_finish(up["id"], "REVIEW", 0, reason)
+        g.move_rename(f["id"], g.folder_path(s.folder(NEEDS_REVIEW), [today]))
+        ctx.stats.uploads += 1
+        ctx.event("WARN", "Needs review", f"'{f['name']}' (whole file): {reason}", ref=f["id"],
+                  alert_key=f"intakegiveup|{f['id']}")
         return
     done = db.pages_done(up["id"])
     todo = [u for u in units if u.page_from not in done]
     with ThreadPoolExecutor(max_workers=int(s.get("workers", 8))) as ex:
-        list(ex.map(lambda u: _stock_unit(ctx, up, f["name"], u), todo))
+        list(ex.map(lambda u: _stock_unit(ctx, up, f["name"], u, vendor_code), todo))
 
     db.upload_finish(up["id"], "DONE", len(units))
-    g.move_rename(f["id"], g.folder_path(s.folder("upload_archive"), [today]))
+    g.move_rename(f["id"], g.folder_path(s.folder(UPLOAD_ARCHIVE), [today]))
     ctx.stats.uploads += 1
     ctx.event("INFO", "Intake", f"'{f['name']}': {len(units)} paper(s) processed", ref=f["id"])
 
 
-def _stock_unit(ctx: Ctx, up: dict, upload_name: str, u: Unit) -> None:
+_stock_name_locks: dict[str, threading.Lock] = {}
+_stock_name_guard = threading.Lock()
+
+
+def _stock_name_lock(name: str) -> threading.Lock:
+    """One lock per target file name, so the check-reuse-upload-insert for a given cert is serialized across
+    the intake worker threads (#9): two papers with the SAME cert in one cycle must not race the orphan check
+    and collapse onto one file. Different names never contend."""
+    with _stock_name_guard:
+        return _stock_name_locks.setdefault(name, threading.Lock())
+
+
+def _reuse_or_upload(ctx: Ctx, folder: str, name: str, data: bytes) -> str:
+    """Return a Drive file id for data at folder/name. If a crashed prior attempt already uploaded this file
+    (same folder+name) and no paper row points at it yet, reuse that orphan instead of creating a duplicate –
+    keeps re-runs idempotent (#9). A file that IS already recorded belongs to a stocked paper, so we upload a
+    fresh one (a genuine duplicate cert then goes to Needs Review with its own file)."""
+    existing = ctx.google.child_id(folder, name)
+    if existing and not ctx.db.file_is_stocked(existing):
+        return existing
+    return ctx.google.upload_pdf(folder, name, data)
+
+
+def _stock_unit(ctx: Ctx, up: dict, upload_name: str, u: Unit, vendor_code: str = "") -> None:
     g, s, db = ctx.google, ctx.settings, ctx.db
     a = _analyze(ctx, u)
+    # E-06: a paper that READ fine but failed the checks gets ONE automatic second OCR attempt (never an E107 pairing
+    # case – that is a structural decision, not a bad reading). Only the better reading is used; a paper that already
+    # passed is never re-read.
+    if not a.ok and not u.error:
+        _reread(ctx, up, upload_name, u)
+        a = _analyze(ctx, u)
     data = u.data
     review_name = f"{safe_file_name(upload_name.rsplit('.', 1)[0])}__p{u.page_from}-{u.page_to}.pdf"
     fields = dict(upload_id=up["id"], page_from=u.page_from, page_to=u.page_to, cert_no=a.cert or None,
                   cert_state=a.cert_state or None, state=a.state or None, denomination=a.amount or None,
-                  ocr_amount=a.amount or None, ocr_via=u.via, ocr_text=u.text[:20000], ocr_raw=u.raw)
+                  ocr_amount=a.amount or None, ocr_via=u.via, ocr_text=u.text[:20000], ocr_raw=u.raw,
+                  vendor_code=vendor_code or None)
 
     if a.ok:
-        folder = g.folder_path(s.folder("inventory_root"), [a.state, str(a.amount)])
+        folder = g.folder_path(s.folder(INVENTORY_ROOT), [a.state, str(a.amount)])
         name = f"{a.cert}.pdf"
-        file_id = g.upload_pdf(folder, name, data)
-        try:
-            db.insert_paper(**fields, drive_file_id=file_id, file_name=name, status="AVAILABLE")
-            with ctx._lock:
-                ctx.stats.papers_in += 1
-            return
-        except UniqueViolation:
-            a.issues.append(f"duplicate certificate {a.cert} – already in stock")
-            g.move_rename(file_id, g.folder_path(s.folder("needs_review"), [ctx.today().isoformat()]), review_name)
-            db.insert_paper(**fields, drive_file_id=file_id, file_name=review_name, status="NEEDS_REVIEW",
-                            notes="; ".join(a.issues))
+        # Serialize per cert name so a same-cert pair in one cycle can't both pass the orphan check and lose
+        # the second paper onto one file (#9). The first to finish stocks it; the second then uploads its own
+        # file and lands in Needs Review as the duplicate it is.
+        with _stock_name_lock(name):
+            file_id = _reuse_or_upload(ctx, folder, name, data)
+            try:
+                db.insert_paper(**fields, drive_file_id=file_id, file_name=name, status="AVAILABLE")
+                with ctx._lock:
+                    ctx.stats.papers_in += 1
+                return
+            except UniqueViolation:
+                a.issues.append(f"duplicate certificate {a.cert} – already in stock")
+                reason = "; ".join(a.issues)
+                g.move_rename(file_id, g.folder_path(s.folder(NEEDS_REVIEW), [ctx.today().isoformat()]), review_name)
+                db.insert_paper(**fields, drive_file_id=file_id, file_name=review_name, status="NEEDS_REVIEW",
+                                notes=reason)
     else:
-        folder = g.folder_path(s.folder("needs_review"), [ctx.today().isoformat()])
-        file_id = g.upload_pdf(folder, review_name, data)
-        db.insert_paper(**fields, drive_file_id=file_id, file_name=review_name, status="NEEDS_REVIEW",
-                        notes="; ".join(a.issues))
+        # E-06: these reach Needs Review only AFTER the automatic second OCR attempt also failed. Where an E-code fits
+        # the leftover reason, stamp it so ops see it (E120 no cert, E124 unreadable amount).
+        reason = "; ".join(a.issues)
+        if not a.cert:
+            reason = line("E120", reason)
+        elif "not readable" in reason or "not an allowed amount" in reason:
+            reason = line("E124", reason)
+        folder = g.folder_path(s.folder(NEEDS_REVIEW), [ctx.today().isoformat()])
+        file_id = _reuse_or_upload(ctx, folder, review_name, data)
+        db.insert_paper(**fields, drive_file_id=file_id, file_name=review_name, status="NEEDS_REVIEW", notes=reason)
     with ctx._lock:
         ctx.stats.papers_review += 1
-    ctx.event("WARN", "Needs review", f"{upload_name} pages {u.page_from}-{u.page_to}: {'; '.join(a.issues)}",
-              ref=file_id)
+    ctx.event("WARN", "Needs review", f"{upload_name} pages {u.page_from}-{u.page_to}: {reason}", ref=file_id)

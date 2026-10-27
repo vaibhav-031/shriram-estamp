@@ -2,19 +2,23 @@
 
   python -m estamp login          one-time Google sign-in (opens your browser)
   python -m estamp init-db        create the shriram_estamp schema + tables (safe to re-run)
+  python -m estamp reset-test-data clear all ledger rows in the current schema (typed YES; refuses prod)
   python -m estamp check-setup    verify DB, Google access, every folder, state config, APIs, alerts
   python -m estamp run-once       one full cycle (respects dry_run in config.yaml)
   python -m estamp run            keep running a cycle every loop_seconds (refuses in dry run)
   python -m estamp status         stock + queue summary in the terminal
   python -m estamp reconcile      find inventory files the ledger doesn't know about (and vice-versa)
   python -m estamp recheck-review re-run checks on Needs Review papers after a config fix (no re-upload)
+  python -m estamp explain E111   print what an error code means and what ops should do (no DB/Google)
 """
 from __future__ import annotations
 
 import argparse
 import sys
 
-from .context import Ctx, setup_logging
+from .constants import (BACKUP_ROOT, INVENTORY_ROOT, NEEDS_REVIEW, ORDERS_INCOMING, ORDERS_PROCESSED,
+                        ORDERS_REJECTED, OUTPUT_ROOT, UPLOAD_ARCHIVE, UPLOAD_INBOX)
+from .context import Ctx, alert_channels, setup_logging
 from .db import DB
 from .settings import load_settings
 
@@ -36,11 +40,22 @@ def _build(args, need_google=True):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="estamp")
-    ap.add_argument("command", choices=["login", "init-db", "check-setup", "run-once", "run", "status", "reconcile", "recheck-review"])
+    ap.add_argument("command", choices=["login", "init-db", "reset-test-data", "check-setup", "run-once", "run", "status", "reconcile", "recheck-review", "explain"])
+    ap.add_argument("code", nargs="?", help="error code for `explain` (e.g. E111)")
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--dry-run", action="store_true", help="force dry run for this command")
     ap.add_argument("--live", action="store_true", help="force live mode for this command")
+    ap.add_argument("--yes", action="store_true", help="reset-test-data: skip the typed confirmation (scripted use)")
+    ap.add_argument("--force", action="store_true", help="reset-test-data: allow a production-looking schema")
     args = ap.parse_args(argv)
+
+    if args.command == "explain":
+        # No DB/Google – just the catalogue (like login, works offline).
+        from .errors import explain
+        if not args.code:
+            ap.error("explain needs an error code, e.g. `explain E111`")
+        print(explain(args.code))
+        return 0
 
     if args.command == "login":
         from .google_clients import load_credentials
@@ -54,6 +69,13 @@ def main(argv=None) -> int:
         db.init_schema()
         print(f"Schema '{s.schema}' ready.")
         return 0
+
+    if args.command == "reset-test-data":
+        s, db, _ = _build(args, need_google=False)
+        try:
+            return _reset_test_data(s, db, confirm=args.yes, force=args.force)
+        finally:
+            db.close()
 
     s, db, google = _build(args, need_google=args.command not in ("status",))
     try:
@@ -81,7 +103,39 @@ def main(argv=None) -> int:
         db.close()
     return 0
 
+# Wipe the ledger in the CURRENT schema (go-live test-data reset). DB only – Drive files are handled separately.
+# Guards: refuse a production-looking schema unless --force; require a typed YES unless --yes.
+PROD_SCHEMAS = {"shriram_estamp"}
 
+
+def _reset_test_data(s, db, confirm: bool, force: bool) -> int:
+    from urllib.parse import urlsplit
+    host = urlsplit(db.url).hostname or "?"          # host only – never print the URL (it may hold credentials)
+    schema = s.schema
+
+    if schema in PROD_SCHEMAS and not force:
+        print(f"REFUSING: schema '{schema}' looks like production. "
+              f"Re-run with --force only if you really mean to wipe it.")
+        return 2
+
+    counts = db.table_counts()
+    print(f"About to wipe schema '{schema}' on host '{host}'.")
+    print(f"Row counts ({sum(counts.values())} rows across {len(counts)} tables):")
+    for t, n in counts.items():
+        print(f"  {t:<16}{n}")
+
+    if not confirm:
+        if input("Type YES to clear all of the above (anything else aborts): ") != "YES":
+            print("cancelled, nothing changed")
+            return 1
+
+    cleared = db.reset_all_data()
+    print(f"Cleared {sum(cleared.values())} rows from {len(cleared)} tables in '{schema}'.")
+    print("Reminder: Drive test files are NOT touched by this command – clean them up separately.")
+    return 0
+
+
+# config and env check
 def _check(s, db, google) -> int:
     ok = True
 
@@ -96,8 +150,8 @@ def _check(s, db, google) -> int:
         line(n >= 8, f"Postgres schema '{s.schema}'", f"{n} tables" + ("" if n >= 8 else " – run init-db"))
     except Exception as e:
         line(False, "Postgres", str(e))
-    for key in ["upload_inbox", "upload_archive", "needs_review", "inventory_root", "orders_incoming",
-                "orders_processed", "orders_rejected", "output_root", "backup_root"]:
+    for key in [UPLOAD_INBOX, UPLOAD_ARCHIVE, NEEDS_REVIEW, INVENTORY_ROOT, ORDERS_INCOMING,
+                ORDERS_PROCESSED, ORDERS_REJECTED, OUTPUT_ROOT, BACKUP_ROOT]:
         try:
             f = google.get_file(s.folder(key))
             line(not f.get("trashed"), f"folder {key}", f"'{f['name']}'")
@@ -119,22 +173,33 @@ def _check(s, db, google) -> int:
              "url + key set" if s.get("zoop_api.ocr.url") else "zoop_api.ocr.url missing")
     else:
         line(True, "OCR: Google Drive OCR")
-    alerts = []
-    if s.env("alerts.slack_webhook_env"):
-        alerts.append("Slack")
-    if (s.get("alerts.smtp") or {}).get("host"):
-        alerts.append("email")
-    if s.env("alerts.heartbeat_url_env"):
-        alerts.append("heartbeat")
-    line(bool(alerts), "alerts", ", ".join(alerts) or "none configured – you will not hear about failures")
+    # A delivery channel (Slack/email) is what carries failure alerts; heartbeat is only a liveness
+    # ping and can't deliver a message, so it doesn't count here (same rule as send_alerts, #2).
+    channels = alert_channels(s)
+    line(bool(channels), "alerts", ", ".join(channels) or "none configured – you will not hear about failures")
+    line(True, "heartbeat", "configured" if s.env("alerts.heartbeat_url_env") else "not set (optional)")
     print("\nAll good." if ok else "\nFix the ✗ items above.")
     return 0 if ok else 1
 
-
+# current status of the jobs
 def _status(s, db) -> int:
     from .context import Ctx
     ctx = Ctx(s, db, None)
     from .dashboard import stock_rows
+    print("Stock per state/denomination:")
+    for abbr, meaning in (
+        ("ST", "state"),
+        ("₹", "denomination"),
+        ("daily", "daily issue rate"),
+        ("avail", "papers ready"),
+        ("review", "awaiting human"),
+        ("pending", "LANs waiting for stock"),
+        ("net", "avail − pending"),
+        ("cover", "days of stock left"),
+        ("flag", "OK / LOW / SHORT / INACTIVE"),
+    ):
+        print(f"  {abbr:<8}{meaning}")
+    print()
     print(f"{'ST':<4}{'₹':>6}{'daily':>7}{'avail':>7}{'review':>8}{'pending':>9}{'net':>7}{'cover':>7}  flag")
     for r in stock_rows(ctx):
         print(f"{r[0]:<4}{r[2]:>6}{r[3]:>7}{r[4]:>7}{r[5]:>8}{r[6]:>9}{r[7]:>7}{str(r[8]):>7}  {r[13]}")
@@ -145,7 +210,7 @@ def _status(s, db) -> int:
 
 def _reconcile(s, db, google) -> int:
     known = {r["drive_file_id"] for r in db.q("SELECT drive_file_id FROM papers WHERE drive_file_id IS NOT NULL")}
-    root = s.folder("inventory_root")
+    root = s.folder(INVENTORY_ROOT)
     orphans = []
     for st in google.list_children(root, folders=True):
         for dn in google.list_children(st["id"], folders=True):

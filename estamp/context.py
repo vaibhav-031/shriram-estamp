@@ -19,6 +19,37 @@ from .settings import Settings
 
 log = logging.getLogger("estamp")
 
+_LEVELS = ("ERROR", "WARN", "INFO")
+
+
+def alert_channels(settings: Settings) -> list[str]:
+    """Which alert delivery channels are actually configured. Empty means every alert would go
+    nowhere – the whole "tell ops on Slack when we're stuck" guarantee is silently dead (#2), so
+    callers must fail loud on []. Slack needs its webhook env set; email needs SMTP host + at least
+    one recipient."""
+    out = []
+    if settings.env("alerts.slack_webhook_env"):
+        out.append("slack")
+    smtp = settings.get("alerts.smtp") or {}
+    if smtp.get("host") and smtp.get("to"):
+        out.append("email")
+    return out
+
+
+def slack_body(lines: list[str]) -> str:
+    """Render the plain-text alert lines for the Slack code block: drop the "• " bullet and left-align the
+    "ERROR · " / "WARN · " level into a fixed-width label so the message text lines up in one column.
+    Lines without a level (summary, stock flags) pass through unchanged."""
+    out = []
+    for ln in lines:
+        s = ln[2:] if ln.startswith("• ") else ln
+        for level in _LEVELS:
+            if s.startswith(f"{level} · "):
+                s = f"{level:<5}  {s[len(level) + 3:]}"
+                break
+        out.append(s)
+    return "\n".join(out)
+
 
 def setup_logging(settings: Settings) -> None:
     if log.handlers:
@@ -77,7 +108,7 @@ class Ctx:
         self.matcher = CertMatcher(self.settings.get("intake.cert_patterns"), self.resolver)
         self.dry = self.settings.dry_run
         if self.ocr is None:
-            self.ocr = ConfiguredOcr(self.settings, self.google)
+            self.ocr = ConfiguredOcr(self.settings)
         if self.splitter is None:
             self.splitter = ConfiguredSplitter(self.settings)
 
@@ -96,10 +127,13 @@ class Ctx:
         return self.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # ---------------------------------------------------------------- events + alerts
-    def event(self, level: str, action: str, details: str, ref: str = "", alert_key: str | None = None) -> None:
+    def event(self, level: str, action: str, details: str, ref: str = "", alert_key: str | None = None,
+              dedup: str = "hour") -> None:
         """Log to console/file and the events table. WARN/ERROR also become alerts.
 
-        alert_key: recurring warnings (shortage, low stock) alert at most once per day per key.
+        alert_key: dedups a recurring alert so it doesn't repeat every 2-min cycle. dedup="hour" (default) means
+        a still-stuck condition re-alerts each hour, so ops keep hearing about it (#4); dedup="day" is for alerts
+        that are only worth one-a-day (shortage, low stock – HANDOFF §12 "first shortage of the day").
         """
         getattr(log, {"ERROR": "error", "WARN": "warning"}.get(level, "info"))(f"{action}: {details}")
         try:
@@ -110,21 +144,30 @@ class Ctx:
             with self._lock:
                 self.stats.errors += 1
         if level in ("ERROR", "WARN"):
-            if alert_key and not self.db.alert_once(alert_key, self.today()):
-                return
+            if alert_key:
+                # fold the hour into the key for hourly dedup, so the same stuck condition re-alerts next hour
+                # ponytail: alerts_sent grows one row per key per hour; prune old days later if it ever matters
+                bucket = alert_key if dedup == "day" else f"{alert_key}|{self.now():%Y-%m-%dT%H}"
+                if not self.db.alert_once(bucket, self.today()):
+                    return
             with self._lock:
                 self.alerts.append(f"{level} · {action}: {details}")
 
     def send_alerts(self, subject: str, lines: list[str]) -> None:
         body = "\n".join(lines)
+        if lines and not alert_channels(self.settings):
+            # No Slack webhook and no SMTP: the alert would vanish. Fail loud so it's at least in the
+            # terminal and estamp.log, and so check-setup can catch this before go-live (#2).
+            log.error(f"ALERT NOT DELIVERED (no Slack/SMTP channel configured): {subject} – {body[:500]}")
         hook = self.settings.env("alerts.slack_webhook_env")
         if hook:
             try:
-                requests.post(hook, json={"text": f"*{subject}*\n```{body[:3500]}```"}, timeout=15)
+                resp = requests.post(hook, json={"text": f"*{subject}*\n```\n{slack_body(lines)[:3500]}\n```"}, timeout=15)
+                resp.raise_for_status()   # a Slack 4xx/5xx must not pass silently as success (#10)
             except Exception as e:
                 log.error(f"Slack alert failed: {e}")
         smtp = self.settings.get("alerts.smtp") or {}
-        if smtp.get("host") and smtp.get("to"):
+        if smtp.get("host") and smtp.get("to"):   # must stay in lockstep with alert_channels()'s email rule
             try:
                 msg = EmailMessage()
                 msg["Subject"], msg["From"], msg["To"] = subject, smtp.get("from"), ", ".join(smtp["to"])
@@ -142,6 +185,7 @@ class Ctx:
         url = self.settings.env("alerts.heartbeat_url_env")
         if url:
             try:
-                requests.get(url if ok else url.rstrip("/") + "/fail", timeout=10)
+                resp = requests.get(url if ok else url.rstrip("/") + "/fail", timeout=10)
+                resp.raise_for_status()
             except Exception as e:
                 log.error(f"heartbeat ping failed: {e}")
