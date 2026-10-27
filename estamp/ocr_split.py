@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import requests
 from pypdf import PdfReader, PdfWriter
 
+from .http_api import api_call
 from .settings import Settings
 
 
@@ -108,10 +109,10 @@ def _split_zoop(data: bytes, name: str, settings: Settings, split_size: int = 1)
         raise RuntimeError("PDF has no pages")
     timeout = int(c.get("timeout_s", 300))
     try:
-        res = requests.post(c["url"], files={"file": (name, data, "application/pdf")},
-                            data={"ranges[0][startPage]": "1", "ranges[0][endPage]": str(n),
-                                  "splitSize": str(split_size)},
-                            timeout=timeout)
+        res = api_call(settings, "split", lambda: requests.post(
+            c["url"], files={"file": (name, data, "application/pdf")},
+            data={"ranges[0][startPage]": "1", "ranges[0][endPage]": str(n), "splitSize": str(split_size)},
+            timeout=timeout))
     except requests.Timeout:
         raise RuntimeError(f"split API timed out after {timeout} s")
     except requests.RequestException as e:
@@ -197,11 +198,11 @@ def _ocr_zoop(data: bytes, name: str, settings: Settings) -> OcrResult:
     c = settings.get("zoop_api.ocr")
     if not c.get("url"):
         raise RuntimeError("zoop_api.ocr.url is not set")
-    res = requests.post(c["url"], headers=_headers(settings, "ocr"),
-                        files={c.get("file_field", "file"): (name, data, "application/pdf")},
-                        data=c.get("extra_fields") or {}, timeout=int(c.get("timeout_s", 60)))
+    res = api_call(settings, "ocr", lambda: requests.post(
+        c["url"], headers=_headers(settings, "ocr"), files={c.get("file_field", "file"): (name, data, "application/pdf")},
+        data=c.get("extra_fields") or {}, timeout=int(c.get("timeout_s", 60))))
     if res.status_code >= 300:
-        raise RuntimeError(f"OCR API HTTP {res.status_code}: {res.text[:200]}")
+        raise RuntimeError(f"OCR API HTTP {res.status_code}: {res.content[:200].decode('utf-8', 'replace')}")
     body = res.json()
     text = str(_json_path(body, c.get("text_path", "")) or "")
     cert = str(_json_path(body, c.get("cert_path", "")) or "").strip().upper()

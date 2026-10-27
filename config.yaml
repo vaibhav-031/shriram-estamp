@@ -94,6 +94,10 @@ zoop_api:                     # fill in when the in-house APIs are ready
   split:                      # contract: docs/api-samples/split/README.md (no auth)
     url: https://live.zoopsign.com/api/pdf-utils/split
     timeout_s: 300            # one request carries the whole merged upload
+    rate_per_s: 5             # own limiter, shared by all threads (A-07)
+    retries: 3                # 429 / 5xx / timeout / connection error; 401/403 never retried
+    backoff_s: 1              # 1 s, 2 s, 4 s …
+    max_total_s: 400          # no new retry after this; worst case ≈ max_total_s + timeout_s
   ocr:
     url: ""
     api_key_env: ZOOP_OCR_API_KEY
@@ -102,6 +106,10 @@ zoop_api:                     # fill in when the in-house APIs are ready
     text_path: data.text
     cert_path: data.certificate_number
     timeout_s: 60
+    rate_per_s: 5             # HANDOFF A3: max 5 OCR requests/second, shared by intake + issue check (A-07)
+    retries: 3
+    backoff_s: 1
+    max_total_s: 120          # per page, including retries (the 83-min Drive OCR read must not repeat)
 
 alerts:
   slack_webhook_env: ESTAMP_SLACK_WEBHOOK

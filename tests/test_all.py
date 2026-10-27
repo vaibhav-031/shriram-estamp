@@ -349,14 +349,19 @@ class _Resp:
 @pytest.fixture
 def split_api(settings, monkeypatch):
     """split_provider=zoop_api with requests.post replaced by a recorder that returns a scripted response."""
+    import estamp.http_api as http_api
     import estamp.ocr_split as ocr_split
     monkeypatch.setitem(settings.raw["intake"], "split_provider", "zoop_api")
+    monkeypatch.setattr(http_api, "_sleep", lambda s: None)          # retries/backoff without real waiting
+    monkeypatch.setattr(http_api, "_limiters", {})
     calls, reply = [], {}
 
     def post(url, **kw):
         calls.append({"url": url, **kw})
         if "raise" in reply:
             raise reply["raise"]
+        if "seq" in reply:
+            return reply["seq"].pop(0)
         return reply["resp"]
 
     monkeypatch.setattr(ocr_split.requests, "post", post)
@@ -422,6 +427,34 @@ def test_split_api_failures_raise_clear_errors(settings, split_api, make_reply, 
     reply.update(make_reply())
     with pytest.raises(RuntimeError, match=needle):
         split_pdf((SPLIT_SAMPLES / "test_input_4pages.pdf").read_bytes(), "vendor.pdf", settings)
+
+
+def test_split_api_is_rate_limited_and_retried(settings, split_api):
+    """A-07: a 503 blip is retried through the shared split limiter and then succeeds."""
+    import estamp.http_api as http_api
+    from estamp.ocr_split import split_pdf
+    calls, reply = split_api
+    reply["seq"] = [_Resp(503, b"{}", "application/json"),
+                    _Resp(200, (SPLIT_SAMPLES / "response_splitSize1.zip").read_bytes())]
+    parts = split_pdf((SPLIT_SAMPLES / "test_input_4pages.pdf").read_bytes(), "vendor.pdf", settings)
+    assert len(parts) == 4 and len(calls) == 2
+    assert [k[0] for k in http_api._limiters] == ["split"]                      # its own limiter
+
+
+def test_ocr_api_calls_go_through_the_shared_ocr_limiter(settings, split_api, monkeypatch):
+    """A-07: OCR calls (intake and issue check use the same adapter) are rate-limited and retried, on their own
+    limiter – separate from the split API's."""
+    import estamp.http_api as http_api
+    from estamp.ocr_split import _ocr_zoop
+    calls, reply = split_api
+    monkeypatch.setitem(settings.raw["zoop_api"]["ocr"], "url", "https://ocr.example.test/do")
+    monkeypatch.setenv("ZOOP_OCR_API_KEY", "test-key-not-real")
+    reply["seq"] = [_Resp(503, b"{}", "application/json"),
+                    _Resp(200, b'{"data":{"text":"x","certificate_number":"IN-MH90000000000001A"}}',
+                          "application/json")]
+    r = _ocr_zoop(b"%PDF-fake", "p1", settings)
+    assert r.cert == "IN-MH90000000000001A" and len(calls) == 2
+    assert any(k[0] == "ocr" for k in http_api._limiters) and not any(k[0] == "split" for k in http_api._limiters)
 
 
 def test_split_api_rejects_a_pdf_with_no_pages_without_calling(settings, split_api):
