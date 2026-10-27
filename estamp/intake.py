@@ -112,9 +112,6 @@ def _read_units(ctx: Ctx, data: bytes, name: str) -> list[Unit]:
     with ThreadPoolExecutor(max_workers=int(s.get("workers", 8))) as ex:
         results = list(ex.map(read, pieces))
 
-    if s.get("intake.split_provider", "local") == "zoop_api":   # API already grouped pages into papers
-        return [Unit(p.page_from, p.page_to, [p.data], [t], c, v, e) for p, (t, c, v, e) in zip(pieces, results)]
-
     units: list[Unit] = []
     last_kind = None
     estamp_markers = [m.upper() for m in s.get("intake.estamp_markers") or []]

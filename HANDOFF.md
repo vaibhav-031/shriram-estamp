@@ -10,9 +10,12 @@ code is an unused stub written against a guessed contract.
 
 **Committed:** this plan, `GLOSSARY.md`, `docs/adr/0001–0005`, specs + tickets in `docs/issues/`, CLAUDE.md
 amended to ADR-0001. Code: A-01 volume test (~1,000 LANs, zero double issue), A-02 README fixes, A-04 OCR/split
-clients injected via the run context (`tests/fake_apis.py`). Suite: 34 passed + 1 expected-fail (A-08 target).
+clients injected via the run context (`tests/fake_apis.py`), **A-06 split API adapter** (contract captured from live
+calls with synthetic PDFs in `docs/api-samples/split/`; no auth; returns a zip of `-<from>-<to>.pdf` parts; does
+NOT reject odd page counts). `config.yaml` still uses `split_provider: local` – switching to `zoop_api` sends every
+upload to live.zoopsign.com (Vaibhav to decide). Suite: 45 passed + 1 expected-fail (A-08 target).
 
-**Not built:** everything else below. No live API call made.
+**Not built:** everything else below. No OCR API call made yet.
 
 **Test data reset (2026-10-27, by Vaibhav's decision – all of it was test data):** every table in `shriram_estamp`
 truncated, ID sequences reset (all 8 tables are data; setup lives in `state_config.csv` / `config.yaml`, unchanged);
@@ -35,14 +38,15 @@ papers front + back); 14 → Needs Review:
 4. E-06 + E-08 (merged) corrections stored next to the API reading; issue check accepts either; auto second
    API attempt – needed as soon as A-05 lands, or every corrected paper fails its issue check
 5. A-07 rate limit + retry → A-08 failure policy (make the xfail test pass) → A-09 remove Drive OCR → A-10 throughput
-6. B-01…B-03 (+B-04 merged) paper type, 1/2-page split **with local pypdf** (split API deferred), pairing safety
+6. B-01…B-03 (+B-04 merged) paper type, 1/2-page split (split API ready: `splitSize` 1/2; reject odd pages before
+   calling it), pairing safety; split API calls also need the A-07 limiter
 7. E-02 self-heal stuck issues → E-09 crash-resume tests
 8. E-10 + E-11 (merged) Gmail major-issue emails + CRASH/HEARTBEAT; keep the heartbeat URL
 9. C (one merged ticket) coded `✗ [E###]` lines for the codes ops actually hit
 10. D-02 live Daily Report tab → D-03 `report --date` (Google Sheet only)
 11. G-01 audit of intake + issue paths → H-02 production URLs + rotated key → H-04 README ops guide
 - F-03 `reset-test-data` command: still waiting on Vaibhav (the 2026-10-27 reset was done by hand, see above).
-- Deferred: split API (D2), auto re-map (D7 – still allowed by ADR-0001, not built), vendors + reconciliation,
+- Deferred: auto re-map (D7 – still allowed by ADR-0001, not built), vendors + reconciliation,
   stray-file adoption, Manual Issues tab, RE-OCR/RECHECK, Drive declutter, Shared Drive move, storage estimate.
 
 ⚠️ **The OCR API key was shared in chat – rotate it before go-live.** Keys live only in `.env`; never commit them.

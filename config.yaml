@@ -91,15 +91,9 @@ allocation:
                               # sheet is the one read from that issued PDF (must match the ledger)
 
 zoop_api:                     # fill in when the in-house APIs are ready
-  split:
-    url: ""
-    api_key_env: ZOOP_SPLIT_API_KEY
-    auth_header: x-api-key
-    file_field: file
-    papers_path: data.papers
-    pdf_b64_field: pdf_base64
-    pages_field: pages
-    timeout_s: 300
+  split:                      # contract: docs/api-samples/split/README.md (no auth)
+    url: https://live.zoopsign.com/api/pdf-utils/split
+    timeout_s: 300            # one request carries the whole merged upload
   ocr:
     url: ""
     api_key_env: ZOOP_OCR_API_KEY

@@ -1,19 +1,21 @@
-"""Split a vendor PDF into single papers, and read each paper's text.
+"""Split a vendor PDF into fixed-size page parts, and read each part's text. Parts are NOT papers yet:
+intake groups the parts into papers (a traditional paper's back page stays with its front).
 
 The run context holds a split client and an OCR client (`Ctx.splitter`, `Ctx.ocr`); intake and the issue check
 only go through those, so tests swap in fakes. The default clients below use the providers configured here.
 
 Providers (config.yaml → intake):
-  split_provider: local     – pypdf, every `pages_per_paper` pages = one paper (works today)
-                  zoop_api  – your in-house split API (fill zoop_api.split once the contract is final)
+  split_provider: local     – pypdf (works today)
+                  zoop_api  – in-house split API, contract in docs/api-samples/split/README.md (no auth)
+  Both split into parts of 1 page (intake today) or 2 pages (traditional papers, Phase B).
   ocr_provider:   drive     – Google Drive OCR (works today, ~3–5 s per paper)
                   zoop_api  – your in-house OCR API; falls back to Drive if ocr_fallback_to_drive
 """
 from __future__ import annotations
 
-import base64
 import io
 import re
+import zipfile
 from dataclasses import dataclass
 
 import requests
@@ -55,13 +57,13 @@ def _headers(settings: Settings, section: str) -> dict:
 
 # ---------------------------------------------------------------------------------- split
 
-def split_pdf(data: bytes, name: str, settings: Settings) -> list[PaperPdf]:
-    """zoop_api → already one PDF per paper. local → ONE PDF PER PAGE; intake groups pages into papers
-    by content (a physical paper's back page stays with its front)."""
-    provider = settings.get("intake.split_provider", "local")
-    if provider == "zoop_api":
-        return _split_zoop(data, name, settings)
-    return _split_local(data, 1)
+def split_pdf(data: bytes, name: str, settings: Settings, split_size: int = 1) -> list[PaperPdf]:
+    """Split into parts of `split_size` pages (1 = digital e-stamp, 2 = traditional front + back), via the
+    in-house split API (zoop_api) or pypdf (local). Intake still splits per page and groups by content until
+    Phase B detects the paper type."""
+    if settings.get("intake.split_provider", "local") == "zoop_api":
+        return _split_zoop(data, name, settings, split_size)
+    return _split_local(data, split_size)
 
 
 def merge_pdfs(parts: list[bytes]) -> bytes:
@@ -92,19 +94,54 @@ def _split_local(data: bytes, per: int) -> list[PaperPdf]:
     return out
 
 
-def _split_zoop(data: bytes, name: str, settings: Settings) -> list[PaperPdf]:
-    c = settings.get("zoop_api.split")
-    res = requests.post(c["url"], headers=_headers(settings, "split"),
-                        files={c.get("file_field", "file"): (name, data, "application/pdf")},
-                        data=c.get("extra_fields") or {}, timeout=int(c.get("timeout_s", 300)))
-    res.raise_for_status()
-    papers = _json_path(res.json(), c.get("papers_path", "data.papers")) or []
+_PART_NAME = re.compile(r"-(\d+)-(\d+)\.pdf$")
+
+
+def _split_zoop(data: bytes, name: str, settings: Settings, split_size: int = 1) -> list[PaperPdf]:
+    """In-house split API (contract: docs/api-samples/split/README.md). Returns a zip with one PDF per part,
+    named `<prefix>-<from>-<to>.pdf`. No auth. The parts must cover pages 1..N exactly once."""
+    c = settings.get("zoop_api.split") or {}
+    if not c.get("url"):
+        raise RuntimeError("zoop_api.split.url is not set")
+    n = len(PdfReader(io.BytesIO(data)).pages)
+    if n == 0:   # never let an empty file count as "processed, 0 papers"
+        raise RuntimeError("PDF has no pages")
+    timeout = int(c.get("timeout_s", 300))
+    try:
+        res = requests.post(c["url"], files={"file": (name, data, "application/pdf")},
+                            data={"ranges[0][startPage]": "1", "ranges[0][endPage]": str(n),
+                                  "splitSize": str(split_size)},
+                            timeout=timeout)
+    except requests.Timeout:
+        raise RuntimeError(f"split API timed out after {timeout} s")
+    except requests.RequestException as e:
+        raise RuntimeError(f"split API unreachable ({type(e).__name__})")
+    if res.status_code != 200:
+        try:
+            msg = res.json().get("message", "")
+        except Exception:
+            msg = ""
+        raise RuntimeError(f"split API HTTP {res.status_code}: {msg or res.content[:200].decode('utf-8', 'replace')}")
+    try:
+        z = zipfile.ZipFile(io.BytesIO(res.content))
+    except zipfile.BadZipFile:
+        raise RuntimeError("split API returned something that is not a zip")
+    if len(z.namelist()) > n:    # checked before decompressing anything
+        raise RuntimeError(f"split API returned {len(z.namelist())} parts for a {n}-page file")
     out = []
-    for i, p in enumerate(papers):
-        pages = p.get(c.get("pages_field", "pages")) or [i + 1]
-        out.append(PaperPdf(min(pages), max(pages), base64.b64decode(p[c.get("pdf_b64_field", "pdf_base64")])))
-    if not out:
-        raise RuntimeError("split API returned no papers")
+    for entry in z.namelist():
+        m = _PART_NAME.search(entry)
+        if not m:
+            raise RuntimeError(f"split API returned an unexpected part name '{entry}'")
+        part = z.read(entry)
+        p_from, p_to = int(m.group(1)), int(m.group(2))
+        if len(PdfReader(io.BytesIO(part)).pages) != p_to - p_from + 1:
+            raise RuntimeError(f"split API part '{entry}' does not have pages {p_from}-{p_to}")
+        out.append(PaperPdf(p_from, p_to, part))
+    out.sort(key=lambda p: p.page_from)
+    covered = [pg for p in out for pg in range(p.page_from, p.page_to + 1)]
+    if covered != list(range(1, n + 1)):
+        raise RuntimeError(f"split API parts don't cover pages 1-{n} exactly once (got {covered})")
     return out
 
 

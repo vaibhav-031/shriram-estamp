@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -329,6 +330,148 @@ def test_ocr_failure_keeps_the_whole_upload_in_the_inbox(env):
     assert run_cycle(Ctx(s, db, g, ocr=FakeOcr(fail={"_p2": RuntimeError("OCR API HTTP 503")})))
     assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
     assert [f["id"] for f in g.list_children(s.folder("upload_inbox"))] == [up]
+
+
+# ============================================================ split API (replays docs/api-samples/split)
+
+SPLIT_SAMPLES = ROOT / "docs" / "api-samples" / "split"
+
+
+class _Resp:
+    def __init__(self, status, content, ctype="application/octet-stream"):
+        self.status_code, self.content, self.headers = status, content, {"content-type": ctype}
+
+    def json(self):
+        import json
+        return json.loads(self.content)
+
+
+@pytest.fixture
+def split_api(settings, monkeypatch):
+    """split_provider=zoop_api with requests.post replaced by a recorder that returns a scripted response."""
+    import estamp.ocr_split as ocr_split
+    monkeypatch.setitem(settings.raw["intake"], "split_provider", "zoop_api")
+    calls, reply = [], {}
+
+    def post(url, **kw):
+        calls.append({"url": url, **kw})
+        if "raise" in reply:
+            raise reply["raise"]
+        return reply["resp"]
+
+    monkeypatch.setattr(ocr_split.requests, "post", post)
+    return calls, reply
+
+
+def _pages(data: bytes) -> int:
+    import io
+    from pypdf import PdfReader
+    return len(PdfReader(io.BytesIO(data)).pages)
+
+
+def test_split_api_digital_one_page_per_part(settings, split_api):
+    from estamp.ocr_split import pdf_text, split_pdf
+    calls, reply = split_api
+    reply["resp"] = _Resp(200, (SPLIT_SAMPLES / "response_splitSize1.zip").read_bytes())
+    pdf = (SPLIT_SAMPLES / "test_input_4pages.pdf").read_bytes()
+    parts = split_pdf(pdf, "vendor.pdf", settings)
+    assert [(p.page_from, p.page_to) for p in parts] == [(1, 1), (2, 2), (3, 3), (4, 4)]
+    assert all(_pages(p.data) == 1 for p in parts)
+    assert samples.cert("MH", 3) in pdf_text(parts[2].data)
+    (c,) = calls
+    assert c["url"] == "https://live.zoopsign.com/api/pdf-utils/split"
+    assert c["data"] == {"ranges[0][startPage]": "1", "ranges[0][endPage]": "4", "splitSize": "1"}
+    assert c["files"]["file"][0] == "vendor.pdf" and c["files"]["file"][1] == pdf
+    assert "headers" not in c or not c["headers"]          # no auth header
+    assert c["timeout"]
+
+
+def test_split_api_traditional_two_pages_per_part(settings, split_api):
+    from estamp.ocr_split import split_pdf
+    calls, reply = split_api
+    reply["resp"] = _Resp(200, (SPLIT_SAMPLES / "response_splitSize2.zip").read_bytes())
+    parts = split_pdf((SPLIT_SAMPLES / "test_input_4pages.pdf").read_bytes(), "scan.pdf", settings, split_size=2)
+    assert [(p.page_from, p.page_to) for p in parts] == [(1, 2), (3, 4)]
+    assert all(_pages(p.data) == 2 for p in parts)
+    assert calls[0]["data"]["splitSize"] == "2"
+
+
+def _zip_without(sample: str, drop: str) -> bytes:
+    import io, zipfile
+    src, buf = zipfile.ZipFile(SPLIT_SAMPLES / sample), io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as out:
+        for n in src.namelist():
+            if n != drop:
+                out.writestr(n, src.read(n))
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("make_reply,needle", [
+    (lambda: {"resp": _Resp(500, (SPLIT_SAMPLES / "response_not_pdf.json").read_bytes(), "application/json")},
+     "HTTP 500: Failed to parse PDF document"),
+    (lambda: {"resp": _Resp(200, b"<html>gateway error</html>", "text/html")}, "not a zip"),
+    (lambda: {"resp": _Resp(200, _zip_without("response_splitSize1.zip", "-3-3.pdf"))}, "don't cover pages 1-4"),
+    (lambda: {"raise": requests.Timeout()}, "timed out"),
+    (lambda: {"raise": requests.ConnectionError("Max retries exceeded with url ... pool=<urllib3 …>")},
+     "unreachable"),
+    (lambda: {"resp": _Resp(502, b'{"error":"upstream"}', "application/json")}, 'HTTP 502: {"error":"upstream"}'),
+])
+def test_split_api_failures_raise_clear_errors(settings, split_api, make_reply, needle):
+    from estamp.ocr_split import split_pdf
+    _, reply = split_api
+    reply.update(make_reply())
+    with pytest.raises(RuntimeError, match=needle):
+        split_pdf((SPLIT_SAMPLES / "test_input_4pages.pdf").read_bytes(), "vendor.pdf", settings)
+
+
+def test_split_api_rejects_a_pdf_with_no_pages_without_calling(settings, split_api):
+    """A 0-page PDF must fail loudly (→ ERROR, file stays for a human), never count as 'processed, 0 papers'."""
+    import io
+    from pypdf import PdfWriter
+    from estamp.ocr_split import split_pdf
+    calls, _ = split_api
+    buf = io.BytesIO()
+    PdfWriter().write(buf)
+    with pytest.raises(RuntimeError, match="no pages"):
+        split_pdf(buf.getvalue(), "empty.pdf", settings)
+    assert calls == []
+
+
+def test_split_api_passes_odd_last_part_through(settings, split_api):
+    """The API does not reject an odd page count with splitSize=2 – it returns a 1-page last part.
+    The adapter reports it faithfully; rejecting the upload (E106) is Phase B's job, before the call."""
+    from estamp.ocr_split import split_pdf
+    _, reply = split_api
+    reply["resp"] = _Resp(200, (SPLIT_SAMPLES / "response_odd3_splitSize2.zip").read_bytes())
+    parts = split_pdf((SPLIT_SAMPLES / "test_input_3pages.pdf").read_bytes(), "odd.pdf", settings, split_size=2)
+    assert [(p.page_from, p.page_to) for p in parts] == [(1, 2), (3, 3)]
+
+
+@e2e
+def test_intake_via_split_api_keeps_front_and_back_together(env, monkeypatch):
+    """Intake asks the split API for one page per part, so it must still group a traditional paper's back page
+    with its front – exactly as with the local split."""
+    import io, zipfile
+    import estamp.ocr_split as ocr_split
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    monkeypatch.setitem(s.raw["intake"], "split_provider", "zoop_api")
+
+    def fake_api(url, files, data, timeout):          # behaves like the captured contract
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            for p in ocr_split._split_local(files["file"][1], int(data["splitSize"])):
+                z.writestr(f"-{p.page_from}-{p.page_to}.pdf", p.data)
+        return _Resp(200, buf.getvalue())
+
+    monkeypatch.setattr(ocr_split.requests, "post", fake_api)
+    g.add("scan.pdf", PDF, s.folder("upload_inbox"), samples.merged([
+        samples.physical_front("RAJASTHAN", "S 254201", 195), samples.physical_back("RAJASTHAN"),
+        samples.paper_page(samples.cert("MH", 1), 200)]))
+    assert run_cycle(_ctx(s, db, g))
+    rows = db.q("SELECT cert_no, page_from, page_to, status FROM papers ORDER BY page_from")
+    assert [(r["cert_no"], r["page_from"], r["page_to"], r["status"]) for r in rows] == [
+        ("RJ-S254201", 1, 2, "AVAILABLE"), (samples.cert("MH", 1), 3, 3, "AVAILABLE")], rows
 
 
 def test_real_rajasthan_ocr_text(settings):

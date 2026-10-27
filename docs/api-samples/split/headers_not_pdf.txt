@@ -1,0 +1,20 @@
+HTTP/2 500 
+vary: Origin, Accept-Encoding
+access-control-allow-credentials: true
+content-security-policy: script-src 'self';style-src 'self';default-src 'self';base-uri 'self';font-src 'self' https: data:;form-action 'self';frame-ancestors 'self';img-src 'self' data:;object-src 'none';script-src-attr 'none';upgrade-insecure-requests
+cross-origin-opener-policy: same-origin
+cross-origin-resource-policy: same-origin
+origin-agent-cluster: ?1
+referrer-policy: same-origin
+strict-transport-security: max-age=15552000; includeSubDomains
+x-content-type-options: nosniff
+x-dns-prefetch-control: off
+x-download-options: noopen
+x-frame-options: DENY
+x-permitted-cross-domain-policies: none
+x-xss-protection: 1; mode=block
+content-type: application/json; charset=utf-8
+content-length: 104
+etag: W/"68-+jlwpcD001tbHcoVoaSyeA2y36Q"
+date: Tue, 27 Oct 2026 16:01:07 GMT
+
