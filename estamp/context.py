@@ -127,10 +127,13 @@ class Ctx:
         return self.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # ---------------------------------------------------------------- events + alerts
-    def event(self, level: str, action: str, details: str, ref: str = "", alert_key: str | None = None) -> None:
+    def event(self, level: str, action: str, details: str, ref: str = "", alert_key: str | None = None,
+              dedup: str = "hour") -> None:
         """Log to console/file and the events table. WARN/ERROR also become alerts.
 
-        alert_key: recurring warnings (shortage, low stock) alert at most once per day per key.
+        alert_key: dedups a recurring alert so it doesn't repeat every 2-min cycle. dedup="hour" (default) means
+        a still-stuck condition re-alerts each hour, so ops keep hearing about it (#4); dedup="day" is for alerts
+        that are only worth one-a-day (shortage, low stock – HANDOFF §12 "first shortage of the day").
         """
         getattr(log, {"ERROR": "error", "WARN": "warning"}.get(level, "info"))(f"{action}: {details}")
         try:
@@ -141,8 +144,12 @@ class Ctx:
             with self._lock:
                 self.stats.errors += 1
         if level in ("ERROR", "WARN"):
-            if alert_key and not self.db.alert_once(alert_key, self.today()):
-                return
+            if alert_key:
+                # fold the hour into the key for hourly dedup, so the same stuck condition re-alerts next hour
+                # ponytail: alerts_sent grows one row per key per hour; prune old days later if it ever matters
+                bucket = alert_key if dedup == "day" else f"{alert_key}|{self.now():%Y-%m-%dT%H}"
+                if not self.db.alert_once(bucket, self.today()):
+                    return
             with self._lock:
                 self.alerts.append(f"{level} · {action}: {details}")
 

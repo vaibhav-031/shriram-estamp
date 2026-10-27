@@ -1711,3 +1711,20 @@ def test_intake_crash_between_upload_and_insert_reuses_the_orphan(env, monkeypat
     assert len(inv) == 1, [g.path_of(f["id"]) for f in inv]      # still exactly one physical file
     assert db.q1("SELECT count(*) n FROM papers WHERE status='AVAILABLE' AND state='MH'")["n"] == 1
     assert db.q1("SELECT drive_file_id FROM papers")["drive_file_id"] == inv[0]["id"]   # row points at it
+
+
+# ── #4 alert dedup is hourly by default (a stuck condition keeps surfacing), daily when asked ──
+@e2e
+def test_alert_dedup_is_hourly_by_default_and_daily_when_asked(env):
+    s, db, g = env
+    ctx = _ctx(s, db, g)
+    ctx.event("WARN", "X", "stuck", alert_key="failK")           # hourly (default)
+    ctx.event("WARN", "X", "still stuck", alert_key="failK")     # same hour → deduped, no second alert
+    assert len([a for a in ctx.alerts if a.startswith("WARN · X")]) == 1
+    keys = [r["alert_key"] for r in db.q("SELECT alert_key FROM alerts_sent")]
+    assert any(k.startswith("failK|") for k in keys), keys       # the hour is folded into the dedup key
+    assert "failK" not in keys                                   # never the bare key when hourly
+
+    ctx.event("WARN", "Y", "shortage", alert_key="shortK", dedup="day")   # daily opt-out
+    keys = [r["alert_key"] for r in db.q("SELECT alert_key FROM alerts_sent")]
+    assert "shortK" in keys, keys                                # stored bare: one a day, no hour bucket

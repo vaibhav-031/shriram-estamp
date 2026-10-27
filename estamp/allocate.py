@@ -91,7 +91,7 @@ def run_allocation(ctx: Ctx, deadline: float, report_shortage: bool = True) -> N
         st, d = key.split("|")
         ctx.stats.waiting += n
         ctx.event("WARN", "Shortage", line("E301", f"{st} ₹{d}: {n} LAN(s) waiting – not enough AVAILABLE papers. "
-                  "They fulfil automatically once stock is uploaded."), alert_key=f"short|{key}")
+                  "They fulfil automatically once stock is uploaded."), alert_key=f"short|{key}", dedup="day")
 
 
 def _preview(ctx: Ctx) -> None:

@@ -41,7 +41,7 @@ def low_stock_alerts(ctx: Ctx) -> None:
         if flag in ("LOW", "SHORT"):
             ctx.event("WARN", "Low stock", f"{code} ₹{amt}: {avail} available, {pend} pending → net {net} "
                       f"(alert below {threshold} = {ctx.settings.states[code].buffer_days} day(s) of {daily}). "
-                      "Raise a vendor order.", alert_key=f"low|{code}|{amt}")
+                      "Raise a vendor order.", alert_key=f"low|{code}|{amt}", dedup="day")
 
 
 def run_dashboard(ctx: Ctx) -> None:
