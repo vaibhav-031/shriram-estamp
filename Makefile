@@ -1,13 +1,13 @@
 # Shriram eStamp – common tasks. Everything runs in the uv-managed .venv
 # (`uv sync` creates it, `uv run` uses it – no manual activate needed).
 .DEFAULT_GOAL := help
-.PHONY: help setup dev lock upgrade login init-db check status reconcile \
-        run-dry run-once run test test5 clean
+.PHONY: help setup dev lock upgrade login init-db check-setup status reconcile \
+        recheck-review run-dry run-once run test test5 clean
 
 help: ## Show this help, grouped by category
 	@awk 'BEGIN {FS = ":.*## "} \
 		/^##@ / {printf "\n\033[1m%s\033[0m\n", substr($$0, 5); next} \
-		/^[a-z-]+:.*## / {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+		/^[a-z-]+:.*## / {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 ##@ Setup
 setup: ## Create the venv and install all deps (prod + dev)
@@ -29,11 +29,12 @@ login: ## Google OAuth sign-in (saves secrets/token.json)
 init-db: ## Create the Postgres schema and tables
 	uv run python -m estamp init-db
 
-check: ## check-setup: DB, sign-in, folders, control sheet, config, APIs, alerts
+check-setup: ## Verify DB, sign-in, folders, control sheet, config, APIs, alerts
 	uv run python -m estamp check-setup
 
 ##@ Run
-dev: run-dry ## Alias for run-dry: a safe one-cycle preview
+dev: ## Dev loop: repeat a dry-run cycle every 5s (safe, nothing written)
+	@while true; do uv run python -m estamp run-once --dry-run || break; sleep 5; done
 
 run-dry: ## One cycle, dry run – nothing moved or written (safe)
 	uv run python -m estamp run-once --dry-run
@@ -50,6 +51,9 @@ status: ## Stock + queue summary in the terminal
 
 reconcile: ## Report Inventory the ledger doesn't know + LANs stuck in ERROR
 	uv run python -m estamp reconcile
+
+recheck-review: ## Re-run checks on Needs Review papers after a config fix (no re-upload)
+	uv run python -m estamp recheck-review
 
 ##@ Test
 test: ## Run the test suite once

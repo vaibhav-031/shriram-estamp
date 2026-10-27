@@ -25,3 +25,6 @@ dev = [
 # Application, not a library: no build step, run via `uv run python -m estamp`.
 [tool.uv]
 package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]   # project root importable in every test (replaces per-file sys.path hacks)

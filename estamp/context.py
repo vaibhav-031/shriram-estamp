@@ -19,6 +19,23 @@ from .settings import Settings
 
 log = logging.getLogger("estamp")
 
+_LEVELS = ("ERROR", "WARN", "INFO")
+
+
+def slack_body(lines: list[str]) -> str:
+    """Render the plain-text alert lines for the Slack code block: drop the "• " bullet and left-align the
+    "ERROR · " / "WARN · " level into a fixed-width label so the message text lines up in one column.
+    Lines without a level (summary, stock flags) pass through unchanged."""
+    out = []
+    for ln in lines:
+        s = ln[2:] if ln.startswith("• ") else ln
+        for level in _LEVELS:
+            if s.startswith(f"{level} · "):
+                s = f"{level:<5}  {s[len(level) + 3:]}"
+                break
+        out.append(s)
+    return "\n".join(out)
+
 
 def setup_logging(settings: Settings) -> None:
     if log.handlers:
@@ -120,7 +137,7 @@ class Ctx:
         hook = self.settings.env("alerts.slack_webhook_env")
         if hook:
             try:
-                requests.post(hook, json={"text": f"*{subject}*\n```{body[:3500]}```"}, timeout=15)
+                requests.post(hook, json={"text": f"*{subject}*\n```\n{slack_body(lines)[:3500]}\n```"}, timeout=15)
             except Exception as e:
                 log.error(f"Slack alert failed: {e}")
         smtp = self.settings.get("alerts.smtp") or {}
