@@ -1510,3 +1510,56 @@ def test_issue_check_still_errors_when_pdf_matches_neither_value(env):
     assert db.q1("SELECT count(*) n FROM allocations")["n"] == 0
     assert db.q1("SELECT status FROM orders")["status"] == "ERROR"
     assert db.q1("SELECT status FROM papers")["status"] == "ERROR"
+
+
+# ── #6 double-issue invariant + #8 atomic recovery (ledger safety) ──────────────────────
+def _one_allocating_order(db, lan, cert):
+    """Helper: a PENDING order claimed into ALLOCATING, with one AVAILABLE paper reserved to it."""
+    db.insert_orders([(lan, lan.lower(), "MH", 200, "f", "fid", "t", 1, "PENDING", None)])
+    order = db.claim_orders("MH", 200, 1)[0]
+    db.insert_paper(state="MH", denomination=200, status="AVAILABLE", cert_no=cert)
+    paper = db.reserve_paper(order)
+    return order, paper
+
+
+@e2e
+def test_finish_allocation_wont_issue_the_same_order_twice(env):
+    from datetime import date
+
+    import pytest
+    s, db, g = env
+    order, paper = _one_allocating_order(db, "LAN-DUP-1", "IN-MH-DUP-1")
+    db.finish_allocation(order, paper, date(2026, 10, 28), "LAN-DUP-1.pdf", "fid", "link", "bid")
+    assert db.q1("SELECT status FROM orders WHERE id=%s", (order["id"],))["status"] == "DONE"
+    assert db.q1("SELECT count(*) n FROM allocations WHERE order_id=%s", (order["id"],))["n"] == 1
+    # the order is DONE now, not ALLOCATING – a second finish must refuse, never a 2nd issuance
+    with pytest.raises(Exception):
+        db.finish_allocation(order, paper, date(2026, 10, 28), "LAN-DUP-1.pdf", "fid2", "link2", "bid2")
+    assert db.q1("SELECT count(*) n FROM allocations WHERE order_id=%s AND cancelled_at IS NULL",
+                 (order["id"],))["n"] == 1
+
+
+@e2e
+def test_finish_allocation_refuses_an_order_not_in_allocating(env):
+    from datetime import date
+
+    import pytest
+    s, db, g = env
+    order, paper = _one_allocating_order(db, "LAN-GUARD-1", "IN-MH-GUARD-1")
+    db.q("UPDATE orders SET status='ERROR' WHERE id=%s", (order["id"],))   # recovery/ops moved it out of ALLOCATING
+    with pytest.raises(Exception):
+        db.finish_allocation(order, paper, date(2026, 10, 28), "LAN-GUARD-1.pdf", "fid", "link", "bid")
+    assert db.q1("SELECT status FROM orders WHERE id=%s", (order["id"],))["status"] == "ERROR"   # not flipped to DONE
+    assert db.q1("SELECT count(*) n FROM allocations WHERE order_id=%s", (order["id"],))["n"] == 0
+
+
+@e2e
+def test_recover_stuck_flips_both_the_order_and_its_paper(env):
+    s, db, g = env
+    order, paper = _one_allocating_order(db, "LAN-STUCK-1", "IN-MH-STUCK-1")
+    db.q("UPDATE orders SET updated_at = now() - interval '30 minutes' WHERE id=%s", (order["id"],))
+    db.q("UPDATE papers SET updated_at = now() - interval '30 minutes' WHERE id=%s", (paper["id"],))
+    n_o, n_p = db.recover_stuck(15)
+    assert (n_o, n_p) == (1, 1)
+    assert db.q1("SELECT status FROM orders WHERE id=%s", (order["id"],))["status"] == "ERROR"
+    assert db.q1("SELECT status FROM papers WHERE id=%s", (paper["id"],))["status"] == "ERROR"

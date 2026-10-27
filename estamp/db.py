@@ -111,6 +111,9 @@ ALTER TABLE papers ADD COLUMN IF NOT EXISTS ops_edited_by TEXT;
 ALTER TABLE papers ADD COLUMN IF NOT EXISTS ops_edited_at TIMESTAMPTZ;
 ALTER TABLE papers ADD COLUMN IF NOT EXISTS vendor_code TEXT;   -- D-1: which inbox vendor folder the upload came from
 CREATE INDEX IF NOT EXISTS alloc_unwritten_idx ON allocations(alloc_date, state, denomination) WHERE NOT output_written;
+-- One live allocation per order, ever: the DB backstop against double-issuing a LAN (#6). A cancelled
+-- allocation (cancelled_at set) is excluded so a later re-order of a cancelled LAN is still allowed.
+CREATE UNIQUE INDEX IF NOT EXISTS allocations_order_live_uq ON allocations(order_id) WHERE cancelled_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS output_sheets (
   alloc_date     DATE NOT NULL,
@@ -337,8 +340,14 @@ class DB:
                        verified_cert, verified_cert, verified_via))
             c.execute("""UPDATE papers SET status='ASSIGNED', file_name=%s, notes=NULL, updated_at=now() WHERE id=%s""",
                       (pdf_name, paper["id"]))
-            c.execute("""UPDATE orders SET status='DONE', paper_id=%s, cert_no=%s, pdf_link=%s, notes=NULL, updated_at=now()
-                         WHERE id=%s""", (paper["id"], paper["cert_no"], pdf_link, order["id"]))
+            # Only finish an order that is still ALLOCATING. If recovery/ops moved it (ERROR/DONE/CANCELLED)
+            # the 0-row update raises and rolls back the whole transaction – never issue the same LAN twice (#6).
+            cur = c.execute("""UPDATE orders SET status='DONE', paper_id=%s, cert_no=%s, pdf_link=%s, notes=NULL,
+                               updated_at=now() WHERE id=%s AND status='ALLOCATING'""",
+                            (paper["id"], paper["cert_no"], pdf_link, order["id"]))
+            if cur.rowcount != 1:
+                raise RuntimeError(f"order {order['id']} ({order['lan']}) was not ALLOCATING when finishing "
+                                   "allocation – refusing to issue (its status changed under us)")
 
     def fail_allocation(self, order: dict, paper: dict | None, msg: str) -> None:
         with self.conn() as c, c.transaction():
@@ -348,12 +357,16 @@ class DB:
                           (f"{msg} | LAN {order['lan']}", paper["id"]))
 
     def recover_stuck(self, minutes: int) -> tuple[int, int]:
-        o = self.q("""UPDATE orders SET status='ERROR', updated_at=now(),
-                      notes='process stopped mid-allocation – check Output/Backup folders before retrying'
-                      WHERE status='ALLOCATING' AND updated_at < now() - make_interval(mins => %s) RETURNING id""", (minutes,))
-        p = self.q("""UPDATE papers SET status='ERROR', updated_at=now(),
-                      notes='process stopped mid-allocation – check where this file is before approving'
-                      WHERE status='RESERVED' AND updated_at < now() - make_interval(mins => %s) RETURNING id""", (minutes,))
+        # One transaction so the orders and papers flips land together – a crash can't half-recover (#8).
+        with self.conn() as c, c.transaction():
+            o = c.execute("""UPDATE orders SET status='ERROR', updated_at=now(),
+                          notes='process stopped mid-allocation – check Output/Backup folders before retrying'
+                          WHERE status='ALLOCATING' AND updated_at < now() - make_interval(mins => %s) RETURNING id""",
+                          (minutes,)).fetchall()
+            p = c.execute("""UPDATE papers SET status='ERROR', updated_at=now(),
+                          notes='process stopped mid-allocation – check where this file is before approving'
+                          WHERE status='RESERVED' AND updated_at < now() - make_interval(mins => %s) RETURNING id""",
+                          (minutes,)).fetchall()
         return len(o), len(p)
 
     # ---------------------------------------------------------------- outputs
