@@ -90,10 +90,6 @@ class FakeGoogle:
             if new_name:
                 f["name"] = new_name
 
-    def ocr_text(self, data, name):
-        from samples import ocr_text_of
-        return ocr_text_of(data)
-
     # ---------------------------------------------------------------- Sheets API surface
     def tab_titles(self, sid):
         return list(self.sheets_data.setdefault(sid, {}).keys())

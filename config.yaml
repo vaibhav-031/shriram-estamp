@@ -33,7 +33,6 @@ folders:
   orders_rejected:  11ZB4dBoH7_U2mLkZJ2eWC8lDr2PmbuLH
   output_root:      16OXBf4-xk2raMDZ9gb0ct-J3ZdsI91rK   # DATE/STATE/<STATE-AMOUNT> sheet + PDFs
   backup_root:      1u-rz3pYzOmgESZrROvt89xW9q3qnpVXa   # DATE/STATE/AMOUNT/<LAN>__<CERT>.pdf
-  ocr_temp: ""                                         # only needed with a service account
 
 control_sheet_id: 1UJ7MP-lX270LOonlOIOYm_Q7ELaWnrD_ZjZm8WPbzRE
 
@@ -57,10 +56,7 @@ intake:
   # Switched to the in-house APIs 2026-10-27 (A-05, A-07, Phase B green). D1: one reader, no silent fallback.
   # Pages per paper are decided from the OCR'd IDs (ADR-0006) – state_config.csv → pages_per_paper.
   split_provider: zoop_api    # local (pypdf) | zoop_api
-  ocr_provider: zoop_api      # zoop_api | drive (legacy, removed with A-09)
-  use_pdf_text: false         # legacy text-layer reading – must stay false with the OCR API (D1)
-  min_pdf_text_chars: 40      # legacy, only used when use_pdf_text is true
-  ocr_fallback_to_drive: false
+  ocr_provider: zoop_api      # in-house OCR API – the only reader; on failure it raises, no fallback (D1)
   required_text: []           # e.g. ["SHRIRAM"] – turn on once sample papers confirm the party name prints
   cert_patterns:
     DEFAULT: '\bIN-([A-Z]{2})(\d{12,16})([A-Z])'      # SHCIL style IN-MH12345678901234X; group 1 = state

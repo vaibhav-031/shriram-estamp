@@ -24,7 +24,6 @@ from .settings import Settings
 SCOPES = ["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/spreadsheets"]
 FOLDER = "application/vnd.google-apps.folder"
 GSHEET = "application/vnd.google-apps.spreadsheet"
-GDOC = "application/vnd.google-apps.document"
 PDF = "application/pdf"
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 XLS = "application/vnd.ms-excel"
@@ -172,24 +171,6 @@ class Google:
         self.drive.files().update(fileId=file_id, body=body, addParents=new_parent,
                                   removeParents=",".join(p for p in current if p != new_parent),
                                   supportsAllDrives=True, fields="id").execute(num_retries=R)
-
-    def ocr_text(self, data: bytes, name: str) -> str:
-        """Google Drive OCR: convert PDF → Google Doc, export text, delete the temp doc."""
-        temp_parent = self.settings.get("folders.ocr_temp", "")
-        body: dict[str, Any] = {"name": f"tmp_ocr_{name}", "mimeType": GDOC}
-        if temp_parent:
-            body["parents"] = [temp_parent]
-        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=PDF, resumable=False)
-        doc = self.drive.files().create(body=body, media_body=media, ocrLanguage="en",
-                                        supportsAllDrives=True, fields="id").execute(num_retries=R)
-        try:
-            raw = self.drive.files().export(fileId=doc["id"], mimeType="text/plain").execute(num_retries=R)
-            return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
-        finally:
-            try:
-                self.drive.files().delete(fileId=doc["id"], supportsAllDrives=True).execute(num_retries=R)
-            except Exception:  # temp doc only – never fatal
-                pass
 
     # ---------------------------------------------------------------- Sheets
     def tab_titles(self, sid: str) -> list[str]:

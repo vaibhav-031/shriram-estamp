@@ -96,9 +96,9 @@ def env(settings):
     settings.raw["dry_run"] = False
     settings.raw["orders"]["settle_minutes"] = 0
     settings.raw["intake"]["settle_minutes"] = 0
-    # Default clients stay offline: pypdf split + FakeGoogle's "Drive OCR". Tests opt into the API paths with fakes.
+    # Default clients stay offline: pypdf split + an offline fake reader (_ctx / explicit ocr=). The live reader is
+    # the in-house OCR API; tests opt into it with FakeApiOcr. (Drive OCR was removed in A-09.)
     settings.raw["intake"]["split_provider"] = "local"
-    settings.raw["intake"]["ocr_provider"] = "drive"
     g = FakeGoogle()
     root = g.folder("Shriram eStamp (Python)")
     for key in ["upload_inbox", "upload_archive", "needs_review", "inventory_root", "orders_incoming",
@@ -112,7 +112,8 @@ def env(settings):
 
 
 def _ctx(settings, db, g):
-    return Ctx(settings, db, g)
+    from fake_apis import FakeOcr
+    return Ctx(settings, db, g, ocr=FakeOcr())   # offline reader; stands in for the live OCR API in e2e
 
 
 def _stock(g, s, state, amount, n, start=1):
@@ -460,14 +461,13 @@ def _pages(data: bytes) -> int:
 
 
 def test_split_api_digital_one_page_per_part(settings, split_api):
-    from estamp.ocr_split import pdf_text, split_pdf
+    from estamp.ocr_split import split_pdf
     calls, reply = split_api
     reply["resp"] = _Resp(200, (SPLIT_SAMPLES / "response_splitSize1.zip").read_bytes())
     pdf = (SPLIT_SAMPLES / "test_input_4pages.pdf").read_bytes()
     parts = split_pdf(pdf, "vendor.pdf", settings)
     assert [(p.page_from, p.page_to) for p in parts] == [(1, 1), (2, 2), (3, 3), (4, 4)]
     assert all(_pages(p.data) == 1 for p in parts)
-    assert samples.cert("MH", 3) in pdf_text(parts[2].data)
     (c,) = calls
     assert c["url"] == "https://live.zoopsign.com/api/pdf-utils/split"
     assert c["data"] == {"ranges[0][startPage]": "1", "ranges[0][endPage]": "4", "splitSize": "1"}
@@ -817,13 +817,13 @@ def _upload_review(db, g, s, name):
 def test_mixed_upload_goes_whole_to_needs_review(env):
     """B-01: digital and scanned pages in one upload → whole file to Needs Review (E105), nothing split or stocked."""
     from estamp.cycle import run_cycle
-    from fake_apis import FakeSplitter
+    from fake_apis import FakeOcr, FakeSplitter
     s, db, g = env
     g.add("mixed.pdf", PDF, s.folder("upload_inbox"), samples.merged([
         samples.paper_page(samples.cert("MH", 1), 200),
         samples.scanned_front("RAJASTHAN", "S 254201", 195), samples.scanned_back("RAJASTHAN")]))
     splitter = FakeSplitter()
-    assert run_cycle(Ctx(s, db, g, splitter=splitter))
+    assert run_cycle(Ctx(s, db, g, ocr=FakeOcr(), splitter=splitter))
     status, notes, path = _upload_review(db, g, s, "mixed.pdf")
     assert status == "REVIEW" and "E105" in notes and path.startswith("needs_review/"), (status, notes, path)
     assert splitter.calls == [] and db.q1("SELECT count(*) n FROM papers")["n"] == 0
@@ -833,13 +833,13 @@ def test_mixed_upload_goes_whole_to_needs_review(env):
 def test_traditional_odd_page_count_goes_whole_to_review_before_split(env):
     """B-02: the split API would happily return a 1-page last part, so the odd count is caught BEFORE calling it."""
     from estamp.cycle import run_cycle
-    from fake_apis import FakeSplitter
+    from fake_apis import FakeOcr, FakeSplitter
     s, db, g = env
     g.add("odd.pdf", PDF, s.folder("upload_inbox"), samples.merged([
         samples.scanned_front("RAJASTHAN", "S 254201", 195), samples.scanned_back("RAJASTHAN"),
         samples.scanned_front("RAJASTHAN", "S 254202", 195)]))
     splitter = FakeSplitter()
-    assert run_cycle(Ctx(s, db, g, splitter=splitter))
+    assert run_cycle(Ctx(s, db, g, ocr=FakeOcr(), splitter=splitter))
     status, notes, path = _upload_review(db, g, s, "odd.pdf")
     assert status == "REVIEW" and "E106" in notes and path.startswith("needs_review/"), (status, notes, path)
     assert splitter.calls == [] and db.q1("SELECT count(*) n FROM papers")["n"] == 0
@@ -900,13 +900,13 @@ def test_serial_the_api_returns_for_a_back_page_breaks_the_pairing(env):
 def test_traditional_parts_must_be_two_pages(env):
     """A split that ignores splitSize (4-page parts) must not stock paper 2's front inside paper 1."""
     from estamp.cycle import run_cycle
-    from fake_apis import FakeSplitter
+    from fake_apis import FakeOcr, FakeSplitter
     s, db, g = env
     pages = []
     for n in (1, 2):
         pages += [samples.scanned_front("RAJASTHAN", f"S 25420{n}", 195), samples.scanned_back("RAJASTHAN")]
     g.add("bad_split.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
-    ctx = Ctx(s, db, g, splitter=FakeSplitter(force_size=4))
+    ctx = Ctx(s, db, g, ocr=FakeOcr(), splitter=FakeSplitter(force_size=4))
     run_cycle(ctx)
     assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
     assert any(f["name"] == "bad_split.pdf" for f in g.list_children(s.folder("upload_inbox")))   # retried later
@@ -1082,23 +1082,18 @@ def test_estamps_never_grouped(env):
 
 def test_configured_reader_is_the_ocr_api_only(settings, ocr_api):
     """D1 / ADR-0002 with config.yaml as shipped: even a PDF with a text layer is read by the OCR API, and an API
-    failure is raised – never silently answered from the text layer or Drive OCR."""
+    failure is raised – never silently answered from the text layer or Drive OCR (no fallback path exists)."""
     from estamp.ocr_split import read_paper
     _, reply = ocr_api
     settings = load_settings(ROOT / "config.yaml")             # as shipped, not the session copy tests adjust
-    assert settings.get("intake.ocr_provider") == "zoop_api" and settings.get("intake.use_pdf_text") is False
-    assert settings.get("intake.ocr_fallback_to_drive") is False
-
-    class NoDrive:
-        def ocr_text(self, *a):
-            raise AssertionError("Drive OCR must never be used as a fallback")
+    assert settings.get("intake.ocr_provider") == "zoop_api"
 
     reply["resp"] = _ocr_resp(_f(certification_no="IN-MH90000000000001A", state_code="MH"))
-    r = read_paper(samples.paper_page(samples.cert("MH", 1), 200), "x", settings, NoDrive())
+    r = read_paper(samples.paper_page(samples.cert("MH", 1), 200), "x", settings)
     assert r.via == "zoop_api" and r.fields["certification_no"]["value"] == "IN-MH90000000000001A"
     reply["resp"] = _Resp(500, b'{"success":false,"message":"down"}', "application/json")
     with pytest.raises(RuntimeError, match="OCR API HTTP 500"):
-        read_paper(samples.paper_page(samples.cert("MH", 1), 200), "x", settings, NoDrive())
+        read_paper(samples.paper_page(samples.cert("MH", 1), 200), "x", settings)
 
 
 UP_P2 = """INDIA NON JUDICIAL Government of Uttar Pradesh\ne-Stamp\n100 100 100 100\n\\*0000000100\nCertificate No.\nCertificate Issued Date Account Reference.\nUnique Doc. Reference\nPurchased by\nStamp Duty Paid By\n23-Sep-2026 06:38 PM\nNEWIMPACC (SV)/ up14054804/ GAUTAMBUDDH NAGAR 2/ UP-GBN\n:SUBIN-UPUP1405480472263158537115Y\nSHRIRAM FINANCE LIMITED\nStamp Duty Amount(Rs.)\n100\n(One Hundred only)\n"""

@@ -94,7 +94,7 @@ class Ctx:
         self.matcher = CertMatcher(self.settings.get("intake.cert_patterns"), self.resolver)
         self.dry = self.settings.dry_run
         if self.ocr is None:
-            self.ocr = ConfiguredOcr(self.settings, self.google)
+            self.ocr = ConfiguredOcr(self.settings)
         if self.splitter is None:
             self.splitter = ConfiguredSplitter(self.settings)
 
