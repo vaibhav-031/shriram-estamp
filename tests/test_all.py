@@ -1528,6 +1528,83 @@ def test_corrections_tab_lists_an_edited_paper(env):
     assert ops_cert in row[2] and row[3] == "ravi" and row[4]
 
 
+# ------------------------------------------------------------ E-04: Manual Issues tab (system-down fallback)
+
+def _manual_issue_result(ctx, s, g, row_after_lan):
+    """Append a Manual Issues row (LAN | Cert | Issued By) and run actions; return the whole result row."""
+    from estamp.actions import MANUAL_HEADER, MANUAL_TAB, run_actions
+    sid = s.get("control_sheet_id")
+    g.ensure_tabs(sid, {MANUAL_TAB: MANUAL_HEADER})
+    g.sheets_data[sid][MANUAL_TAB].append(row_after_lan)
+    run_actions(ctx)
+    return g.sheets_data[sid][MANUAL_TAB][-1]
+
+
+@e2e
+def test_manual_issue_records_allocation_and_reaches_output_sheet(env):
+    from estamp.outputs import run_outputs
+    s, db, g = env
+    cert = samples.cert("MH", 900)
+    db.insert_orders([("LAN-MAN-1", "LAN-MAN-1", "MH", 200, "f", "fid", "t", 1, "PENDING", None)])
+    o = db.q1("SELECT * FROM orders WHERE lan='LAN-MAN-1'")
+    pid = db.insert_paper(state="MH", denomination=200, status="AVAILABLE", cert_no=cert)
+    ctx = _ctx(s, db, g)
+    row = _manual_issue_result(ctx, s, g, ["LAN-MAN-1", cert, "ravi", "", ""])
+    assert row[3].startswith("DONE: recorded manual issue"), row
+    assert row[4], "Processed At must be filled"
+    assert db.q1("SELECT status FROM orders WHERE id=%s", (o["id"],))["status"] == "DONE"
+    assert db.q1("SELECT status FROM papers WHERE id=%s", (pid,))["status"] == "ASSIGNED"
+    a = db.q1("SELECT * FROM allocations WHERE order_id=%s", (o["id"],))
+    assert a and a["paper_id"] == pid and a["cert_no"] == cert
+    # reaches the Output sheet like an auto issue
+    from estamp.allocate import label_for
+    from estamp.outputs import output_sheet_id
+    run_outputs(ctx)
+    sid = output_sheet_id(ctx, a["alloc_date"], a["state"], a["denomination"])
+    out = g.sheets_data[sid][label_for("MH", 200)]
+    assert any(r[0] == "LAN-MAN-1" and r[1] == cert for r in out[1:]), out
+
+
+@e2e
+def test_manual_issue_for_already_done_lan_is_rejected_no_double_issue(env):
+    from datetime import date
+    s, db, g = env
+    cert = samples.cert("MH", 901)
+    db.insert_orders([("LAN-MAN-DONE", "LAN-MAN-DONE", "MH", 200, "f", "fid", "t", 1, "PENDING", None)])
+    order = db.claim_orders("MH", 200, 1)[0]
+    db.insert_paper(state="MH", denomination=200, status="AVAILABLE", cert_no="IN-MH-MANDONE")
+    paper = db.reserve_paper(order)
+    db.finish_allocation(order, paper, date(2026, 10, 28), "LAN-MAN-DONE.pdf", "fid", "link", "bid")
+    # a free paper sits in stock; a manual issue for the already-DONE LAN must not consume it
+    pid = db.insert_paper(state="MH", denomination=200, status="AVAILABLE", cert_no=cert)
+    ctx = _ctx(s, db, g)
+    row = _manual_issue_result(ctx, s, g, ["LAN-MAN-DONE", cert, "ravi", "", ""])
+    assert row[3].startswith("ERROR: LAN not pending"), row
+    assert db.q1("SELECT count(*) n FROM allocations WHERE lan='LAN-MAN-DONE'")["n"] == 1
+    assert db.q1("SELECT status FROM papers WHERE id=%s", (pid,))["status"] == "AVAILABLE"
+
+
+@e2e
+def test_manual_issue_with_unavailable_or_mismatched_paper_is_rejected(env):
+    s, db, g = env
+    db.insert_orders([("LAN-MAN-2", "LAN-MAN-2", "MH", 200, "f", "fid", "t", 1, "PENDING", None)])
+    o = db.q1("SELECT * FROM orders WHERE lan='LAN-MAN-2'")
+    ctx = _ctx(s, db, g)
+    # no such cert
+    assert _manual_issue_result(ctx, s, g, ["LAN-MAN-2", "NOPE-1", "ravi", "", ""])[3].startswith("ERROR")
+    # wrong denomination
+    wrong = samples.cert("MH", 902)
+    db.insert_paper(state="MH", denomination=100, status="AVAILABLE", cert_no=wrong)
+    assert _manual_issue_result(ctx, s, g, ["LAN-MAN-2", wrong, "ravi", "", ""])[3].startswith("ERROR")
+    # already assigned paper (not AVAILABLE)
+    taken = samples.cert("MH", 903)
+    db.insert_paper(state="MH", denomination=200, status="ASSIGNED", cert_no=taken)
+    assert _manual_issue_result(ctx, s, g, ["LAN-MAN-2", taken, "ravi", "", ""])[3].startswith("ERROR")
+    # no ledger change: order still PENDING, no allocation
+    assert db.q1("SELECT status FROM orders WHERE id=%s", (o["id"],))["status"] == "PENDING"
+    assert db.q1("SELECT count(*) n FROM allocations WHERE lan='LAN-MAN-2'")["n"] == 0
+
+
 # ------------------------------------------------------------ E-06: automatic second OCR attempt before Needs Review
 
 def _hp_fields(cert="IN-HP90000000000055A", amount="100"):

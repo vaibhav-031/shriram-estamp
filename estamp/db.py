@@ -354,6 +354,30 @@ class DB:
                 raise RuntimeError(f"order {order['id']} ({order['lan']}) was not ALLOCATING when finishing "
                                    "allocation – refusing to issue (its status changed under us)")
 
+    def record_manual_issue(self, order: dict, paper: dict, alloc_date: date, issued_by: str) -> None:
+        """E-04: record a by-hand issue in one transaction – order→DONE, paper→ASSIGNED (linked), and an
+        allocation flagged unwritten so run_outputs appends it to the Output sheet like an auto issue.
+        Both flips are CAS-guarded (PENDING→DONE, AVAILABLE→ASSIGNED): if anything raced (LAN already issued,
+        paper taken) the 0-row update raises and the whole transaction rolls back – no double-issue (#6)."""
+        with self.conn() as c, c.transaction():
+            cur = c.execute("""UPDATE orders SET status='DONE', paper_id=%s, cert_no=%s,
+                               notes=%s, updated_at=now() WHERE id=%s AND status='PENDING'""",
+                            (paper["id"], paper["cert_no"], f"manual issue by {issued_by}", order["id"]))
+            if cur.rowcount != 1:
+                raise RuntimeError(f"order {order['id']} ({order['lan']}) was not PENDING when recording manual "
+                                   "issue – refusing (its status changed under us)")
+            cur = c.execute("""UPDATE papers SET status='ASSIGNED', order_id=%s, file_name=%s, notes=%s,
+                               updated_at=now() WHERE id=%s AND status='AVAILABLE'""",
+                            (order["id"], f"{order['lan']}.pdf", f"manual issue by {issued_by}", paper["id"]))
+            if cur.rowcount != 1:
+                raise RuntimeError(f"paper {paper['id']} ({paper['cert_no']}) was not AVAILABLE when recording "
+                                   "manual issue – refusing (it was taken under us)")
+            c.execute("""INSERT INTO allocations(order_id, paper_id, lan, cert_no, state, denomination, alloc_date,
+                                                 pdf_name)
+                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                      (order["id"], paper["id"], order["lan"], paper["cert_no"], order["state"],
+                       order["denomination"], alloc_date, f"{order['lan']}.pdf"))
+
     def fail_allocation(self, order: dict, paper: dict | None, msg: str) -> None:
         with self.conn() as c, c.transaction():
             c.execute("UPDATE orders SET status='ERROR', notes=%s, updated_at=now() WHERE id=%s", (msg, order["id"]))
