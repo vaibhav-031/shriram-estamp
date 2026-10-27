@@ -15,7 +15,12 @@ calls with synthetic PDFs in `docs/api-samples/split/`; no auth; returns a zip o
 NOT reject odd page counts). `config.yaml` still uses `split_provider: local` – switching to `zoop_api` sends every
 upload to live.zoopsign.com (Vaibhav to decide). Suite: 45 passed + 1 expected-fail (A-08 target).
 
-**Not built:** everything else below. No OCR API call made yet.
+**Not built (as of the original 2026-10-27 write-up):** everything else below.
+
+**Audit 2026-10-28 (code-verified).** Phases A (in-house APIs) and B (paper type / split / pairing) have since
+landed; `config.yaml` now runs `ocr_provider` + `split_provider: zoop_api`. The shortlist below is annotated with
+code-verified status markers: ✅ done · 🟡 partial · ❌ not built. Done so far: A-03/A-05/A-06/A-07 (OCR+split
+adapters, rate-limit+retry), all of Phase B, and the service-account + Shared-Drive *capability* (not the move).
 
 **Test data reset (2026-10-27, by Vaibhav's decision – all of it was test data):** every table in `shriram_estamp`
 truncated, ID sequences reset (all 8 tables are data; setup lives in `state_config.csv` / `config.yaml`, unchanged);
@@ -31,23 +36,35 @@ papers front + back); 14 → Needs Review:
 - **Drive OCR took 83 min on one TN page** and the cycle hit its time budget (whole run 92 min; 4 papers never
   read). Supports doing A-05 (OCR API) first, and every OCR call needs a **per-page timeout** (A-07).
 
-**Shortlist for the dev team, in priority order** (tickets in `docs/issues/`; deferred tickets are `needs-triage`):
-1. E-01 never append a LAN twice to an output sheet (real gap in today's live flow)
-2. A-03 capture redacted OCR API samples – **ask Vaibhav before each live call**
-3. A-05 OCR API adapter at intake + issue check, raw response stored per paper, **per-page timeout** (see 83-min read)
-4. E-06 + E-08 (merged) corrections stored next to the API reading; issue check accepts either; auto second
-   API attempt – needed as soon as A-05 lands, or every corrected paper fails its issue check
-5. A-07 rate limit + retry → A-08 failure policy (make the xfail test pass) → A-09 remove Drive OCR → A-10 throughput
-6. B-01…B-03 (+B-04 merged) paper type, 1/2-page split (split API ready: `splitSize` 1/2; reject odd pages before
-   calling it), pairing safety; split API calls also need the A-07 limiter
-7. E-02 self-heal stuck issues → E-09 crash-resume tests
-8. E-10 + E-11 (merged) Gmail major-issue emails + CRASH/HEARTBEAT; keep the heartbeat URL
-9. C (one merged ticket) coded `✗ [E###]` lines for the codes ops actually hit
-10. D-02 live Daily Report tab → D-03 `report --date` (Google Sheet only)
-11. G-01 audit of intake + issue paths → H-02 production URLs + rotated key → H-04 README ops guide
-- F-03 `reset-test-data` command: still waiting on Vaibhav (the 2026-10-27 reset was done by hand, see above).
-- Deferred: auto re-map (D7 – still allowed by ADR-0001, not built), vendors + reconciliation,
-  stray-file adoption, Manual Issues tab, RE-OCR/RECHECK, Drive declutter, Shared Drive move, storage estimate.
+**Shortlist for the dev team, in priority order** (tickets in `docs/issues/`; deferred tickets are `needs-triage`;
+✅/🟡/❌ = code-verified status on 2026-10-28):
+1. ❌ E-01 never append a LAN twice to an output sheet (real gap in today's live flow) – only the `output_written`
+   flag guards it (`outputs.py:31-46`); no by-LAN check before `append_rows`, so a crash between append and
+   `mark_written` can double-append.
+2. ✅ A-03 capture redacted OCR API samples – `docs/api-samples/ocr/` (digital, traditional, not-pdf).
+3. ✅ A-05 OCR API adapter at intake + issue check, raw response stored per paper, **per-page timeout** –
+   `ocr_split.py:182` `_ocr_zoop`, `allocate.py:35` reuses `ctx.ocr`, `db.py:106` `ocr_raw`, `timeout_s`/`max_total_s`.
+4. ❌ E-06 + E-08 (merged) corrections stored next to the API reading; issue check accepts either; auto second
+   API attempt – none built: no audit fields, no RE-OCR action (`actions.py:62` APPROVE/REJECT only), no auto
+   second attempt, `verify_issued` accepts only the ledger cert.
+5. 🟡 A-07 ✅ rate limit + retry (`http_api.py`) → A-08 🟡 failure policy (file stays in inbox ✅ but xfail still
+   strict + no "after M cycles" escalation) → A-09 ❌ remove Drive OCR (`ocr_split.py:158` fallback still present)
+   → A-10 ❌ throughput measurement.
+6. ✅ B-01…B-03 (+B-04 merged) paper type, 1/2-page split (`splitSize` 1/2; reject odd pages before calling it),
+   pairing safety (E105/E106/E107) – `intake.py:139-186`, `extract.py:365/376`; content grouping removed.
+7. 🟡 E-02 self-heal stuck issues (`db.py:315` only moves to ERROR, no Drive-location heal) → 🟡 E-09 crash-resume
+   tests (2 of the required steps covered).
+8. 🟡 E-10 + E-11 (merged) Gmail major-issue emails + CRASH/HEARTBEAT – Slack/SMTP/heartbeat exist
+   (`context.py`); **no Gmail, no major-vs-minor routing, no CRASH/HEARTBEAT codes**. Keep the heartbeat URL.
+9. ❌ C (one merged ticket) coded `✗ [E###]` lines – no `estamp/errors.py`, no `explain` command; only
+   E105/E106/E107 emitted in code.
+10. ❌ D-02 live Daily Report tab → D-03 `report --date` – no report subcommand, no Daily Report tab.
+11. ❌ G-01 audit of intake + issue paths (no `docs/AUDIT.md`) → H-02 production URLs + rotated key (still dev
+    endpoint) → H-04 README ops guide. (Service-account + Shared-Drive *capability* ✅ in `google_clients.py`.)
+- ❌ F-03 `reset-test-data` command: still waiting on Vaibhav (the 2026-10-27 reset was done by hand, see above).
+- Deferred: ❌ auto re-map (D7 – still allowed by ADR-0001, not built), ❌ vendors + reconciliation,
+  ❌ stray-file adoption, ❌ Manual Issues tab, RECHECK ✅ / RE-OCR ❌, ❌ Drive declutter, ❌ Shared Drive move,
+  ❌ storage estimate.
 
 ⚠️ **The OCR API key was shared in chat – rotate it before go-live.** Keys live only in `.env`; never commit them.
 
