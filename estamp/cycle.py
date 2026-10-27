@@ -1,0 +1,104 @@
+"""One cycle, in this order (each step is safe to re-run):
+
+  1. recover   – LANs/papers stuck mid-allocation after a crash → ERROR (never silently retried)
+  2. actions   – ops approvals / cancellations from the control sheet
+  3. ingest    – new LAN sheets → PENDING orders
+  4. allocate  – PENDING LANs ← AVAILABLE papers (uses stock already on hand first)
+  5. intake    – Upload Inbox → split → OCR → Inventory / Needs Review (time-boxed)
+  6. allocate  – again, so freshly stocked papers are issued in the same cycle
+  7. outputs   – Output sheets for everything issued
+  8. alerts    – low stock, cycle summary (errors/warnings), daily summary, heartbeat
+  9. dashboard – control sheet tabs
+"""
+from __future__ import annotations
+
+import time
+import traceback
+
+from .actions import run_actions
+from .allocate import run_allocation
+from .context import Ctx, log
+from .dashboard import low_stock_alerts, run_dashboard
+from .intake import run_intake
+from .orders import run_ingest
+from .outputs import run_outputs
+
+
+def run_cycle(ctx: Ctx) -> bool:
+    s, db = ctx.settings, ctx.db
+    if not db.try_lock():
+        log.warning("another run is in progress – skipping this cycle")
+        return True
+    run_id = db.start_run()
+    ok = True
+    t0 = time.time()
+    budget = float(s.get("cycle.max_seconds", 900))
+    try:
+        if not ctx.dry:
+            o, p = db.recover_stuck(int(s.get("alerts.stuck_minutes", 15)))
+            if o or p:
+                ctx.event("ERROR", "Recovery", f"{o} LAN(s) and {p} paper(s) were stuck mid-allocation (crash?) – "
+                          "moved to ERROR. Check Output/Backup folders, then RETRY in Order Actions.")
+        _step(ctx, "Actions", lambda: run_actions(ctx))
+        _step(ctx, "Ingest", lambda: run_ingest(ctx, t0 + budget * 0.2))
+        _step(ctx, "Allocate", lambda: run_allocation(ctx, t0 + budget * 0.45, report_shortage=False))
+        _step(ctx, "Intake", lambda: run_intake(ctx, t0 + budget * 0.8))
+        _step(ctx, "Allocate", lambda: run_allocation(ctx, t0 + budget * 0.95))
+        _step(ctx, "Outputs", lambda: run_outputs(ctx))
+        _step(ctx, "Low stock", lambda: low_stock_alerts(ctx))
+    except Exception as e:
+        ok = False
+        ctx.event("ERROR", "Cycle", f"cycle crashed: {e}\n{traceback.format_exc()[-1500:]}")
+    finally:
+        try:
+            _step(ctx, "Dashboard", lambda: run_dashboard(ctx))
+        finally:
+            db.finish_run(run_id, ok, ctx.stats.as_dict())
+            _send(ctx)
+            ctx.heartbeat(ok)
+            db.release_lock()
+    log.info(f"cycle done in {time.time() - t0:.0f}s: {ctx.stats.as_dict()}")
+    return ok
+
+
+def _step(ctx: Ctx, name: str, fn) -> None:
+    try:
+        fn()
+    except Exception as e:
+        ctx.event("ERROR", name, f"step failed: {e}\n{traceback.format_exc()[-1500:]}")
+
+
+def _send(ctx: Ctx) -> None:
+    s, st = ctx.settings, ctx.stats
+    name = s.get("client_name", "Shriram")
+    if ctx.alerts and (not ctx.dry or s.get("alerts.in_dry_run", False)):
+        lines = [f"Issued {st.allocated} · LANs in {st.orders_in} · papers in {st.papers_in} · review {st.papers_review} · "
+                 f"errors {st.errors} · waiting {st.waiting}", ""] + [f"• {a}" for a in ctx.alerts[:40]]
+        if len(ctx.alerts) > 40:
+            lines.append(f"… {len(ctx.alerts) - 40} more – see the Log tab")
+        ctx.send_alerts(f"[{name} eStamp] {st.errors} error(s), {len(ctx.alerts)} alert(s)", lines)
+
+    hour = int(s.get("alerts.daily_summary_hour", 20))
+    if not ctx.dry and ctx.now().hour >= hour and ctx.db.alert_once("daily_summary", ctx.today()):
+        from .dashboard import stock_rows
+        d = ctx.today()
+        c = ctx.db.q1("""SELECT (SELECT count(*) FROM orders WHERE (received_at AT TIME ZONE %(tz)s)::date=%(d)s) rec,
+                                (SELECT count(*) FROM allocations WHERE alloc_date=%(d)s AND cancelled_at IS NULL) iss,
+                                (SELECT count(*) FROM orders WHERE status='PENDING') pend,
+                                (SELECT count(*) FROM orders WHERE status IN ('ERROR','CONFLICT')) exc,
+                                (SELECT count(*) FROM papers WHERE status='NEEDS_REVIEW') rev""", {"d": d, "tz": str(ctx.tz)})
+        lines = [f"Date {d}", f"LANs received {c['rec']} · issued {c['iss']} · pending {c['pend']} · "
+                 f"exceptions {c['exc']} · papers in review {c['rev']}", "", "Stock flags:"]
+        lines += [f"  {r[0]} ₹{r[2]}: avail {r[4]}, pending {r[6]}, net {r[7]}, cover {r[8]}d → {r[13]}"
+                  for r in stock_rows(ctx) if r[13] != "OK"] or ["  all OK"]
+        ctx.send_alerts(f"[{name} eStamp] Daily summary {d}", lines)
+
+
+def run_forever(ctx_factory, interval: int) -> None:
+    while True:
+        ctx = ctx_factory()
+        try:
+            run_cycle(ctx)
+        except Exception:
+            log.exception("cycle failed outside the safety net")
+        time.sleep(interval)

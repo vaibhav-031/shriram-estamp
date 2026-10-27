@@ -1,0 +1,124 @@
+# Shriram eStamp – Python service config. Secrets go in .env, not here.
+
+client_name: Shriram Finance
+
+# true  = preview only: reads + OCRs, writes the "Dry Run Preview" tab, moves NOTHING, writes NOTHING to the ledger
+# false = live
+dry_run: false
+
+timezone: Asia/Kolkata
+workers: 8                 # parallel threads for OCR / allocation (6–8 is safe for Drive API limits)
+loop_seconds: 120          # `run` mode: start a new cycle every N seconds
+cycle:
+  max_seconds: 900         # time budget per cycle (intake is time-boxed inside this)
+
+db:
+  url_env: ESTAMP_DB_URL   # name of the env var holding the Postgres URL
+  schema: shriram_estamp   # everything lives in this schema only
+
+google:
+  auth: oauth              # oauth = your Google account (Mac pilot) | service_account (server, Shared Drive only)
+  oauth_client_file: secrets/client_secret.json
+  oauth_token_file: secrets/token.json
+  service_account_file: secrets/service_account.json
+
+# Drive folder IDs – the "Shriram eStamp (Python)" test set in your Drive
+folders:
+  upload_inbox:     1yGKi1TFXDqGnftenBY26Mh2QjVEjTxoC   # 📥 ops upload vendor PDFs here (merged or single)
+  upload_archive:   1qQNEoIWgGrKlwWKSfs4M4GI1C92Mthvb   # originals after processing (never deleted)
+  needs_review:     1i6qCL58qpWU6IWvnKzLvW9ZaCDxKQ7YL   # papers that failed a check
+  inventory_root:   1--Zx-Dj8vvDpgO2xmjitWu1vWCYI7t25   # STATE/AMOUNT/<CERT>.pdf – created automatically
+  orders_incoming:  1A-chhNDQBKv07bCjirwbzzE2qmN0s6d2   # Shriram's state LAN sheets
+  orders_processed: 1CBYMCbvDJa7RFIedvTjBe5mJMTA5-ZNu
+  orders_rejected:  11ZB4dBoH7_U2mLkZJ2eWC8lDr2PmbuLH
+  output_root:      16OXBf4-xk2raMDZ9gb0ct-J3ZdsI91rK   # DATE/STATE/<STATE-AMOUNT> sheet + PDFs
+  backup_root:      1u-rz3pYzOmgESZrROvt89xW9q3qnpVXa   # DATE/STATE/AMOUNT/<LAN>__<CERT>.pdf
+  ocr_temp: ""                                         # only needed with a service account
+
+control_sheet_id: 1UJ7MP-lX270LOonlOIOYm_Q7ELaWnrD_ZjZm8WPbzRE
+
+state_config_file: state_config.csv
+
+orders:
+  settle_minutes: 0          # ignore sheets edited in the last N minutes (someone may still be filling them)
+  header_scan_rows: 10
+  lan_regex: '^[A-Za-z0-9][A-Za-z0-9\-_/]{3,39}$'   # tighten once Shriram's LAN format is confirmed
+  reject_file_on_any_invalid_row: false
+  columns:                    # header names are matched case/punctuation-insensitively
+    lan: [loan no, loan number, loan no., lan id, lan, lan no, lan number, loan account number, loan account no]
+    state: [state, state code, state name]
+    denomination: [stamp duty amount, stamp duty, denomination, stamp value, stamp amount]
+
+intake:
+  settle_minutes: 0           # ignore uploads still being copied in
+  split_provider: local       # local (pypdf) | zoop_api
+  # local split: every page is read, then grouped – a physical paper's back page stays with its front
+  use_pdf_text: true          # digital e-stamps: read the PDF's built-in text first (instant, exact)
+  min_pdf_text_chars: 40      # less text than this = scanned page → OCR
+  ocr_provider: drive         # drive | zoop_api   (only used for scanned pages)
+  ocr_fallback_to_drive: true
+  required_text: []           # e.g. ["SHRIRAM"] – turn on once sample papers confirm the party name prints
+  cert_patterns:
+    DEFAULT: '\bIN-([A-Z]{2})(\d{12,16})([A-Z])'      # SHCIL style IN-MH12345678901234X; group 1 = state
+    # MH: '\bIN-MH\d{14}[A-Z]'                         # add per-state patterns once samples are in
+  stamp_duty_regex: 'STAMP\s*DUTY\s*AMOUNT[^0-9]{0,25}([\d,]+)'
+  # Physical (non-judicial) stamp paper: serial number on the front, state printed as a name (RAJASTHAN).
+  # The paper id becomes STATE-SERIAL, e.g. RJ-S254201. Add per-state patterns as you see more samples.
+  physical_front_markers: ["NON JUDICIAL", "गैर न्यायिक"]   # front of a physical paper even if serial unreadable
+  # A page with any of these is an e-stamp: always ONE page = one paper, never grouped with the next page
+  # (e-stamps also print "INDIA NON JUDICIAL", so this overrides physical_front_markers).
+  estamp_markers: ["E-STAMP", "UNIQUE DOC. REFERENCE", "SUBIN-"]
+  serial_patterns:
+    DEFAULT: '\b[A-Z]{1,2} ?\d{6}\b'               # e.g. "S 254201", "AB 123456"
+  # Amount: tried in order – e-stamp line first, then the face value printed on physical paper
+  # e-stamp fallback id when the certificate no. isn't readable as text (group 1 = state code)
+  estamp_ref_patterns:
+    # UP: SUBIN-UPUP1405480472263158537115Y   KA: SUBIN-KAKAKSCSA0817022928679844Y (office code before the digits)
+    - '\bSUBIN-([A-Z]{2})[A-Z]{2}(?=[A-Z0-9]*\d{12})[A-Z0-9]{16,34}\b'
+  amount_patterns:
+    - '([\d,]+)\s*\(\s*[A-Z][A-Z ]*ONLY\s*\)'          # "100 (One Hundred only)" – most reliable on e-stamps
+    - 'STAMP\s*DUTY\s*AMOUNT\s*\(RS\.?\)\s*:?\s*([\d,]+)'
+    - '\bRS\.?\s*([\d,]+)'
+    - 'रु\.?\s*([\d,]+)'
+    # last resort: watermark text OCR'd between label and value, e.g. "Stamp Duty Amount (Rs.) RAM FINANCE LIMITE: 500"
+    - 'STAMP\s*DUTY\s*AMOUNT[^0-9]{0,45}?([\d,]+)'
+
+allocation:
+  batch_size: 200
+  max_per_cycle: 3000
+  cancel_returns_paper: true  # CANCEL on an issued LAN puts the paper back in stock
+  verify_ocr: true            # OCR the renamed <LAN>.pdf again; the Certificate No written to the Output
+                              # sheet is the one read from that issued PDF (must match the ledger)
+
+zoop_api:                     # fill in when the in-house APIs are ready
+  split:
+    url: ""
+    api_key_env: ZOOP_SPLIT_API_KEY
+    auth_header: x-api-key
+    file_field: file
+    papers_path: data.papers
+    pdf_b64_field: pdf_base64
+    pages_field: pages
+    timeout_s: 300
+  ocr:
+    url: ""
+    api_key_env: ZOOP_OCR_API_KEY
+    auth_header: x-api-key
+    file_field: file
+    text_path: data.text
+    cert_path: data.certificate_number
+    timeout_s: 60
+
+alerts:
+  slack_webhook_env: ESTAMP_SLACK_WEBHOOK
+  heartbeat_url_env: ESTAMP_HEARTBEAT_URL
+  in_dry_run: false
+  stuck_minutes: 15
+  daily_summary_hour: 20
+  smtp:
+    host: ""
+    port: 587
+    user_env: ESTAMP_SMTP_USER
+    password_env: ESTAMP_SMTP_PASSWORD
+    from: ""
+    to: [vaibhav.sharma@zoop.one]
