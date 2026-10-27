@@ -1136,3 +1136,51 @@ def test_up_estamp_amount_layout_variants(settings, variant):
     r = StateResolver(settings.states); m = CertMatcher(settings.get("intake.cert_patterns"), r)
     a = analyze_paper(variant, "", settings, m, lambda c: False)
     assert (a.state, a.amount, a.issues) == ("UP", 100, [])
+
+
+# ============================================================ reset-test-data (F-03)
+
+@e2e
+def test_reset_all_data_clears_tables_and_restarts_identity(env):
+    s, db, g = env
+    # seed a couple of rows across tables that use BIGSERIAL identities
+    db.q("INSERT INTO uploads(drive_file_id, file_name, md5) VALUES ('f1','a.pdf','m1'),('f2','b.pdf','m2')")
+    db.event("INFO", "seed", "hello")
+    assert db.table_counts()["uploads"] == 2
+    assert db.table_counts()["events"] == 1
+
+    cleared = db.reset_all_data()
+    assert cleared["uploads"] == 2 and cleared["events"] == 1
+
+    # every table empty now
+    assert all(n == 0 for n in db.table_counts().values())
+    # identity restarted: next insert gets id 1 again
+    new_id = db.q1("INSERT INTO uploads(drive_file_id) VALUES ('f3') RETURNING id")["id"]
+    assert new_id == 1
+
+
+@e2e
+def test_cli_reset_refuses_production_schema_without_force(env, monkeypatch):
+    import io
+    from contextlib import redirect_stdout
+    from estamp import cli
+    s, db, g = env
+    # seed one row we can prove survives
+    db.q("INSERT INTO uploads(drive_file_id) VALUES ('keep')")
+
+    # Point the CLI at the SAME test DB but a prod-looking schema name, so the guard sees production.
+    # Give the CLI its own DB handle (it calls db.close() in finally) so the fixture's pool stays open.
+    from estamp.db import DB
+    def fake_build(args, need_google=True):
+        s.raw["db"]["schema"] = "shriram_estamp"   # looks like prod to the guard
+        return s, DB(DB_URL, "shriram_estamp", max_size=2), None
+    monkeypatch.setattr(cli, "_build", fake_build)
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli.main(["reset-test-data", "--yes"])   # --yes, but NO --force
+    out = buf.getvalue()
+    assert rc != 0
+    assert "refus" in out.lower()
+    # nothing was truncated
+    assert db.q1("SELECT count(*) n FROM uploads")["n"] == 1

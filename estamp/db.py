@@ -160,6 +160,26 @@ class DB:
         with psycopg.connect(self.url, autocommit=True) as c:
             c.execute(SCHEMA_SQL.format(schema=self.schema))
 
+    def table_counts(self) -> dict[str, int]:
+        """Row count per table in this schema, enumerated from information_schema (not hardcoded)."""
+        return {t: self.q1(f'SELECT count(*) n FROM "{self.schema}"."{t}"')["n"] for t in self._tables()}
+
+    def reset_all_data(self) -> dict[str, int]:
+        """Wipe every table in this schema (TRUNCATE ... RESTART IDENTITY CASCADE) in one transaction.
+        Keeps the schema and tables so the service keeps working. Returns the per-table row counts it cleared."""
+        before = self.table_counts()
+        tables = list(before)
+        if tables:
+            qualified = ", ".join(f'"{self.schema}"."{t}"' for t in tables)
+            with self.conn() as c, c.transaction():
+                c.execute(f"TRUNCATE {qualified} RESTART IDENTITY CASCADE")
+        return before
+
+    def _tables(self) -> list[str]:
+        return [r["table_name"] for r in self.q(
+            """SELECT table_name FROM information_schema.tables
+               WHERE table_schema=%s AND table_type='BASE TABLE' ORDER BY table_name""", (self.schema,))]
+
     def close(self) -> None:
         self.release_lock()
         self.pool.close()

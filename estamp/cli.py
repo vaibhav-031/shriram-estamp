@@ -2,6 +2,7 @@
 
   python -m estamp login          one-time Google sign-in (opens your browser)
   python -m estamp init-db        create the shriram_estamp schema + tables (safe to re-run)
+  python -m estamp reset-test-data clear all ledger rows in the current schema (typed YES; refuses prod)
   python -m estamp check-setup    verify DB, Google access, every folder, state config, APIs, alerts
   python -m estamp run-once       one full cycle (respects dry_run in config.yaml)
   python -m estamp run            keep running a cycle every loop_seconds (refuses in dry run)
@@ -39,11 +40,13 @@ def _build(args, need_google=True):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="estamp")
-    ap.add_argument("command", choices=["login", "init-db", "check-setup", "run-once", "run", "status", "reconcile", "recheck-review", "explain"])
+    ap.add_argument("command", choices=["login", "init-db", "reset-test-data", "check-setup", "run-once", "run", "status", "reconcile", "recheck-review", "explain"])
     ap.add_argument("code", nargs="?", help="error code for `explain` (e.g. E111)")
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--dry-run", action="store_true", help="force dry run for this command")
     ap.add_argument("--live", action="store_true", help="force live mode for this command")
+    ap.add_argument("--yes", action="store_true", help="reset-test-data: skip the typed confirmation (scripted use)")
+    ap.add_argument("--force", action="store_true", help="reset-test-data: allow a production-looking schema")
     args = ap.parse_args(argv)
 
     if args.command == "explain":
@@ -66,6 +69,13 @@ def main(argv=None) -> int:
         db.init_schema()
         print(f"Schema '{s.schema}' ready.")
         return 0
+
+    if args.command == "reset-test-data":
+        s, db, _ = _build(args, need_google=False)
+        try:
+            return _reset_test_data(s, db, confirm=args.yes, force=args.force)
+        finally:
+            db.close()
 
     s, db, google = _build(args, need_google=args.command not in ("status",))
     try:
@@ -92,6 +102,38 @@ def main(argv=None) -> int:
     finally:
         db.close()
     return 0
+
+# Wipe the ledger in the CURRENT schema (go-live test-data reset). DB only – Drive files are handled separately.
+# Guards: refuse a production-looking schema unless --force; require a typed YES unless --yes.
+PROD_SCHEMAS = {"shriram_estamp"}
+
+
+def _reset_test_data(s, db, confirm: bool, force: bool) -> int:
+    from urllib.parse import urlsplit
+    host = urlsplit(db.url).hostname or "?"          # host only – never print the URL (it may hold credentials)
+    schema = s.schema
+
+    if schema in PROD_SCHEMAS and not force:
+        print(f"REFUSING: schema '{schema}' looks like production. "
+              f"Re-run with --force only if you really mean to wipe it.")
+        return 2
+
+    counts = db.table_counts()
+    print(f"About to wipe schema '{schema}' on host '{host}'.")
+    print(f"Row counts ({sum(counts.values())} rows across {len(counts)} tables):")
+    for t, n in counts.items():
+        print(f"  {t:<16}{n}")
+
+    if not confirm:
+        if input("Type YES to clear all of the above (anything else aborts): ") != "YES":
+            print("cancelled, nothing changed")
+            return 1
+
+    cleared = db.reset_all_data()
+    print(f"Cleared {sum(cleared.values())} rows from {len(cleared)} tables in '{schema}'.")
+    print("Reminder: Drive test files are NOT touched by this command – clean them up separately.")
+    return 0
+
 
 # config and env check
 def _check(s, db, google) -> int:
