@@ -19,13 +19,13 @@ Shriram eStamp (Python)/
 
 ## 1. One-time setup on your Mac (≈30 min)
 
-**Python**
+**Python (uv)** – install uv once (`brew install uv`), then:
 ```bash
-brew install python@3.15
-cd shriram-estamp-python
-python3.15 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+cd shriram-estamp
+make setup          # creates .venv (Python 3.13, pinned in .python-version) and installs everything
 ```
+`make setup` is `uv sync`. Every other step runs inside that venv via `uv run` – no manual `activate`.
+Run `make` on its own to list all tasks.
 
 **Google sign-in (OAuth, runs as you)**
 1. console.cloud.google.com → create a project (e.g. "shriram-estamp").
@@ -134,11 +134,12 @@ Logs: `logs/estamp.log` (rotating), the **Log** tab, and the `events` table.
 ## 6. Tests
 
 ```bash
-pip install pytest reportlab
-ESTAMP_TEST_DB_URL=postgresql://<your-mac-username>@localhost:3000/postgres python -m pytest -q tests/
+make test     # once; or `make test5` for the 5×-in-a-row suite required before committing
 ```
+`make test` defaults the test DB to `postgresql://$USER@localhost:3000/postgres`; override if your Postgres
+user differs: `make test ESTAMP_TEST_DB_URL=postgresql://someone@localhost:3000/postgres`.
 The end-to-end tests create and drop only their own `estamp_test` schema and use an in-memory Drive – they never
-touch `shriram_estamp` or real Drive folders. Before committing, run the suite 5× in a row (see `CLAUDE.md`).
+touch `shriram_estamp` or real Drive folders.
 
 ## 7. Moving off the Mac
 
