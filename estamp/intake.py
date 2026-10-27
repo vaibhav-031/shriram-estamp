@@ -29,26 +29,55 @@ from .http_api import ApiAuthError
 from .ocr_split import _split_local, merge_pdfs
 
 
-def _collect(g, folder_id: str, depth: int = 0, max_depth: int = 4) -> tuple[list[dict], list[dict]]:
-    """All files in the inbox, including inside any folders ops uploaded (RJ/, Vendor batch 3/, …).
-    Returns (files, subfolders). Folder names are ignored – every paper is routed by its certificate."""
+def _collect(g, folder_id: str, vendor: str | None = None, depth: int = 0,
+             max_depth: int = 4) -> tuple[list[dict], list[dict]]:
+    """All files in the inbox, including inside any folders ops uploaded (Paper Ease/, batch 3/, …).
+    Returns (files, subfolders). Each file carries `_vendor_folder`: the name of the top-level inbox subfolder
+    it descends from (None if it sits directly in the inbox root). Nested folders inherit the top-level name, so
+    the vendor is decided by the immediate child of the Upload Inbox, not by how deep the file is buried (D-1)."""
     files, folders = [], []
     for item in g.list_children(folder_id):
         if item.get("mimeType") == FOLDER:
             if depth < max_depth:
                 folders.append(item)
-                sub_files, sub_folders = _collect(g, item["id"], depth + 1, max_depth)
+                # top-level subfolder (depth 0) names the vendor; deeper folders keep the one they inherited.
+                sub_vendor = item["name"] if depth == 0 else vendor
+                sub_files, sub_folders = _collect(g, item["id"], sub_vendor, depth + 1, max_depth)
                 files += sub_files
                 folders += sub_folders
         else:
-            files.append(item)
+            files.append({**item, "_vendor_folder": vendor})
     return files, folders
+
+
+def _resolve_vendor(s, folder_name: str | None):
+    """Map an inbox top-level folder name to its vendor code, matching vendor_name or vendor_code case-insensitively.
+    Returns the VendorCfg, or None when the file is in the inbox root / the folder is not a known vendor (E101)."""
+    if not folder_name:
+        return None
+    key = folder_name.strip().lower()
+    for v in s.vendors.values():
+        if key in (v.name.lower(), v.code.lower()):
+            return v
+    return None
+
+
+def _ensure_vendor_folders(ctx: Ctx) -> None:
+    """One subfolder per ACTIVE vendor exists in the Upload Inbox (created by vendor_name if missing). Never deletes."""
+    if ctx.dry:
+        return
+    g, s = ctx.google, ctx.settings
+    inbox = s.folder(UPLOAD_INBOX)
+    for v in s.vendors.values():
+        if v.active:
+            g.folder_path(inbox, [v.name])
 
 
 def run_intake(ctx: Ctx, deadline: float) -> None:
     g, s = ctx.google, ctx.settings
     inbox = s.folder(UPLOAD_INBOX)
     settle = int(s.get("intake.settle_minutes", 5)) * 60
+    _ensure_vendor_folders(ctx)
     files, folders = _collect(g, inbox)
     for f in sorted(files, key=lambda x: x["modifiedTime"]):
         if time.time() > deadline:
@@ -57,15 +86,26 @@ def run_intake(ctx: Ctx, deadline: float) -> None:
         age = (datetime.now(timezone.utc) - parse_time(f["modifiedTime"])).total_seconds()
         if age < settle:
             continue
+        vendor = _resolve_vendor(s, f.get("_vendor_folder"))
+        if vendor is None:
+            # E101: not inside a known vendor folder. Leave the file where it is – never move/delete/process it.
+            where = f.get("_vendor_folder")
+            why = f"folder '{where}' is not a known vendor" if where else "file sits directly in the inbox root"
+            ctx.event("WARN", "Intake", line("E101", f"'{f['name']}' – {why}; moved nowhere, not stocked"),
+                      ref=f["id"], alert_key=f"intakevendor|{f['id']}")
+            continue
         try:
-            _process_upload(ctx, f)
+            _process_upload(ctx, f, vendor.code)
         except Exception as e:
             ctx.event("ERROR", "Intake", f"'{f['name']}' failed: {e} – stays in the inbox and is retried next cycle",
                       ref=f["id"], alert_key=f"intakefail|{f['id']}")
-    # Uploaded folders that are now empty go to the archive (deepest first), so the inbox stays clean.
+    # Uploaded folders that are now empty go to the archive (deepest first), so the inbox stays clean. The vendor
+    # folders themselves are permanent – they are left in place even when empty (ops drop the next batch into them).
     if not ctx.dry:
         archive = g.folder_path(s.folder(UPLOAD_ARCHIVE), [ctx.today().isoformat()])
         for fo in reversed(folders):
+            if _resolve_vendor(s, fo["name"]) is not None:
+                continue
             try:
                 if not g.list_children(fo["id"]):
                     g.move_rename(fo["id"], archive)
@@ -219,7 +259,7 @@ def _reread(ctx: Ctx, up: dict, upload_name: str, u: Unit) -> None:
     u.via = r.via
 
 
-def _process_upload(ctx: Ctx, f: dict) -> None:
+def _process_upload(ctx: Ctx, f: dict, vendor_code: str = "") -> None:
     g, s, db = ctx.google, ctx.settings, ctx.db
     today = ctx.today().isoformat()
     if f.get("mimeType") != PDF:
@@ -300,7 +340,7 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
     done = db.pages_done(up["id"])
     todo = [u for u in units if u.page_from not in done]
     with ThreadPoolExecutor(max_workers=int(s.get("workers", 8))) as ex:
-        list(ex.map(lambda u: _stock_unit(ctx, up, f["name"], u), todo))
+        list(ex.map(lambda u: _stock_unit(ctx, up, f["name"], u, vendor_code), todo))
 
     db.upload_finish(up["id"], "DONE", len(units))
     g.move_rename(f["id"], g.folder_path(s.folder(UPLOAD_ARCHIVE), [today]))
@@ -308,7 +348,7 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
     ctx.event("INFO", "Intake", f"'{f['name']}': {len(units)} paper(s) processed", ref=f["id"])
 
 
-def _stock_unit(ctx: Ctx, up: dict, upload_name: str, u: Unit) -> None:
+def _stock_unit(ctx: Ctx, up: dict, upload_name: str, u: Unit, vendor_code: str = "") -> None:
     g, s, db = ctx.google, ctx.settings, ctx.db
     a = _analyze(ctx, u)
     # E-06: a paper that READ fine but failed the checks gets ONE automatic second OCR attempt (never an E107 pairing
@@ -321,7 +361,8 @@ def _stock_unit(ctx: Ctx, up: dict, upload_name: str, u: Unit) -> None:
     review_name = f"{safe_file_name(upload_name.rsplit('.', 1)[0])}__p{u.page_from}-{u.page_to}.pdf"
     fields = dict(upload_id=up["id"], page_from=u.page_from, page_to=u.page_to, cert_no=a.cert or None,
                   cert_state=a.cert_state or None, state=a.state or None, denomination=a.amount or None,
-                  ocr_amount=a.amount or None, ocr_via=u.via, ocr_text=u.text[:20000], ocr_raw=u.raw)
+                  ocr_amount=a.amount or None, ocr_via=u.via, ocr_text=u.text[:20000], ocr_raw=u.raw,
+                  vendor_code=vendor_code or None)
 
     if a.ok:
         folder = g.folder_path(s.folder(INVENTORY_ROOT), [a.state, str(a.amount)])

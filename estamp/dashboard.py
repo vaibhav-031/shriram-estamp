@@ -53,8 +53,8 @@ def run_dashboard(ctx: Ctx) -> None:
         "Summary": ["Metric", "Value"],
         "Stock": ["State", "Name", "Stamp Duty", "Daily Qty", "Available", "Needs Review", "Pending LANs",
                   "Net After Pending", "Days of Cover", "Issued Today", "Issued (all time)", "Error", "Alert Below", "Flag"],
-        "Needs Review": ["Paper ID", "Upload", "Page", "Cert No (OCR)", "State (OCR)", "Stamp Duty (OCR)", "Reason",
-                         "Open PDF", "Added At"],
+        "Needs Review": ["Paper ID", "Upload", "Vendor", "Page", "Cert No (OCR)", "State (OCR)", "Stamp Duty (OCR)",
+                         "Reason", "Open PDF", "Added At"],
         "Exceptions": ["LAN ID", "State", "Stamp Duty", "Status", "Notes", "Source File", "Updated At"],
         "Corrections": ["Paper ID", "API read (cert/state/₹)", "Ops value (cert/state/₹)", "Edited By", "Edited At",
                         "LAN issued to"],
@@ -93,8 +93,9 @@ def run_dashboard(ctx: Ctx) -> None:
     review = db.q("""SELECT p.*, u.file_name AS upload_name FROM papers p LEFT JOIN uploads u ON u.id = p.upload_id
                      WHERE p.status='NEEDS_REVIEW' ORDER BY p.added_at LIMIT 3000""")
     g.overwrite_tab(sid, "Needs Review", [tabs["Needs Review"]] + [
-        [r["id"], r["upload_name"], f"{r['page_from']}-{r['page_to']}", r["cert_no"], r["state"], r["denomination"],
-         r["notes"], file_link(r["drive_file_id"]) if r["drive_file_id"] else "", t(r["added_at"])] for r in review])
+        [r["id"], r["upload_name"], r["vendor_code"] or "", f"{r['page_from']}-{r['page_to']}", r["cert_no"],
+         r["state"], r["denomination"], r["notes"], file_link(r["drive_file_id"]) if r["drive_file_id"] else "",
+         t(r["added_at"])] for r in review])
 
     exc = db.q("SELECT * FROM orders WHERE status IN ('ERROR','CONFLICT') ORDER BY updated_at DESC LIMIT 3000")
     g.overwrite_tab(sid, "Exceptions", [tabs["Exceptions"]] + [

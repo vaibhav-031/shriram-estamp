@@ -39,6 +39,11 @@ def test_projection_loaded(settings):
     assert settings.states["RJ"].amounts == [195]
 
 
+def test_vendors_loaded(settings):
+    assert set(settings.vendors) == {"PAPEREASE", "AGREXP", "SHABDA"}
+    assert settings.vendors["PAPEREASE"].name == "Paper Ease" and settings.vendors["PAPEREASE"].active
+
+
 @pytest.mark.parametrize("raw,code", [("KARTNATAKA", "KA"), ("ANDRA PRADESH", "AP"), ("UTTARPRADESH", "UP"),
                                       ("DELHI NCR", "DL"), ("KOLKATA", "WB"), ("JAMMU & KASHMIR", "JK"),
                                       ("gujarat", "GJ"), ("MH", "MH"), ("Telangana", "TS"), ("Sheet1", "")])
@@ -116,9 +121,30 @@ def _ctx(settings, db, g):
     return Ctx(settings, db, g, ocr=FakeOcr())   # offline reader; stands in for the live OCR API in e2e
 
 
+def _vendor_folder(g, s, name="Paper Ease"):
+    """The inbox subfolder ops drop files into (D-1: files must sit inside a vendor folder, never the root)."""
+    return g.folder_path(s.folder("upload_inbox"), [name])
+
+
+def inbox_add(g, s, name, mime, data=b"", vendor="Paper Ease", **kw):
+    """g.add into the inbox, but inside a vendor folder so intake will process it (root files are E101)."""
+    return g.add(name, mime, _vendor_folder(g, s, vendor), data, **kw)
+
+
+def _inbox_files(g, s):
+    """Every non-folder file still in the inbox, at any depth (vendor folders stay; their contents are the uploads)."""
+    files, _ = _intake_collect(g, s.folder("upload_inbox"))
+    return files
+
+
+def _intake_collect(g, folder_id):
+    from estamp.intake import _collect
+    return _collect(g, folder_id)
+
+
 def _stock(g, s, state, amount, n, start=1):
     pages = [samples.paper_page(samples.cert(state, start + i), amount) for i in range(n)]
-    return g.add(f"vendor_{state}_{amount}_{start}.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
+    return inbox_add(g, s, f"vendor_{state}_{amount}_{start}.pdf", PDF, samples.merged(pages))
 
 
 @e2e
@@ -134,13 +160,13 @@ def test_full_flow(env):
     _stock(g, s, "TN", 200, 6)
     _stock(g, s, "GJ", 300, 10)
     _stock(g, s, "UP", 100, 10)
-    g.add("vendor_KA_copy.pdf", PDF, s.folder("upload_inbox"), g.files[ka]["data"])          # exact duplicate upload
+    g.add("vendor_KA_copy.pdf", PDF, _vendor_folder(g, s), g.files[ka]["data"])          # exact duplicate upload
     bad = samples.merged([samples.paper_page(samples.cert("MH", 900), 100),                  # wrong amount for MH
                           samples.paper_page(samples.cert("MH", 1), 200),                    # duplicate cert
                           samples.paper_page("", 200),                                       # no cert
                           samples.paper_page(samples.cert("KL", 1), 200)])                   # inactive state
-    g.add("vendor_mixed_bad.pdf", PDF, s.folder("upload_inbox"), bad)
-    g.add("notes.txt", "text/plain", s.folder("upload_inbox"), b"hello")
+    g.add("vendor_mixed_bad.pdf", PDF, _vendor_folder(g, s), bad)
+    g.add("notes.txt", "text/plain", _vendor_folder(g, s), b"hello")
 
     ctx = _ctx(s, db, g)
     assert run_cycle(ctx)
@@ -173,7 +199,7 @@ def test_full_flow(env):
     assert db.q1("SELECT count(*) n FROM allocations WHERE verified_cert IS DISTINCT FROM cert_no")["n"] == 0
     # every order file left the inbox; the non-PDF and the duplicate upload went to Needs Review
     assert g.list_children(s.folder("orders_incoming")) == []
-    assert g.list_children(s.folder("upload_inbox")) == []
+    assert _inbox_files(g, s) == []
     # dashboard
     ctl = g.sheets_data[s.get("control_sheet_id")]
     assert {"Summary", "Stock", "Needs Review", "Exceptions", "Log"} <= set(ctl)
@@ -330,7 +356,7 @@ def test_crash_recovery_and_dry_run(env):
     ctx = _ctx(s, db, g)
     assert run_cycle(ctx)
     assert db.q1("SELECT count(*) n FROM orders")["n"] == 0 and db.q1("SELECT count(*) n FROM papers")["n"] == 0
-    assert len(g.list_children(s.folder("upload_inbox"))) == 1, "dry run must not move anything"
+    assert len(_inbox_files(g, s)) == 1, "dry run must not move anything"
     kinds = {r[0] for r in ctx.preview}
     assert {"PAPER", "ORDER", "ALLOCATE"} <= kinds
     alloc = [r for r in ctx.preview if r[0] == "ALLOCATE"]
@@ -418,24 +444,35 @@ def test_output_never_appends_a_lan_twice_across_a_crash(env):
 
 
 @e2e
-def test_inbox_accepts_uploaded_folders(env):
-    """Ops drag whole folders (any name, nested) into the inbox – papers inside are processed, folders archived."""
+def test_inbox_routes_by_vendor_folder(env):
+    """D-1: a file's vendor is the top-level inbox subfolder it descends from. Nested subfolders inherit it; a file
+    directly in the inbox root is E101 and is NOT processed or moved; a top-level folder that is not a known vendor
+    is also E101. The vendor_code is stamped on every paper stocked from that upload."""
     from estamp.cycle import run_cycle
     s, db, g = env
     inbox = s.folder("upload_inbox")
-    rj = g.folder("RJ", inbox)
-    batch = g.folder("vendor batch 2", rj)
-    g.add("p1.pdf", PDF, rj, samples.paper_page(samples.cert("RJ", 1), 195))
-    g.add("p2.pdf", PDF, batch, samples.merged([samples.paper_page(samples.cert("RJ", 2), 195),
-                                                samples.paper_page(samples.cert("RJ", 3), 195)]))
-    g.add("loose.pdf", PDF, inbox, samples.paper_page(samples.cert("MH", 1), 200))
+    pe = g.folder("Paper Ease", inbox)                 # recognised by vendor_name
+    nested = g.folder("batch 2", pe)                   # nested → inherits Paper Ease
+    g.add("p1.pdf", PDF, pe, samples.paper_page(samples.cert("RJ", 1), 195))
+    g.add("p2.pdf", PDF, nested, samples.merged([samples.paper_page(samples.cert("RJ", 2), 195),
+                                                 samples.paper_page(samples.cert("RJ", 3), 195)]))
+    agr = g.folder("AGREXP", inbox)                    # recognised by vendor_code
+    g.add("p3.pdf", PDF, agr, samples.paper_page(samples.cert("MH", 1), 200))
+    unknown = g.folder("Random Vendor", inbox)         # not a known vendor → E101
+    uid = g.add("rogue.pdf", PDF, unknown, samples.paper_page(samples.cert("MH", 2), 200))
+    loose = g.add("loose.pdf", PDF, inbox, samples.paper_page(samples.cert("MH", 3), 200))  # root → E101
+
     assert run_cycle(_ctx(s, db, g))
-    stocked = {r["cert_no"]: r["state"] for r in db.q("SELECT cert_no, state FROM papers WHERE status='AVAILABLE'")}
-    assert stocked == {samples.cert("RJ", 1): "RJ", samples.cert("RJ", 2): "RJ", samples.cert("RJ", 3): "RJ",
-                       samples.cert("MH", 1): "MH"}, stocked
-    assert g.list_children(inbox) == [], "inbox should be empty – files processed, folders archived"
-    paths = [g.path_of(f["id"]) for f in g.files.values() if f["name"] == "RJ"]
-    assert paths and paths[0].startswith("upload_archive/"), paths
+
+    stocked = {r["cert_no"]: r["vendor_code"] for r in db.q("SELECT cert_no, vendor_code FROM papers WHERE status='AVAILABLE'")}
+    assert stocked == {samples.cert("RJ", 1): "PAPEREASE", samples.cert("RJ", 2): "PAPEREASE",
+                       samples.cert("RJ", 3): "PAPEREASE", samples.cert("MH", 1): "AGREXP"}, stocked
+    # E101 files are left exactly where they are – never stocked, never moved.
+    assert g.files[loose]["parents"] == [inbox], "root file must not move"
+    assert g.files[uid]["parents"] == [unknown], "unknown-vendor file must not move"
+    assert db.q1("SELECT count(*) n FROM papers WHERE cert_no IN (%s,%s)",
+                 (samples.cert("MH", 2), samples.cert("MH", 3)))["n"] == 0
+    assert "E101" in " ".join(e["details"] for e in db.q("SELECT details FROM events WHERE level='WARN'"))
 
 
 @e2e
@@ -497,7 +534,7 @@ def test_ocr_failure_keeps_the_whole_upload_in_the_inbox(env):
     up = _stock(g, s, "MH", 200, 3)
     assert run_cycle(Ctx(s, db, g, ocr=FakeOcr(fail={"vendor_MH_200_1.pdf_p2": RuntimeError("OCR API HTTP 503")})))
     assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
-    assert [f["id"] for f in g.list_children(s.folder("upload_inbox"))] == [up]
+    assert [f["id"] for f in _inbox_files(g, s)] == [up]
     assert db.q1("SELECT status FROM uploads")["status"] == "PROCESSING"   # still retryable next cycle
 
 
@@ -512,7 +549,7 @@ def test_ocr_failure_escalates_to_needs_review_after_the_give_up_window(env):
     ocr = FakeOcr(fail={"vendor_MH_200_1.pdf_p2": RuntimeError("OCR API HTTP 503")})
     # First cycle: failure, upload stays in the inbox, first-failure time recorded as now().
     assert run_cycle(Ctx(s, db, g, ocr=ocr))
-    assert [f["id"] for f in g.list_children(s.folder("upload_inbox"))] == [up]
+    assert [f["id"] for f in _inbox_files(g, s)] == [up]
     # Simulate the give-up window having elapsed since the first failure.
     give_up = int(s.get("intake.ocr_fail_give_up_minutes", 30))
     db.q("UPDATE uploads SET created_at = now() - make_interval(mins => %s)", (give_up + 1,))
@@ -520,7 +557,7 @@ def test_ocr_failure_escalates_to_needs_review_after_the_give_up_window(env):
     assert db.q1("SELECT count(*) n FROM papers")["n"] == 0, "whole upload to review, never stocked page by page"
     assert db.q1("SELECT status FROM uploads")["status"] == "REVIEW"
     assert "OCR" in (db.q1("SELECT notes FROM uploads")["notes"] or "")
-    assert g.list_children(s.folder("upload_inbox")) == [], "upload left the inbox"
+    assert _inbox_files(g, s) == [], "upload left the inbox"
     assert db.q1("SELECT count(*) n FROM events WHERE action='Needs review' AND level='WARN'")["n"] >= 1
 
 
@@ -534,7 +571,7 @@ def test_ocr_auth_failure_stops_the_upload_loudly_without_retrying(env):
     ocr = FakeOcr(fail={"vendor_MH_200_1.pdf_p1": ApiAuthError("refused (HTTP 401)")})
     assert run_cycle(Ctx(s, db, g, ocr=ocr))
     assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
-    assert [f["id"] for f in g.list_children(s.folder("upload_inbox"))] == [up]
+    assert [f["id"] for f in _inbox_files(g, s)] == [up]
     assert db.q1("SELECT count(*) n FROM events WHERE level='ERROR' AND details ILIKE '%401%'")["n"] >= 1
 
 
@@ -543,7 +580,7 @@ def test_non_pdf_upload_event_carries_the_error_code(env):
     """A non-PDF upload is routed to Needs Review/Not PDF and its ops event carries the E102 code."""
     from estamp.cycle import run_cycle
     s, db, g = env
-    g.add("notes.txt", "text/plain", s.folder("upload_inbox"), b"hello")
+    g.add("notes.txt", "text/plain", _vendor_folder(g, s), b"hello")
     assert run_cycle(_ctx(s, db, g))
     assert db.q1("SELECT count(*) n FROM events WHERE level='WARN' AND details LIKE '%E102%'")["n"] >= 1
 
@@ -787,7 +824,7 @@ def test_intake_via_split_api_keeps_front_and_back_together(env, monkeypatch):
         return _Resp(200, buf.getvalue())
 
     monkeypatch.setattr(ocr_split.requests, "post", fake_api)
-    g.add("scan.pdf", PDF, s.folder("upload_inbox"), samples.merged([
+    g.add("scan.pdf", PDF, _vendor_folder(g, s), samples.merged([
         samples.scanned_front("RAJASTHAN", "S 254201", 195), samples.scanned_back("RAJASTHAN"),
         samples.scanned_front("RAJASTHAN", "S 254202", 195), samples.scanned_back("RAJASTHAN")]))
     assert run_cycle(_ctx(s, db, g))
@@ -803,7 +840,7 @@ def test_traditional_page_with_a_text_layer_is_never_stocked_as_one_page(env):
     the whole file goes to Needs Review (E105) – the RJ front is never stocked as a 1-page paper without its back."""
     from estamp.cycle import run_cycle
     s, db, g = env
-    g.add("searchable_scan.pdf", PDF, s.folder("upload_inbox"), samples.merged([
+    g.add("searchable_scan.pdf", PDF, _vendor_folder(g, s), samples.merged([
         samples.paper_page(samples.cert("MH", 1), 200),
         samples.physical_front("RAJASTHAN", "S 254201", 195), samples.physical_back("RAJASTHAN")]))
     assert run_cycle(_ctx(s, db, g))
@@ -916,7 +953,7 @@ def test_physical_papers_front_and_back(env):
     pages = []
     for serial in ["S 254201", "S 254202", "AB 100003", "(serial smudged)"]:
         pages += [samples.scanned_front("RAJASTHAN", serial, 195), samples.scanned_back("RAJASTHAN")]
-    g.add("vendor_scan.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
+    g.add("vendor_scan.pdf", PDF, _vendor_folder(g, s), samples.merged(pages))
     g.add("orders", GSHEET, s.folder("orders_incoming"),
           tabs={"x": [["LOAN NO", "STATE"], ["RJLAN0001", "RAJASTHAN"], ["RJLAN0002", "RAJASTHAN"]]})
     ctx = _ctx(s, db, g)
@@ -949,7 +986,7 @@ def test_mixed_upload_goes_whole_to_needs_review(env):
     from estamp.cycle import run_cycle
     from fake_apis import FakeOcr, FakeSplitter
     s, db, g = env
-    g.add("mixed.pdf", PDF, s.folder("upload_inbox"), samples.merged([
+    g.add("mixed.pdf", PDF, _vendor_folder(g, s), samples.merged([
         samples.paper_page(samples.cert("MH", 1), 200),
         samples.scanned_front("RAJASTHAN", "S 254201", 195), samples.scanned_back("RAJASTHAN")]))
     splitter = FakeSplitter()
@@ -965,7 +1002,7 @@ def test_traditional_odd_page_count_goes_whole_to_review_before_split(env):
     from estamp.cycle import run_cycle
     from fake_apis import FakeOcr, FakeSplitter
     s, db, g = env
-    g.add("odd.pdf", PDF, s.folder("upload_inbox"), samples.merged([
+    g.add("odd.pdf", PDF, _vendor_folder(g, s), samples.merged([
         samples.scanned_front("RAJASTHAN", "S 254201", 195), samples.scanned_back("RAJASTHAN"),
         samples.scanned_front("RAJASTHAN", "S 254202", 195)]))
     splitter = FakeSplitter()
@@ -983,7 +1020,7 @@ def test_traditional_upload_is_split_in_pairs_and_each_page_ocrd(env):
     pages = []
     for serial in ["S 254201", "S 254202"]:
         pages += [samples.scanned_front("RAJASTHAN", serial, 195), samples.scanned_back("RAJASTHAN")]
-    g.add("pairs.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
+    g.add("pairs.pdf", PDF, _vendor_folder(g, s), samples.merged(pages))
     ocr, splitter = FakeOcr(), FakeSplitter()
     assert run_cycle(Ctx(s, db, g, ocr=ocr, splitter=splitter))
     assert splitter.calls == [("pairs.pdf", 2)]
@@ -1001,7 +1038,7 @@ def test_missing_back_page_sends_that_pair_and_all_later_pairs_to_review(env):
     s, db, g = env
     f = lambda n: samples.scanned_front("RAJASTHAN", f"S 25420{n}", 195)
     b = lambda: samples.scanned_back("RAJASTHAN")
-    g.add("broken.pdf", PDF, s.folder("upload_inbox"), samples.merged([f(1), b(), f(2), f(3), b(), f(4)]))
+    g.add("broken.pdf", PDF, _vendor_folder(g, s), samples.merged([f(1), b(), f(2), f(3), b(), f(4)]))
     assert run_cycle(_ctx(s, db, g))
     rows = db.q("SELECT page_from, page_to, status, notes FROM papers ORDER BY page_from")
     assert [(r["page_from"], r["page_to"], r["status"]) for r in rows] == [
@@ -1018,7 +1055,7 @@ def test_serial_the_api_returns_for_a_back_page_breaks_the_pairing(env):
     pages = []
     for n in (1, 2):
         pages += [samples.scanned_front("RAJASTHAN", f"S 25420{n}", 195), samples.scanned_back("RAJASTHAN")]
-    g.add("api_cert.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
+    g.add("api_cert.pdf", PDF, _vendor_folder(g, s), samples.merged(pages))
     ocr = FakeOcr(certs={"api_cert.pdf_p4": "S 254209"})      # a serial on a back page
     assert run_cycle(Ctx(s, db, g, ocr=ocr))
     rows = db.q("SELECT page_from, status, notes FROM papers ORDER BY page_from")
@@ -1035,11 +1072,11 @@ def test_traditional_parts_must_be_two_pages(env):
     pages = []
     for n in (1, 2):
         pages += [samples.scanned_front("RAJASTHAN", f"S 25420{n}", 195), samples.scanned_back("RAJASTHAN")]
-    g.add("bad_split.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
+    g.add("bad_split.pdf", PDF, _vendor_folder(g, s), samples.merged(pages))
     ctx = Ctx(s, db, g, ocr=FakeOcr(), splitter=FakeSplitter(force_size=4))
     run_cycle(ctx)
     assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
-    assert any(f["name"] == "bad_split.pdf" for f in g.list_children(s.folder("upload_inbox")))   # retried later
+    assert any(f["name"] == "bad_split.pdf" for f in _inbox_files(g, s))   # retried later
     assert any("not 2 page(s) each" in a for a in ctx.alerts), ctx.alerts
 
 
@@ -1048,7 +1085,7 @@ def test_digital_page_with_two_ids_goes_alone_to_review(env):
     from estamp.cycle import run_cycle
     s, db, g = env
     two = f"{samples.cert('MH', 1)} {samples.cert('MH', 2)}"
-    g.add("two_ids.pdf", PDF, s.folder("upload_inbox"), samples.merged([
+    g.add("two_ids.pdf", PDF, _vendor_folder(g, s), samples.merged([
         samples.paper_page(two, 200), samples.paper_page(samples.cert("MH", 3), 200)]))
     assert run_cycle(_ctx(s, db, g))
     rows = db.q("SELECT page_from, status, notes FROM papers ORDER BY page_from")
@@ -1066,7 +1103,7 @@ def test_crash_mid_upload_then_rerun_stocks_nothing_twice(env, monkeypatch):
     pages = []
     for n in (1, 2, 3):
         pages += [samples.scanned_front("RAJASTHAN", f"S 25420{n}", 195), samples.scanned_back("RAJASTHAN")]
-    g.add("crash.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
+    g.add("crash.pdf", PDF, _vendor_folder(g, s), samples.merged(pages))
     real = intake._stock_unit
 
     def crashing(ctx, up, name, u):
@@ -1077,12 +1114,12 @@ def test_crash_mid_upload_then_rerun_stocks_nothing_twice(env, monkeypatch):
     monkeypatch.setattr(intake, "_stock_unit", crashing)
     run_cycle(_ctx(s, db, g))
     assert db.q1("SELECT count(*) n FROM papers WHERE page_from=3")["n"] == 0
-    assert any(f["name"] == "crash.pdf" for f in g.list_children(s.folder("upload_inbox")))
+    assert any(f["name"] == "crash.pdf" for f in _inbox_files(g, s))
     monkeypatch.setattr(intake, "_stock_unit", real)
     assert run_cycle(_ctx(s, db, g))
     rows = db.q("SELECT cert_no, page_from FROM papers ORDER BY page_from")
     assert [(r["cert_no"], r["page_from"]) for r in rows] == [("RJ-S254201", 1), ("RJ-S254202", 3), ("RJ-S254203", 5)]
-    assert not g.list_children(s.folder("upload_inbox"))
+    assert not _inbox_files(g, s)
 
 
 # ------------------------------------------------------------ OCR API path (A-05 + ADR-0006), fake API from fields
@@ -1107,7 +1144,7 @@ def test_api_estamp_without_text_layer_is_stocked_and_issued(env):
     from estamp.cycle import run_cycle
     from fake_apis import FakeApiOcr
     s, db, g = env
-    g.add("hp.pdf", PDF, s.folder("upload_inbox"), samples.merged([_hp(1), _hp(2)]))
+    g.add("hp.pdf", PDF, _vendor_folder(g, s), samples.merged([_hp(1), _hp(2)]))
     g.add("orders", GSHEET, s.folder("orders_incoming"), tabs={"x": [samples.H, ["1", "LAN-HP1", "c", "b", "HP", "100"]]})
     ocr = FakeApiOcr()
     assert run_cycle(Ctx(s, db, g, ocr=ocr))
@@ -1126,9 +1163,9 @@ def test_api_traditional_pairs_and_one_page_state(env):
     from estamp.cycle import run_cycle
     from fake_apis import FakeApiOcr
     s, db, g = env
-    g.add("mp.pdf", PDF, s.folder("upload_inbox"),
+    g.add("mp.pdf", PDF, _vendor_folder(g, s),
           samples.merged([_mp_front("DH 318891"), _mp_back(), _mp_front("DH 318892"), _mp_back()]))
-    g.add("hr.pdf", PDF, s.folder("upload_inbox"), samples.merged([
+    g.add("hr.pdf", PDF, _vendor_folder(g, s), samples.merged([
         samples.api_page(certification_no=f"G1K2026A99{n}", state_code="HR", stamp_duty_amount="100") for n in (1, 2, 3)]))
     assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr()))
     got = {r["cert_no"]: (r["page_from"], r["page_to"], r["status"]) for r in db.q("SELECT * FROM papers")}
@@ -1143,7 +1180,7 @@ def test_api_file_whose_pages_disagree_goes_whole_to_review(env):
     from estamp.cycle import run_cycle
     from fake_apis import FakeApiOcr, FakeSplitter
     s, db, g = env
-    g.add("mixed_api.pdf", PDF, s.folder("upload_inbox"), samples.merged([_hp(1), _mp_front("DH 318891"), _mp_back()]))
+    g.add("mixed_api.pdf", PDF, _vendor_folder(g, s), samples.merged([_hp(1), _mp_front("DH 318891"), _mp_back()]))
     splitter = FakeSplitter()
     assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr(), splitter=splitter))
     status, notes, path = _upload_review(db, g, s, "mixed_api.pdf")
@@ -1156,7 +1193,7 @@ def test_api_upload_with_no_readable_id_at_all_goes_whole_to_review(env):
     from estamp.cycle import run_cycle
     from fake_apis import FakeApiOcr
     s, db, g = env
-    g.add("blank.pdf", PDF, s.folder("upload_inbox"), samples.merged([_mp_back(), _mp_back()]))
+    g.add("blank.pdf", PDF, _vendor_folder(g, s), samples.merged([_mp_back(), _mp_back()]))
     assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr()))
     status, notes, _ = _upload_review(db, g, s, "blank.pdf")
     assert status == "REVIEW" and "E105" in notes
@@ -1168,11 +1205,11 @@ def test_api_page_1_ocr_failure_retries_the_whole_upload(env):
     from estamp.cycle import run_cycle
     from fake_apis import FakeApiOcr
     s, db, g = env
-    g.add("hp_fail.pdf", PDF, s.folder("upload_inbox"), samples.merged([_hp(1), _hp(2)]))
+    g.add("hp_fail.pdf", PDF, _vendor_folder(g, s), samples.merged([_hp(1), _hp(2)]))
     ctx = Ctx(s, db, g, ocr=FakeApiOcr(fail={"hp_fail.pdf_p1": RuntimeError("OCR API HTTP 503: down")}))
     run_cycle(ctx)
     assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
-    assert any(f["name"] == "hp_fail.pdf" for f in g.list_children(s.folder("upload_inbox")))
+    assert any(f["name"] == "hp_fail.pdf" for f in _inbox_files(g, s))
     assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr()))
     assert db.q1("SELECT count(*) n FROM papers WHERE status='AVAILABLE'")["n"] == 2
 
@@ -1185,7 +1222,7 @@ def test_api_recheck_review_uses_the_stored_fields(env, monkeypatch):
     from estamp.cycle import run_cycle
     from fake_apis import FakeApiOcr
     s, db, g = env
-    g.add("hr101.pdf", PDF, s.folder("upload_inbox"),
+    g.add("hr101.pdf", PDF, _vendor_folder(g, s),
           samples.api_page(certification_no="G1K2026A991", state_code="HR", stamp_duty_amount="101"))
     assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr()))
     p = db.q1("SELECT * FROM papers")
@@ -1203,7 +1240,7 @@ def test_estamps_never_grouped(env):
     goes to Needs Review (E105) – pages are never guessed into pairs."""
     from estamp.cycle import run_cycle
     s, db, g = env
-    g.add("ka_estamps.pdf", PDF, s.folder("upload_inbox"), samples.merged([samples.estamp_no_cert() for _ in range(4)]))
+    g.add("ka_estamps.pdf", PDF, _vendor_folder(g, s), samples.merged([samples.estamp_no_cert() for _ in range(4)]))
     assert run_cycle(_ctx(s, db, g))
     status, notes, _ = _upload_review(db, g, s, "ka_estamps.pdf")
     assert status == "REVIEW" and "E105" in notes
@@ -1410,7 +1447,7 @@ def test_second_ocr_attempt_rescues_a_paper_that_failed_the_first_reading(env):
     from estamp.cycle import run_cycle
     from fake_apis import ScriptedOcr
     s, db, g = env
-    g.add("retry.pdf", PDF, s.folder("upload_inbox"), samples.api_page(state_code="HP"))
+    g.add("retry.pdf", PDF, _vendor_folder(g, s), samples.api_page(state_code="HP"))
     # 1st reading: valid HP cert (type decides) but a bad amount → fails checks; retry: clean HP ₹100.
     ocr = ScriptedOcr(script={"retry.pdf_p1": [_hp_fields(amount="999")]}, default=_hp_fields(amount="100"))
     assert run_cycle(Ctx(s, db, g, ocr=ocr))
@@ -1427,7 +1464,7 @@ def test_paper_failing_both_ocr_attempts_goes_to_needs_review(env):
     from estamp.cycle import run_cycle
     from fake_apis import ScriptedOcr
     s, db, g = env
-    g.add("retry2.pdf", PDF, s.folder("upload_inbox"), samples.api_page(state_code="HP"))
+    g.add("retry2.pdf", PDF, _vendor_folder(g, s), samples.api_page(state_code="HP"))
     ocr = ScriptedOcr(script={}, default=_hp_fields(amount="999"))   # valid cert, bad amount both times
     run_cycle(Ctx(s, db, g, ocr=ocr))
     p = db.q1("SELECT * FROM papers")

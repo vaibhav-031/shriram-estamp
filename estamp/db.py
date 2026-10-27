@@ -109,6 +109,7 @@ ALTER TABLE papers ADD COLUMN IF NOT EXISTS api_denomination INT;
 ALTER TABLE papers ADD COLUMN IF NOT EXISTS api_state TEXT;
 ALTER TABLE papers ADD COLUMN IF NOT EXISTS ops_edited_by TEXT;
 ALTER TABLE papers ADD COLUMN IF NOT EXISTS ops_edited_at TIMESTAMPTZ;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS vendor_code TEXT;   -- D-1: which inbox vendor folder the upload came from
 CREATE INDEX IF NOT EXISTS alloc_unwritten_idx ON allocations(alloc_date, state, denomination) WHERE NOT output_written;
 
 CREATE TABLE IF NOT EXISTS output_sheets (

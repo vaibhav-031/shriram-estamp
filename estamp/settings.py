@@ -33,10 +33,18 @@ class StateCfg:
 
 
 @dataclass
+class VendorCfg:
+    code: str    # PAPEREASE
+    name: str    # Paper Ease (the Upload Inbox subfolder ops drop files into)
+    active: bool  # inactive vendors get no auto-created inbox folder
+
+
+@dataclass
 class Settings:
     raw: dict[str, Any]
     base_dir: Path
     states: dict[str, StateCfg] = field(default_factory=dict)
+    vendors: dict[str, VendorCfg] = field(default_factory=dict)
 
     # ---- convenience accessors -------------------------------------------------------
     def get(self, dotted: str, default: Any = None) -> Any:
@@ -102,6 +110,21 @@ def load_states(path: Path) -> dict[str, StateCfg]:
     return states
 
 
+def load_vendors(path: Path) -> dict[str, VendorCfg]:
+    vendors: dict[str, VendorCfg] = {}
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        for row in csv.DictReader(fh):
+            code = row["vendor_code"].strip().upper()
+            if not code:
+                continue
+            vendors[code] = VendorCfg(
+                code=code,
+                name=row["vendor_name"].strip(),
+                active=row.get("active", "yes").strip().lower() in ("yes", "y", "true", "1"),
+            )
+    return vendors
+
+
 def load_settings(config_path: str | os.PathLike = "config.yaml") -> Settings:
     config_path = Path(config_path).resolve()
     base = config_path.parent
@@ -110,4 +133,5 @@ def load_settings(config_path: str | os.PathLike = "config.yaml") -> Settings:
         raw = yaml.safe_load(fh) or {}
     s = Settings(raw=raw, base_dir=base)
     s.states = load_states(s.path("state_config_file"))
+    s.vendors = load_vendors(s.path("vendors_file"))
     return s
