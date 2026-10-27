@@ -10,12 +10,12 @@
 #   scripts/with-test-db.sh               # run the suite 5× (the CLAUDE.md gate)
 #   scripts/with-test-db.sh <cmd...>      # run <cmd> with ESTAMP_TEST_DB_URL set
 #
-# ponytail: one fixed-name container on one fixed port; if you ever need two
-# runs at once, pass TEST_DB_PORT=<n> and set a unique NAME.
+# For parallel runs (e.g. several worktree engineers at once) give each a unique
+# container + port: TEST_DB_NAME=estamp-eng1 TEST_DB_PORT=55441 scripts/with-test-db.sh ...
 set -euo pipefail
 
 PORT="${TEST_DB_PORT:-55432}"
-NAME="estamp-test-db"
+NAME="${TEST_DB_NAME:-estamp-test-db}"   # override both for parallel runs (e.g. worktree engineers)
 IMAGE="postgres:16-alpine"
 
 cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
