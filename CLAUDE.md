@@ -44,7 +44,9 @@ See `README.md` for the flow and `estamp/cycle.py` for the order of steps in one
   unit-testable.
 - Tunables (patterns, markers, amounts) belong in `config.yaml` / `state_config.csv`, not hard-coded.
 - Every step of a cycle must be safe to re-run; anything uncertain goes to ERROR / Needs Review for a human,
-  never silently retried or reassigned.
+  never silently retried or reassigned – with exactly two logged exceptions (`docs/adr/0001-limited-automatic-recovery.md`):
+  **re-map once** after a failed issue check (second failure on the same LAN → ERROR), and **self-heal stuck issues**
+  from the file's real Drive location (anywhere unexpected → ERROR). Add no other automatic retry/reassign without a new ADR.
 
 ## Agent skills
 
