@@ -1,8 +1,8 @@
 # Shriram eStamp – common tasks. Everything runs in the uv-managed .venv
 # (`uv sync` creates it, `uv run` uses it – no manual activate needed).
 .DEFAULT_GOAL := help
-.PHONY: help setup dev lock upgrade login init-db check-setup status reconcile \
-        recheck-review run-dry run-once run test test5 clean
+.PHONY: help setup dev dev-safe lock upgrade login init-db check-setup status reconcile \
+        recheck-review run-dry run-once run stress stress-tight stress-volume test test5 clean
 
 help: ## Show this help, grouped by category
 	@awk 'BEGIN {FS = ":.*## "} \
@@ -36,6 +36,9 @@ check-setup: ## Verify DB, sign-in, folders, control sheet, config, APIs, alerts
 dev: ## Dev loop: repeat a dry-run cycle every 5s (safe, nothing written)
 	@while true; do uv run python -m estamp run-once --dry-run || break; sleep 5; done
 
+dev-safe: ## One dry-run cycle on the scratch config (config.dryrun.yaml) – the mandated dev workflow
+	uv run python -m estamp run-once --config config.dryrun.yaml --dry-run
+
 run-dry: ## One cycle, dry run – nothing moved or written (safe)
 	uv run python -m estamp run-once --dry-run
 
@@ -54,6 +57,16 @@ reconcile: ## Report Inventory the ledger doesn't know + LANs stuck in ERROR
 
 recheck-review: ## Re-run checks on Needs Review papers after a config fix (no re-upload)
 	uv run python -m estamp recheck-review
+
+##@ Eval (LIVE – issues real certificates; test/pre-prod only)
+stress: ## Full stress-eval loop (build assets, drive cycles, verify, report)
+	uv run python evals/stress_eval.py
+
+stress-tight: ## Minimal eval: KA, 2 LANs/2 papers, 1 cycle, reset first
+	uv run python evals/stress_eval.py --scenario orders --states KA --lans 2 --papers 2 --reset --live --max-cycles 1
+
+stress-volume: ## Volume eval: 10 LANs/8 papers, 3 cycles, reset first
+	uv run python evals/stress_eval.py --lans 10 --papers 8 --reset --live --max-cycles 3
 
 ##@ Test
 test: ## Run the test suite once

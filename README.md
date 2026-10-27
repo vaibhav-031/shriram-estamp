@@ -1,5 +1,7 @@
 # Shriram eStamp – Python service
 
+> **Changing the code?** Start with [`ARCHITECTURE.md`](ARCHITECTURE.md) – the cycle and the module map. This README is for operators.
+
 Ops upload vendor PDFs to one Drive folder. Shriram's state-wise LAN sheets go in another.
 The service splits, OCRs, checks and files every paper automatically, matches papers to LANs,
 and writes the PDFs + sheets Shriram receives. Postgres is the ledger; a Google Sheet is the dashboard.
@@ -146,3 +148,22 @@ touch `shriram_estamp` or real Drive folders.
 Run the same code on a server or in Docker with `google.auth: service_account`. Service accounts
 have no My Drive storage, so the folders must live in a **Shared Drive** that the service account can
 edit (and set `folders.ocr_temp` to a Shared Drive folder).
+
+## 8. All the docs
+
+| Doc | Read it when |
+|---|---|
+| **this README** | you operate the service (setup, daily use) |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | you change the code – the cycle + module map |
+| [`GLOSSARY.md`](GLOSSARY.md) | you need the exact word for a thing (paper, LAN, cert…) |
+| [`HANDOFF.md`](HANDOFF.md) | you're picking the project up – status, what's built, what isn't |
+| [`CLAUDE.md`](CLAUDE.md) | before any change – safety rules + the required workflow |
+| [`docs/adr/`](docs/adr/) | you wonder *why* a non-obvious decision was made |
+| [`docs/issues/`](docs/issues/) | you want the spec/tickets behind a feature (grouped by phase) |
+| [`docs/agents/`](docs/agents/) | you run the issue tracker, triage labels, or domain docs |
+| [`docs/api-samples/`](docs/api-samples/) | you touch the in-house OCR/split API adapters |
+| [`evals/DESIGN.md`](evals/DESIGN.md) | you work on the stress-test eval |
+| [`docs/AUDIT.md`](docs/AUDIT.md) | you need the production-readiness findings |
+
+Code is documented in place: every `estamp/*.py` opens with a docstring explaining its role,
+and `estamp/errors.py` is the catalogue of every message ops see.

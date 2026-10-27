@@ -62,9 +62,19 @@ and/or `intake.cert_patterns` don't recognize it) — classify it **code vs docu
 one real page (`estamp.ocr_split._ocr_zoop`) and checking what `certification_no`/`state_code` come
 back. For a genuine pipeline bug, switch to the `diagnosing-bugs` skill before changing code.
 
-## Known gaps (as of the last run)
+## Known findings & RCA
 
-- **Manipur (MN)**: cert reads `IN-LF…` (the 2 letters aren't the state); pipeline derives state
-  from those letters → rejected. Fix = derive state from `state_code`/UDR, not the cert prefix.
-- **Kerala (KL)**: non-SHCIL `KL…` format; OCR + `cert_patterns` don't read it (inactive, latent).
-- **Traditional (BR/TS/SK)**: need front+back sample PDFs; current templates are fronts only.
+Full root-cause analysis, OCR-probe evidence, exact code locations, and the change to make for
+each finding is in **`evals/FINDINGS.md`** — read it before touching the pipeline. Index:
+
+- **Manipur (MN)** — cert reads `IN-LF…` (the 2 letters aren't the state); `id_from_fields`
+  (`extract.py:307-310`) trusts the cert prefix for state → rejected. Fix: derive state from
+  `state_code`/UDR, not the cert prefix. Also the MN template mapping row is wrong (`IN-MN14847277`
+  ≠ the PDF's `IN-LF…`).
+- **Kerala (KL)** — non-SHCIL `KL…` format; OCR config + `cert_patterns`/`estamp_ref_patterns`
+  don't read it. Inactive, latent — fix both layers before activating.
+- **Traditional (BR/TS/SK)** — pipeline wants 2-page front+back (`extract.py:365-370`,
+  `pages_per_paper`); templates are fronts-only. Provide paired PDFs, or set `pages_per_paper=1`
+  in `state_config.csv` if real papers are single-page (ADR-worthy).
+
+Update `evals/FINDINGS.md` whenever a run surfaces something new.
