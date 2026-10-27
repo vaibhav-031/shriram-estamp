@@ -270,7 +270,7 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
         reason = (f"OCR kept failing for over {give_up} min ({e}). Moved to Needs Review as a whole – nothing was "
                   "stocked. Check the API / the file, then upload it again as a new file.")
         db.upload_finish(up["id"], "REVIEW", 0, reason)
-        g.move_rename(f["id"], g.folder_path(s.folder("needs_review"), [today]))
+        g.move_rename(f["id"], g.folder_path(s.folder(NEEDS_REVIEW), [today]))
         ctx.stats.uploads += 1
         ctx.event("WARN", "Needs review", f"'{f['name']}' (whole file): {reason}", ref=f["id"],
                   alert_key=f"intakegiveup|{f['id']}")
