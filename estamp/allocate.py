@@ -29,17 +29,22 @@ class CertMismatch(RuntimeError):
     pass
 
 
-def verify_issued(ctx: Ctx, file_id: str, expected: str, name: str) -> tuple[str, str]:
-    """OCR every page of the issued file; return (id found, via). Raises CertMismatch unless it is exactly `expected`."""
+def verify_issued(ctx: Ctx, file_id: str, allowed: list[str], name: str) -> tuple[str, str]:
+    """OCR every page of the issued file; return (the allowed id the PDF showed, via). `allowed` holds the values the
+    PDF may legitimately show: the ledger cert_no and – when ops corrected the paper (E-07) – the API's original
+    printed cert (api_cert_no), which is what the physical PDF still prints. Raises CertMismatch unless the OCR'd set
+    is exactly one of the allowed values."""
+    allowed = [a for a in allowed if a]
     found, via = set(), ""
     for p in _split_local(ctx.google.download(file_id), 1):
         r = ctx.ocr.read(p.data, f"{name}_p{p.page_from}")
         found |= {h.cert for h in ids_in_reading(r.text, r.cert, r.fields, ctx.settings, ctx.matcher, ctx.resolver)}
         via = r.via
-    if found != {expected}:
-        seen = ", ".join(sorted(found)) or "no certificate / serial readable"
-        raise CertMismatch(f"issued PDF shows [{seen}] but ledger expected {expected}")
-    return expected, via
+    for cand in allowed:
+        if found == {cand}:
+            return cand, via
+    seen = ", ".join(sorted(found)) or "no certificate / serial readable"
+    raise CertMismatch(f"issued PDF shows [{seen}] but ledger expected {' or '.join(allowed)}")
 
 
 def label_for(state: str, denom: int) -> str:
@@ -142,7 +147,8 @@ def _allocate_one(ctx: Ctx, order: dict) -> str:
         if s.get("allocation.verify_ocr", True):
             step = "verify OCR on issued PDF"
             try:
-                verified, via = verify_issued(ctx, paper["drive_file_id"], paper["cert_no"], pdf_name)
+                verified, via = verify_issued(ctx, paper["drive_file_id"],
+                                              [paper["cert_no"], paper.get("api_cert_no")], pdf_name)
             except CertMismatch:
                 g.move_rename(paper["drive_file_id"],
                               g.folder_path(s.folder(NEEDS_REVIEW), [d.isoformat(), "Cert mismatch"]),

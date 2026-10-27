@@ -1392,3 +1392,84 @@ def test_corrections_tab_lists_an_edited_paper(env):
     assert tab[0][:4] == ["Paper ID", "API read (cert/state/₹)", "Ops value (cert/state/₹)", "Edited By"]
     row = [r for r in tab[1:] if r[0] == pid][0]
     assert ops_cert in row[2] and row[3] == "ravi" and row[4]
+
+
+# ------------------------------------------------------------ E-06: automatic second OCR attempt before Needs Review
+
+def _hp_fields(cert="IN-HP90000000000055A", amount="100"):
+    from estamp.ocr_split import OcrResult
+    return OcrResult("", "", "fake-api", raw={"fake": True},
+                     fields={"certification_no": {"value": cert}, "state_code": {"value": "HP"},
+                             "state_name": {"value": "HIMACHAL PRADESH"}, "stamp_duty_amount": {"value": amount}})
+
+
+@e2e
+def test_second_ocr_attempt_rescues_a_paper_that_failed_the_first_reading(env):
+    """A paper whose type reads fine but whose FIRST reading fails a check (amount not allowed) is re-OCR'd ONCE; the
+    better second reading passes, so it is STOCKED – exactly two OCR calls for that paper."""
+    from estamp.cycle import run_cycle
+    from fake_apis import ScriptedOcr
+    s, db, g = env
+    g.add("retry.pdf", PDF, s.folder("upload_inbox"), samples.api_page(state_code="HP"))
+    # 1st reading: valid HP cert (type decides) but a bad amount → fails checks; retry: clean HP ₹100.
+    ocr = ScriptedOcr(script={"retry.pdf_p1": [_hp_fields(amount="999")]}, default=_hp_fields(amount="100"))
+    assert run_cycle(Ctx(s, db, g, ocr=ocr))
+    p = db.q1("SELECT * FROM papers")
+    assert p["status"] == "AVAILABLE" and p["cert_no"] == "IN-HP90000000000055A" and p["denomination"] == 100, p
+    # one read in _read_units + one retry in _stock_unit = two calls for this single paper
+    assert len(ocr.calls) == 2, ocr.calls
+
+
+@e2e
+def test_paper_failing_both_ocr_attempts_goes_to_needs_review(env):
+    """When the retry reading also fails the checks, the paper lands in Needs Review (coded E124 for a bad amount) –
+    the API output is still on the row, and no third attempt is made."""
+    from estamp.cycle import run_cycle
+    from fake_apis import ScriptedOcr
+    s, db, g = env
+    g.add("retry2.pdf", PDF, s.folder("upload_inbox"), samples.api_page(state_code="HP"))
+    ocr = ScriptedOcr(script={}, default=_hp_fields(amount="999"))   # valid cert, bad amount both times
+    run_cycle(Ctx(s, db, g, ocr=ocr))
+    p = db.q1("SELECT * FROM papers")
+    assert p["status"] == "NEEDS_REVIEW" and "E124" in (p["notes"] or ""), p
+    assert len(ocr.calls) == 2, ocr.calls
+
+
+# ------------------------------------------------------------ E-08: issue check accepts the ops-corrected ID OR the API original
+
+@e2e
+def test_issue_check_accepts_api_original_cert_when_ops_corrected(env):
+    """E-07 corrected the ledger cert_no; the physical PDF still prints the API's ORIGINAL cert. The issue check must
+    accept EITHER value, so the LAN fulfils and the API original is recorded as the verifying cert."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeApiOcr
+    s, db, g = env
+    api_cert, ledger_cert = "IN-MH90000000000010A", "IN-MH90000000000011A"   # PDF prints api_cert; ledger was corrected
+    fid = g.add("p.pdf", PDF, s.folder("inventory_root"),
+                samples.api_page(certification_no=api_cert, state_code="MH", stamp_duty_amount="200"))
+    db.insert_paper(drive_file_id=fid, file_name="p.pdf", cert_no=ledger_cert, api_cert_no=api_cert,
+                    state="MH", denomination=200, status="AVAILABLE")
+    g.add("orders", GSHEET, s.folder("orders_incoming"),
+          tabs={"x": [samples.H, ["1", "LAN-MH9", "c", "b", "MH", "200"]]})
+    assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr()))
+    a = db.q1("SELECT * FROM allocations")
+    assert a and a["lan"] == "LAN-MH9" and a["cert_no"] == ledger_cert
+    assert a["verified_cert"] == api_cert and a["verified_at"] is not None   # the value the PDF actually showed
+
+
+@e2e
+def test_issue_check_still_errors_when_pdf_matches_neither_value(env):
+    """Safety: an issued PDF showing NEITHER the ledger cert NOR the stored api_cert still mismatches → ERROR."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeApiOcr
+    s, db, g = env
+    fid = g.add("q.pdf", PDF, s.folder("inventory_root"),
+                samples.api_page(certification_no="IN-MH90000000000099A", state_code="MH", stamp_duty_amount="200"))
+    db.insert_paper(drive_file_id=fid, file_name="q.pdf", cert_no="IN-MH90000000000011A",
+                    api_cert_no="IN-MH90000000000010A", state="MH", denomination=200, status="AVAILABLE")
+    g.add("orders", GSHEET, s.folder("orders_incoming"),
+          tabs={"x": [samples.H, ["1", "LAN-MHX", "c", "b", "MH", "200"]]})
+    assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr()))
+    assert db.q1("SELECT count(*) n FROM allocations")["n"] == 0
+    assert db.q1("SELECT status FROM orders")["status"] == "ERROR"
+    assert db.q1("SELECT status FROM papers")["status"] == "ERROR"

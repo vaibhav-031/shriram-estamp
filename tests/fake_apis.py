@@ -47,6 +47,24 @@ class FakeApiOcr:
         return OcrResult("", "", "fake-api", fields=fields, raw={"fake": True, "fields": fields})
 
 
+class ScriptedOcr:
+    """OCR fake with a scripted reply queue. `script` maps an exact page name to a list of OcrResults returned
+    one per call (last one repeats once exhausted); a name not in `script` falls back to the shared `default`.
+    Records every call. Used for E-06: a paper that reads badly the 1st time and cleanly the 2nd."""
+
+    def __init__(self, script: dict[str, list[OcrResult]], default: OcrResult | None = None):
+        self.script = {k: list(v) for k, v in script.items()}
+        self.default = default or OcrResult("", "", "fake", fields={})
+        self.calls: list[str] = []
+        self.lock = threading.Lock()
+
+    def read(self, data: bytes, name: str) -> OcrResult:
+        with self.lock:
+            self.calls.append(name)
+            q = self.script.get(name)
+            return q.pop(0) if q and len(q) > 1 else (q[0] if q else self.default)
+
+
 class FakeSplitter:
     def __init__(self, force_size: int | None = None):
         self.calls: list[tuple[str, int]] = []

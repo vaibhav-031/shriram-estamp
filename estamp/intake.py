@@ -200,6 +200,25 @@ def _analyze(ctx: Ctx, u: Unit):
     return analyze_paper(u.text, u.api_cert, ctx.settings, ctx.matcher, ctx.db.cert_is_live, ctx.resolver)
 
 
+def _reread(ctx: Ctx, up: dict, upload_name: str, u: Unit) -> None:
+    """E-06: one extra OCR call for this single paper, in place. A first reading that SUCCEEDED but failed the checks
+    (no cert, amount not allowed, …) often reads clean on a retry – before the paper lands in Needs Review we re-OCR
+    its own PDF once and adopt the retry's reading. On a traditional (2-page) paper the retry reads the merged PDF as
+    one call, like the live OCR API. A read FAILURE here is left to Needs Review – it is not the A-08 transient-call
+    case (that keeps the WHOLE upload in the inbox and is handled in _read_units before any paper is stocked)."""
+    try:
+        r = ctx.ocr.read(u.data, f"{upload_name}_p{u.page_from}-{u.page_to}#retry")
+    except Exception as e:
+        ctx.event("INFO", "Intake", f"{upload_name} pages {u.page_from}-{u.page_to}: second OCR attempt failed ({e}) "
+                  "– keeping the first reading", ref=up.get("drive_file_id"))
+        return
+    if r.fields is not None:
+        u.fields, u.raw = r.fields, {"fields": r.fields, "responses": {str(u.page_from): r.raw}}
+    else:
+        u.texts, u.api_cert, u.fields, u.raw = [r.text], r.cert, None, None
+    u.via = r.via
+
+
 def _process_upload(ctx: Ctx, f: dict) -> None:
     g, s, db = ctx.google, ctx.settings, ctx.db
     today = ctx.today().isoformat()
@@ -292,6 +311,12 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
 def _stock_unit(ctx: Ctx, up: dict, upload_name: str, u: Unit) -> None:
     g, s, db = ctx.google, ctx.settings, ctx.db
     a = _analyze(ctx, u)
+    # E-06: a paper that READ fine but failed the checks gets ONE automatic second OCR attempt (never an E107 pairing
+    # case – that is a structural decision, not a bad reading). Only the better reading is used; a paper that already
+    # passed is never re-read.
+    if not a.ok and not u.error:
+        _reread(ctx, up, upload_name, u)
+        a = _analyze(ctx, u)
     data = u.data
     review_name = f"{safe_file_name(upload_name.rsplit('.', 1)[0])}__p{u.page_from}-{u.page_to}.pdf"
     fields = dict(upload_id=up["id"], page_from=u.page_from, page_to=u.page_to, cert_no=a.cert or None,
@@ -309,15 +334,21 @@ def _stock_unit(ctx: Ctx, up: dict, upload_name: str, u: Unit) -> None:
             return
         except UniqueViolation:
             a.issues.append(f"duplicate certificate {a.cert} – already in stock")
+            reason = "; ".join(a.issues)
             g.move_rename(file_id, g.folder_path(s.folder(NEEDS_REVIEW), [ctx.today().isoformat()]), review_name)
             db.insert_paper(**fields, drive_file_id=file_id, file_name=review_name, status="NEEDS_REVIEW",
-                            notes="; ".join(a.issues))
+                            notes=reason)
     else:
+        # E-06: these reach Needs Review only AFTER the automatic second OCR attempt also failed. Where an E-code fits
+        # the leftover reason, stamp it so ops see it (E120 no cert, E124 unreadable amount).
+        reason = "; ".join(a.issues)
+        if not a.cert:
+            reason = line("E120", reason)
+        elif "not readable" in reason or "not an allowed amount" in reason:
+            reason = line("E124", reason)
         folder = g.folder_path(s.folder(NEEDS_REVIEW), [ctx.today().isoformat()])
         file_id = g.upload_pdf(folder, review_name, data)
-        db.insert_paper(**fields, drive_file_id=file_id, file_name=review_name, status="NEEDS_REVIEW",
-                        notes="; ".join(a.issues))
+        db.insert_paper(**fields, drive_file_id=file_id, file_name=review_name, status="NEEDS_REVIEW", notes=reason)
     with ctx._lock:
         ctx.stats.papers_review += 1
-    ctx.event("WARN", "Needs review", f"{upload_name} pages {u.page_from}-{u.page_to}: {'; '.join(a.issues)}",
-              ref=file_id)
+    ctx.event("WARN", "Needs review", f"{upload_name} pages {u.page_from}-{u.page_to}: {reason}", ref=file_id)
