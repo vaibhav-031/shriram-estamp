@@ -108,7 +108,7 @@ class Scenario:
 
 
 def build_scenario(settings, papers: list[Paper], states: list[str] | None,
-                   n_lans: int, n_papers: int, scenario: str, dup_upload: bool) -> Scenario:
+                   n_lans: int, n_papers: int, scenario: str, dup_upload: bool, tag: str) -> Scenario:
     by_state: dict[str, list[Paper]] = {}
     for p in papers:
         by_state.setdefault(p.state, []).append(p)
@@ -122,7 +122,9 @@ def build_scenario(settings, papers: list[Paper], states: list[str] | None,
         single = bool(st and len(st.amounts) == 1)
         amount = ps[0].amount
         chosen_papers = ps[:n_papers]
-        chosen_lans = [p.lan for p in ps[:n_lans]]
+        # Unique LAN per run: the Output <LAN>.pdf persists in Drive (no-delete), so re-issuing the same LAN
+        # collides. Any valid paper fulfils any LAN of the same state+amount, so the suffix is harmless.
+        chosen_lans = [f"{p.lan}-E{tag}" for p in ps[:n_lans]]
         groups.append(Group(state=state, amount=amount, papers=chosen_papers, lans=chosen_lans,
                             active=active, single_amount=single))
     build_oracle(groups, scenario)
@@ -288,6 +290,7 @@ def main(argv=None) -> int:
     ap.add_argument("--papers", type=int, default=10, help="papers per state (uploaded)")
     ap.add_argument("--dup-upload", action="store_true", help="also upload an exact-copy duplicate per group")
     ap.add_argument("--max-cycles", type=int, default=5)
+    ap.add_argument("--tag", help="unique suffix for LANs (default: random) so re-runs don't collide in Output")
     ap.add_argument("--reset", action="store_true", help="TRUNCATE the schema before running")
     ap.add_argument("--live", action="store_true", help="run live (overrides dry_run) – issues real certificates")
     ap.add_argument("--config", default=str(ROOT / "config.yaml"))
@@ -307,6 +310,8 @@ def main(argv=None) -> int:
     resolver = StateResolver(settings.states)
 
     try:
+        import uuid
+        tag = args.tag or uuid.uuid4().hex[:6]
         states = [s.strip().upper() for s in args.states.split(",")] if args.states else None
         papers = load_papers(resolver)
         scenarios = ["inbox", "orders"] if args.scenario == "both" else [args.scenario]
@@ -316,8 +321,8 @@ def main(argv=None) -> int:
 
         overall: list[tuple[str, Report]] = []
         for sc_name in scenarios:
-            sc = build_scenario(settings, papers, states, args.lans, args.papers, sc_name, args.dup_upload)
-            print(f"\n=== scenario: {sc_name} ===")
+            sc = build_scenario(settings, papers, states, args.lans, args.papers, sc_name, args.dup_upload, tag)
+            print(f"\n=== scenario: {sc_name} (tag={tag}) ===")
             print_plan(sc)
             print("Uploading assets:")
             upload_assets(google, settings, sc)
