@@ -1685,3 +1685,29 @@ def test_lock_released_even_if_send_raises(env):
     assert db.try_lock(), "advisory lock leaked after _send raised"
     db.release_lock()
     assert db.q1("SELECT count(*) n FROM runs WHERE finished_at IS NOT NULL")["n"] >= 1
+
+
+# ── #9 intake crash between Drive upload and ledger insert must not duplicate the file ───
+@e2e
+def test_intake_crash_between_upload_and_insert_reuses_the_orphan(env, monkeypatch):
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    _stock(g, s, "MH", 200, 1)                       # one paper waiting in the inbox
+
+    def boom(**f):
+        raise RuntimeError("crash after Drive upload, before the ledger insert")
+    monkeypatch.setattr(db, "insert_paper", boom)
+    run_cycle(_ctx(s, db, g))                         # uploads the file, then the insert blows up → orphan
+    monkeypatch.undo()
+
+    # one orphan PDF now sits in Inventory with no ledger row
+    inv = [f for f in g.files.values() if f["mimeType"] == PDF
+           and g.path_of(f["id"]).startswith("inventory_root/MH/200/")]
+    assert len(inv) == 1 and db.q1("SELECT count(*) n FROM papers")["n"] == 0
+
+    run_cycle(_ctx(s, db, g))                         # re-run must adopt the orphan, not upload a second file
+    inv = [f for f in g.files.values() if f["mimeType"] == PDF
+           and g.path_of(f["id"]).startswith("inventory_root/MH/200/")]
+    assert len(inv) == 1, [g.path_of(f["id"]) for f in inv]      # still exactly one physical file
+    assert db.q1("SELECT count(*) n FROM papers WHERE status='AVAILABLE' AND state='MH'")["n"] == 1
+    assert db.q1("SELECT drive_file_id FROM papers")["drive_file_id"] == inv[0]["id"]   # row points at it

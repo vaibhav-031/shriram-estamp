@@ -61,7 +61,13 @@ class FakeGoogle:
         return sorted(out, key=lambda f: f["modifiedTime"])
 
     def child_exists(self, folder_id, name):
-        return any(f["name"] == name for f in self.children(folder_id))
+        return self.child_id(folder_id, name) is not None
+
+    def child_id(self, folder_id, name):
+        for f in self.children(folder_id):
+            if f["name"] == name:
+                return f["id"]
+        return None
 
     def download(self, fid):
         return self.files[fid]["data"]

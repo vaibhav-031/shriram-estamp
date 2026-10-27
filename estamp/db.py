@@ -278,6 +278,11 @@ class DB:
         vals = tuple(Jsonb(v) if isinstance(v, dict) else v for v in f.values())
         return self.q1(f"INSERT INTO papers({cols}) VALUES ({ph}) RETURNING id", vals)["id"]
 
+    def file_is_stocked(self, file_id: str) -> bool:
+        """True if some paper row already points at this Drive file – so intake can tell a reusable orphan
+        (crashed prior upload, no row) from a file that genuinely belongs to a stocked paper (#9)."""
+        return self.q1("SELECT 1 FROM papers WHERE drive_file_id=%s LIMIT 1", (file_id,)) is not None
+
     def update_paper(self, paper_id: int, **f: Any) -> None:
         sets = ", ".join(f"{k}=%s" for k in f)
         vals = tuple(Jsonb(v) if isinstance(v, dict) else v for v in f.values())

@@ -348,6 +348,17 @@ def _process_upload(ctx: Ctx, f: dict, vendor_code: str = "") -> None:
     ctx.event("INFO", "Intake", f"'{f['name']}': {len(units)} paper(s) processed", ref=f["id"])
 
 
+def _reuse_or_upload(ctx: Ctx, folder: str, name: str, data: bytes) -> str:
+    """Return a Drive file id for data at folder/name. If a crashed prior attempt already uploaded this file
+    (same folder+name) and no paper row points at it yet, reuse that orphan instead of creating a duplicate –
+    keeps re-runs idempotent (#9). A file that IS already recorded belongs to a stocked paper, so we upload a
+    fresh one (a genuine duplicate cert then goes to Needs Review with its own file)."""
+    existing = ctx.google.child_id(folder, name)
+    if existing and not ctx.db.file_is_stocked(existing):
+        return existing
+    return ctx.google.upload_pdf(folder, name, data)
+
+
 def _stock_unit(ctx: Ctx, up: dict, upload_name: str, u: Unit, vendor_code: str = "") -> None:
     g, s, db = ctx.google, ctx.settings, ctx.db
     a = _analyze(ctx, u)
@@ -367,7 +378,7 @@ def _stock_unit(ctx: Ctx, up: dict, upload_name: str, u: Unit, vendor_code: str 
     if a.ok:
         folder = g.folder_path(s.folder(INVENTORY_ROOT), [a.state, str(a.amount)])
         name = f"{a.cert}.pdf"
-        file_id = g.upload_pdf(folder, name, data)
+        file_id = _reuse_or_upload(ctx, folder, name, data)
         try:
             db.insert_paper(**fields, drive_file_id=file_id, file_name=name, status="AVAILABLE")
             with ctx._lock:
@@ -388,7 +399,7 @@ def _stock_unit(ctx: Ctx, up: dict, upload_name: str, u: Unit, vendor_code: str 
         elif "not readable" in reason or "not an allowed amount" in reason:
             reason = line("E124", reason)
         folder = g.folder_path(s.folder(NEEDS_REVIEW), [ctx.today().isoformat()])
-        file_id = g.upload_pdf(folder, review_name, data)
+        file_id = _reuse_or_upload(ctx, folder, review_name, data)
         db.insert_paper(**fields, drive_file_id=file_id, file_name=review_name, status="NEEDS_REVIEW", notes=reason)
     with ctx._lock:
         ctx.stats.papers_review += 1

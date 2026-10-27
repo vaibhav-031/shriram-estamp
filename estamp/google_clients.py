@@ -117,10 +117,16 @@ class Google:
                 return out
 
     def child_exists(self, folder_id: str, name: str) -> bool:
+        return self.child_id(folder_id, name) is not None
+
+    def child_id(self, folder_id: str, name: str) -> str | None:
+        """Id of the (first) child with this exact name, or None – lets callers reuse a file a crashed
+        prior run already created instead of uploading a duplicate (#9)."""
         res = self.drive.files().list(
             q=f"'{folder_id}' in parents and name='{_q(name)}' and trashed=false", pageSize=1,
             supportsAllDrives=True, includeItemsFromAllDrives=True, fields="files(id)").execute(num_retries=R)
-        return bool(res.get("files"))
+        files = res.get("files")
+        return files[0]["id"] if files else None
 
     def download(self, file_id: str) -> bytes:
         buf = io.BytesIO()
