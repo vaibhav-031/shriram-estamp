@@ -1,0 +1,10 @@
+# Dev tasks. `mise dev` runs the service loop (a cycle every loop_seconds).
+# NOTE: --live overrides the dry_run lock in config.yaml – it issues real certificates.
+# Only run against a pre-production / test environment.
+[tasks.dev]
+description = "Run the estamp service loop (LIVE – issues real certificates)"
+run = "python -m estamp run --live"
+
+[tasks.stress]
+description = "Run the stress-test eval loop (build assets, drive cycles, verify, report)"
+run = "python evals/stress_eval.py"
