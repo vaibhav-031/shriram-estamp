@@ -49,19 +49,22 @@ class RateLimiter:
             self.paused_until = max(self.paused_until, self.clock() + seconds)
 
     def acquire(self) -> float:
-        """Wait for a slot; return the start time granted."""
-        with self.lock:      # held while waiting, so callers are served in order and never overshoot
-            while True:
+        """Wait for a slot; return the start time granted. The slot is granted atomically under the lock (so the
+        window is never overshot), but the wait/sleep happens WITHOUT the lock – one caller's 429 pause must not
+        freeze every other thread (H-4)."""
+        while True:
+            with self.lock:
                 now = self.clock()
-                if now < self.paused_until:
-                    self.sleep(self.paused_until - now)
-                    continue
-                while self.starts and now - self.starts[0] >= self.window:
-                    self.starts.popleft()
-                if len(self.starts) < self.max_calls:
-                    self.starts.append(now)
-                    return now
-                self.sleep(self.window - (now - self.starts[0]))
+                if now >= self.paused_until:
+                    while self.starts and now - self.starts[0] >= self.window:
+                        self.starts.popleft()
+                    if len(self.starts) < self.max_calls:
+                        self.starts.append(now)
+                        return now
+                    wait = self.window - (now - self.starts[0])
+                else:
+                    wait = self.paused_until - now
+            self.sleep(wait)      # lock released – concurrent callers wait in parallel, then re-check
 
 
 def _retry_after(res, default: float) -> float:
