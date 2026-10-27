@@ -22,6 +22,20 @@ log = logging.getLogger("estamp")
 _LEVELS = ("ERROR", "WARN", "INFO")
 
 
+def alert_channels(settings: Settings) -> list[str]:
+    """Which alert delivery channels are actually configured. Empty means every alert would go
+    nowhere – the whole "tell ops on Slack when we're stuck" guarantee is silently dead (#2), so
+    callers must fail loud on []. Slack needs its webhook env set; email needs SMTP host + at least
+    one recipient."""
+    out = []
+    if settings.env("alerts.slack_webhook_env"):
+        out.append("slack")
+    smtp = settings.get("alerts.smtp") or {}
+    if smtp.get("host") and smtp.get("to"):
+        out.append("email")
+    return out
+
+
 def slack_body(lines: list[str]) -> str:
     """Render the plain-text alert lines for the Slack code block: drop the "• " bullet and left-align the
     "ERROR · " / "WARN · " level into a fixed-width label so the message text lines up in one column.
@@ -134,6 +148,10 @@ class Ctx:
 
     def send_alerts(self, subject: str, lines: list[str]) -> None:
         body = "\n".join(lines)
+        if lines and not alert_channels(self.settings):
+            # No Slack webhook and no SMTP: the alert would vanish. Fail loud so it's at least in the
+            # terminal and estamp.log, and so check-setup can catch this before go-live (#2).
+            log.error(f"ALERT NOT DELIVERED (no Slack/SMTP channel configured): {subject} – {body[:500]}")
         hook = self.settings.env("alerts.slack_webhook_env")
         if hook:
             try:
@@ -141,7 +159,7 @@ class Ctx:
             except Exception as e:
                 log.error(f"Slack alert failed: {e}")
         smtp = self.settings.get("alerts.smtp") or {}
-        if smtp.get("host") and smtp.get("to"):
+        if smtp.get("host") and smtp.get("to"):   # must stay in lockstep with alert_channels()'s email rule
             try:
                 msg = EmailMessage()
                 msg["Subject"], msg["From"], msg["To"] = subject, smtp.get("from"), ", ".join(smtp["to"])

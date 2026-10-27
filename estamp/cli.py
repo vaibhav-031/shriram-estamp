@@ -18,7 +18,7 @@ import sys
 
 from .constants import (BACKUP_ROOT, INVENTORY_ROOT, NEEDS_REVIEW, ORDERS_INCOMING, ORDERS_PROCESSED,
                         ORDERS_REJECTED, OUTPUT_ROOT, UPLOAD_ARCHIVE, UPLOAD_INBOX)
-from .context import Ctx, setup_logging
+from .context import Ctx, alert_channels, setup_logging
 from .db import DB
 from .settings import load_settings
 
@@ -173,14 +173,11 @@ def _check(s, db, google) -> int:
              "url + key set" if s.get("zoop_api.ocr.url") else "zoop_api.ocr.url missing")
     else:
         line(True, "OCR: Google Drive OCR")
-    alerts = []
-    if s.env("alerts.slack_webhook_env"):
-        alerts.append("Slack")
-    if (s.get("alerts.smtp") or {}).get("host"):
-        alerts.append("email")
-    if s.env("alerts.heartbeat_url_env"):
-        alerts.append("heartbeat")
-    line(bool(alerts), "alerts", ", ".join(alerts) or "none configured – you will not hear about failures")
+    # A delivery channel (Slack/email) is what carries failure alerts; heartbeat is only a liveness
+    # ping and can't deliver a message, so it doesn't count here (same rule as send_alerts, #2).
+    channels = alert_channels(s)
+    line(bool(channels), "alerts", ", ".join(channels) or "none configured – you will not hear about failures")
+    line(True, "heartbeat", "configured" if s.env("alerts.heartbeat_url_env") else "not set (optional)")
     print("\nAll good." if ok else "\nFix the ✗ items above.")
     return 0 if ok else 1
 
