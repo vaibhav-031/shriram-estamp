@@ -1,10 +1,13 @@
-"""Intake: ops drop vendor PDFs (merged or single) into the Upload Inbox. For each paper:
+"""Intake: ops drop vendor PDFs (merged or single) into the Upload Inbox. Per upload: paper type (digital /
+traditional) → split (1 or 2 pages) → OCR every page → pairing check (traditional). Then for each paper:
 
-  split → OCR → find cert no + state (from cert) + stamp duty → checks →
+  find cert no + state (from cert) + stamp duty → checks →
     OK   → Inventory/<STATE>/<AMOUNT>/<CERT>.pdf     (folders created automatically)
     FAIL → Needs Review/<date>/<upload>__p<page>.pdf  (reason in the ledger + dashboard)
 
-The original upload is never deleted: it moves to Upload Archive/<date>/.
+A whole upload with a mixed/unclear type (E105) or an odd traditional page count (E106) moves untouched to
+Needs Review/<date>/ (reason on the upload row + Log). The original upload is never deleted: it moves to
+Upload Archive/<date>/.
 Re-running is safe: pages already in the ledger are skipped.
 """
 from __future__ import annotations
@@ -17,9 +20,10 @@ from .context import Ctx, log
 from .db import UniqueViolation
 from dataclasses import dataclass
 
-from .extract import PaperAnalysis, analyze_paper, identify, normalize_ocr, safe_file_name
+from .extract import (PaperAnalysis, analyze_paper, first_broken_pair, identify, normalize_ocr, paper_type,
+                      safe_file_name)
 from .google_clients import FOLDER, PDF, parse_time
-from .ocr_split import merge_pdfs
+from .ocr_split import _split_local, merge_pdfs, page_text_chars
 
 
 def _collect(g, folder_id: str, depth: int = 0, max_depth: int = 4) -> tuple[list[dict], list[dict]]:
@@ -86,55 +90,82 @@ class Unit:
         return "\n".join(self.texts)
 
 
-def _read_units(ctx: Ctx, data: bytes, name: str) -> list[Unit]:
-    """Split → OCR every piece (parallel) → group pages into papers.
+class WholeUploadReview(Exception):
+    """The whole upload goes to Needs Review untouched: E105 paper type unclear/mixed, E106 odd traditional pages."""
 
-    Grouping rule: a page carrying a certificate/serial starts a new paper. A page WITHOUT one that directly
-    follows the front page of a PHYSICAL paper is that paper's back side. E-stamps are always one page.
-    Anything else stands alone (and will go to Needs Review with the reason)."""
+    def __init__(self, code: str, reason: str):
+        super().__init__(f"{code}: {reason}")
+        self.code, self.reason = code, reason
+
+
+def _read_units(ctx: Ctx, data: bytes, name: str) -> list[Unit]:
+    """Paper type → split by type → OCR every page (parallel) → papers (ADR-0003).
+
+    digital     → 1 page per paper; each page must carry exactly one ID (checked by analyze_paper).
+    traditional → 2 pages per paper (front + back); front and back are OCR'd separately. The first pair whose front
+                  doesn't carry exactly one serial, or whose back carries one, breaks the pairing: that pair and
+                  every later pair go to Needs Review (E107) – one missing page shifts every pair after it.
+    Mixed/unclear type (E105) or an odd traditional page count (E106) → WholeUploadReview, nothing is split."""
     s = ctx.settings
-    pieces = ctx.splitter.split(data, name)
-    ctx.event("INFO", "Intake", f"'{name}': {len(pieces)} page(s)/piece(s) – reading them now")
+    chars = page_text_chars(data)
+    kind = paper_type(chars, int(s.get("intake.min_pdf_text_chars", 40)))   # same threshold as the reader
+    if kind == "mixed":
+        raise WholeUploadReview("E105", "paper type unclear – digital and scanned pages in one file. "
+                                        "Split them into separate files and upload again")
+    if kind == "traditional" and len(chars) % 2:
+        raise WholeUploadReview("E106", f"scanned upload has {len(chars)} pages (odd) – every traditional paper "
+                                        "needs front + back. Find the missing page and upload again")
+    size = 1 if kind == "digital" else 2
+    pieces = ctx.splitter.split(data, name, size)
+    wrong = [p for p in pieces if p.page_to - p.page_from + 1 != size]
+    if wrong:   # never stock a part that holds more (or less) than one paper – retried next cycle
+        raise RuntimeError(f"split returned parts that are not {size} page(s) each "
+                           f"(e.g. pages {wrong[0].page_from}-{wrong[0].page_to}) – nothing stocked")
+    pages = [(p.page_from, p.data) for p in pieces] if kind == "digital" else \
+        [(p.page_from + i, pg.data) for p in pieces for i, pg in enumerate(_split_local(p.data, 1))]
+    ctx.event("INFO", "Intake", f"'{name}': {kind}, {len(pages)} page(s) in {len(pieces)} paper(s) – reading them now")
     done = [0]
 
-    def read(p):
+    def read(page):
+        no, pdf = page
         try:
-            r = ctx.ocr.read(p.data, f"{name}_p{p.page_from}")
+            r = ctx.ocr.read(pdf, f"{name}_p{no}")
             out = (r.text, r.cert, r.via, "")
         except Exception as e:
-            out = ("", "", "error", f"OCR failed: {e}")
+            out = ("", "", "error", f"OCR failed on page {no}: {e}")
         with ctx._lock:
             done[0] += 1
-            if done[0] % 10 == 0 or done[0] == len(pieces):
-                log.info(f"Intake: '{name}': read {done[0]}/{len(pieces)}")
-        return out
+            if done[0] % 10 == 0 or done[0] == len(pages):
+                log.info(f"Intake: '{name}': read {done[0]}/{len(pages)}")
+        return no, out
 
     with ThreadPoolExecutor(max_workers=int(s.get("workers", 8))) as ex:
-        results = list(ex.map(read, pieces))
+        read_by_page = dict(ex.map(read, pages))
 
-    units: list[Unit] = []
-    last_kind = None
-    estamp_markers = [m.upper() for m in s.get("intake.estamp_markers") or []]
-    for p, (t, c, v, e) in zip(pieces, results):
-        ids = identify(normalize_ocr(t + ("\n" + c if c else "")), s, ctx.matcher, ctx.resolver) if not e else []
-        # An e-stamp is always exactly one page: never a back side, never the front of a 2-page paper –
-        # even when its certificate couldn't be read (it then goes to Needs Review on its own).
-        estamp = not e and any(m in t.upper() for m in estamp_markers)
-        if ids:
+    ids = lambda t, c="": identify(normalize_ocr(t + ("\n" + c if c else "")), s, ctx.matcher, ctx.resolver)
+    if kind == "digital":
+        units = []
+        for p in pieces:
+            t, c, v, e = read_by_page[p.page_from]
+            # A searchable scan of a traditional paper has a text layer too; never stock its front as 1 page.
+            if not e and any(h.kind == "physical" for h in ids(t, c)):
+                e = ("E105 page reads like a traditional paper (STATE-SERIAL) but the file is digital – not stocked "
+                     "on its own, a back page could be lost. Check the page; scanned papers go in a separate file")
             units.append(Unit(p.page_from, p.page_to, [p.data], [t], c, v, e))
-            last_kind = ids[0].kind
-        elif units and last_kind == "physical" and len(units[-1].parts) == 1 and not e and not estamp:
-            u = units[-1]                                   # back side of the physical paper before it
-            u.parts.append(p.data); u.texts.append(t); u.page_to = p.page_to
-            last_kind = None
-        else:
-            units.append(Unit(p.page_from, p.page_to, [p.data], [t], c, v, e))
-            # A physical FRONT whose serial couldn't be read still keeps its back page attached,
-            # so ops review one 2-page paper instead of two loose pages.
-            up_t = t.upper()
-            markers = s.get("intake.physical_front_markers") or []
-            last_kind = "physical" if not e and not estamp and any(m.upper() in up_t for m in markers) else None
-    ctx.event("INFO", "Intake", f"'{name}': {len(pieces)} page(s) grouped into {len(units)} paper(s)")
+        return units
+
+    units, counts = [], []
+    for p in pieces:
+        (tf, cf, vf, ef), (tb, cb, _, eb) = read_by_page[p.page_from], read_by_page[p.page_to]
+        units.append(Unit(p.page_from, p.page_to, [p.data], [tf, tb], cf, vf, ef or eb))
+        # A pair whose OCR failed can't prove or disprove the pairing; it goes to review on its own error.
+        counts.append((1, 0) if ef or eb else (len(ids(tf, cf)), len(ids(tb, cb))))
+    k = first_broken_pair(counts)
+    if k is not None:
+        at = pieces[k].page_from
+        for u in units[k:]:
+            u.error = (f"E107 pairing broken at page {at} – upload the papers from page {at} on again as separate "
+                       f"2-page PDFs, then REJECT these entries")
     return units
 
 
@@ -154,7 +185,12 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
         return
 
     if ctx.dry:
-        units = _read_units(ctx, g.download(f["id"]), f["name"])
+        try:
+            units = _read_units(ctx, g.download(f["id"]), f["name"])
+        except WholeUploadReview as w:
+            ctx.preview.append(["UPLOAD", f["name"], "all pages", "", "", "", "Needs Review (whole file)", str(w)])
+            ctx.event("WARN", "Intake", f"'{f['name']}' would go to Needs Review as a whole – {w}", ref=f["id"])
+            return
         rows = []
         for u in units:
             a = _analyze(ctx, u)
@@ -172,6 +208,11 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
     if up["status"] in ("DONE", "DUPLICATE"):
         g.move_rename(f["id"], g.folder_path(s.folder("upload_archive"), [today]))
         return
+    if up["status"] == "REVIEW":          # decided earlier (crash before the move, or ops moved it back)
+        g.move_rename(f["id"], g.folder_path(s.folder("needs_review"), [today]))
+        ctx.event("WARN", "Needs review", f"'{f['name']}' was already sent to Needs Review as a whole ({up['notes']}) – "
+                  "moved back there. To process it after a fix, upload it again as a new file.", ref=f["id"])
+        return
     twin = db.upload_same_md5_done(f.get("md5Checksum", ""), up["id"])
     if twin:
         db.upload_finish(up["id"], "DUPLICATE", 0, f"same file content as '{twin['file_name']}' (upload {twin['id']})")
@@ -180,7 +221,14 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
                   ref=f["id"])
         return
 
-    units = _read_units(ctx, g.download(f["id"]), f["name"])
+    try:
+        units = _read_units(ctx, g.download(f["id"]), f["name"])
+    except WholeUploadReview as w:
+        db.upload_finish(up["id"], "REVIEW", 0, str(w))
+        g.move_rename(f["id"], g.folder_path(s.folder("needs_review"), [today]))
+        ctx.stats.uploads += 1
+        ctx.event("WARN", "Needs review", f"'{f['name']}' (whole file): {w}", ref=f["id"])
+        return
     done = db.pages_done(up["id"])
     todo = [u for u in units if u.page_from not in done]
     with ThreadPoolExecutor(max_workers=int(s.get("workers", 8))) as ex:

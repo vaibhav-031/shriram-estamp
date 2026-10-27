@@ -15,3 +15,4 @@ the back. At the first pair that fails, that pair and every later pair of the sa
 - [ ] Re-run after a crash mid-file stocks nothing twice
 
 ## Comments
+- 2026-10-27: done. Front and back OCR'd separately; first_broken_pair() (pure) – front must have exactly 1 ID, back none (incl. an ID the API returns directly); that pair and all later → Needs Review E107 with the page. Digital page with 0/2 IDs → review alone. Crash mid-upload → rerun stocks nothing twice (test). Safety net: a STATE-SERIAL page inside a digital file → review (E105), never stocked as 1 page.

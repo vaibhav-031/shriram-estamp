@@ -7,7 +7,7 @@ only go through those, so tests swap in fakes. The default clients below use the
 Providers (config.yaml → intake):
   split_provider: local     – pypdf (works today)
                   zoop_api  – in-house split API, contract in docs/api-samples/split/README.md (no auth)
-  Both split into parts of 1 page (intake today) or 2 pages (traditional papers, Phase B).
+  Both split into parts of 1 page (digital e-stamps) or 2 pages (traditional papers: front + back).
   ocr_provider:   drive     – Google Drive OCR (works today, ~3–5 s per paper)
                   zoop_api  – your in-house OCR API; falls back to Drive if ocr_fallback_to_drive
 """
@@ -60,8 +60,7 @@ def _headers(settings: Settings, section: str) -> dict:
 
 def split_pdf(data: bytes, name: str, settings: Settings, split_size: int = 1) -> list[PaperPdf]:
     """Split into parts of `split_size` pages (1 = digital e-stamp, 2 = traditional front + back), via the
-    in-house split API (zoop_api) or pypdf (local). Intake still splits per page and groups by content until
-    Phase B detects the paper type."""
+    in-house split API (zoop_api) or pypdf (local). Intake picks the size from the upload's paper type."""
     if settings.get("intake.split_provider", "local") == "zoop_api":
         return _split_zoop(data, name, settings, split_size)
     return _split_local(data, split_size)
@@ -148,6 +147,18 @@ def _split_zoop(data: bytes, name: str, settings: Settings, split_size: int = 1)
 
 # ---------------------------------------------------------------------------------- OCR
 
+def page_text_chars(data: bytes) -> list[int]:
+    """Non-whitespace characters in each page's text layer, used to decide the paper type. A page whose text can't
+    be extracted counts as 0 (scan-like), so a broken font sends the file to review instead of failing every cycle."""
+    out = []
+    for pg in PdfReader(io.BytesIO(data)).pages:
+        try:
+            out.append(len(re.sub(r"\s+", "", pg.extract_text() or "")))
+        except Exception:
+            out.append(0)
+    return out
+
+
 def pdf_text(data: bytes) -> str:
     """Text already inside the PDF (digital e-stamps). Empty for scans."""
     try:
@@ -190,8 +201,8 @@ class ConfiguredSplitter:
     def __init__(self, settings: Settings):
         self.settings = settings
 
-    def split(self, data: bytes, name: str) -> list[PaperPdf]:
-        return split_pdf(data, name, self.settings)
+    def split(self, data: bytes, name: str, split_size: int = 1) -> list[PaperPdf]:
+        return split_pdf(data, name, self.settings, split_size)
 
 
 def _ocr_zoop(data: bytes, name: str, settings: Settings) -> OcrResult:

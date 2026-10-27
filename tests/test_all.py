@@ -313,7 +313,7 @@ def test_intake_and_issue_check_read_through_the_context_clients(env):
           tabs={"x": [samples.H, ["1", "LAN-A", "c", "b", "MH", "200"]]})
     ocr, splitter = FakeOcr(), FakeSplitter()
     assert run_cycle(Ctx(s, db, g, ocr=ocr, splitter=splitter))
-    assert splitter.calls == ["vendor_MH_200_1.pdf"]
+    assert splitter.calls == [("vendor_MH_200_1.pdf", 1)]
     assert sorted(ocr.calls) == ["LAN-A.pdf_p1", "vendor_MH_200_1.pdf_p1", "vendor_MH_200_1.pdf_p2"]
     a = db.q1("SELECT * FROM allocations")
     assert a["lan"] == "LAN-A" and a["verified_via"] == "fake"
@@ -327,7 +327,7 @@ def test_ocr_failure_keeps_the_whole_upload_in_the_inbox(env):
     from fake_apis import FakeOcr
     s, db, g = env
     up = _stock(g, s, "MH", 200, 3)
-    assert run_cycle(Ctx(s, db, g, ocr=FakeOcr(fail={"_p2": RuntimeError("OCR API HTTP 503")})))
+    assert run_cycle(Ctx(s, db, g, ocr=FakeOcr(fail={"vendor_MH_200_1.pdf_p2": RuntimeError("OCR API HTTP 503")})))
     assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
     assert [f["id"] for f in g.list_children(s.folder("upload_inbox"))] == [up]
 
@@ -482,15 +482,17 @@ def test_split_api_passes_odd_last_part_through(settings, split_api):
 
 @e2e
 def test_intake_via_split_api_keeps_front_and_back_together(env, monkeypatch):
-    """Intake asks the split API for one page per part, so it must still group a traditional paper's back page
-    with its front – exactly as with the local split."""
+    """Through the split API (fake that follows the captured contract): a scanned upload is sent with splitSize=2
+    and each paper keeps its front + back."""
     import io, zipfile
     import estamp.ocr_split as ocr_split
     from estamp.cycle import run_cycle
     s, db, g = env
     monkeypatch.setitem(s.raw["intake"], "split_provider", "zoop_api")
+    sizes = []
 
-    def fake_api(url, files, data, timeout):          # behaves like the captured contract
+    def fake_api(url, files, data, timeout):
+        sizes.append(data["splitSize"])
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as z:
             for p in ocr_split._split_local(files["file"][1], int(data["splitSize"])):
@@ -499,12 +501,55 @@ def test_intake_via_split_api_keeps_front_and_back_together(env, monkeypatch):
 
     monkeypatch.setattr(ocr_split.requests, "post", fake_api)
     g.add("scan.pdf", PDF, s.folder("upload_inbox"), samples.merged([
+        samples.scanned_front("RAJASTHAN", "S 254201", 195), samples.scanned_back("RAJASTHAN"),
+        samples.scanned_front("RAJASTHAN", "S 254202", 195), samples.scanned_back("RAJASTHAN")]))
+    assert run_cycle(_ctx(s, db, g))
+    assert sizes == ["2"]
+    rows = db.q("SELECT cert_no, page_from, page_to, status FROM papers ORDER BY page_from")
+    assert [(r["cert_no"], r["page_from"], r["page_to"], r["status"]) for r in rows] == [
+        ("RJ-S254201", 1, 2, "AVAILABLE"), ("RJ-S254202", 3, 4, "AVAILABLE")], rows
+
+
+@e2e
+def test_traditional_page_with_a_text_layer_is_never_stocked_as_one_page(env):
+    """A 'searchable' scan has a text layer, so its upload looks digital. A page carrying a traditional
+    STATE-SERIAL in a digital upload must not be stocked as a 1-page paper without its back → Needs Review (E105)."""
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    g.add("searchable_scan.pdf", PDF, s.folder("upload_inbox"), samples.merged([
         samples.physical_front("RAJASTHAN", "S 254201", 195), samples.physical_back("RAJASTHAN"),
         samples.paper_page(samples.cert("MH", 1), 200)]))
     assert run_cycle(_ctx(s, db, g))
-    rows = db.q("SELECT cert_no, page_from, page_to, status FROM papers ORDER BY page_from")
-    assert [(r["cert_no"], r["page_from"], r["page_to"], r["status"]) for r in rows] == [
-        ("RJ-S254201", 1, 2, "AVAILABLE"), (samples.cert("MH", 1), 3, 3, "AVAILABLE")], rows
+    rows = {r["page_from"]: r for r in db.q("SELECT * FROM papers")}
+    assert rows[1]["status"] == "NEEDS_REVIEW" and "E105" in rows[1]["notes"], rows[1]
+    assert rows[3]["status"] == "AVAILABLE"                                   # the real e-stamp is fine
+    assert db.q1("SELECT count(*) n FROM papers WHERE status='AVAILABLE' AND cert_no LIKE 'RJ-%%'")["n"] == 0
+
+
+# ============================================================ Phase B: paper type + pairing (pure rules)
+
+@pytest.mark.parametrize("chars,expected", [
+    ([500, 480, 512], "digital"),                 # e-stamp PDFs: every page has a real text layer
+    ([0, 0, 3, 0], "traditional"),                # scans: no / negligible text layer
+    ([500, 0], "mixed"),                          # digital and scanned in one upload
+    ([39, 41], "mixed"),                          # either side of the threshold (40)
+    ([], "mixed"),                                # nothing to decide on
+])
+def test_paper_type_from_text_layer(chars, expected):
+    from estamp.extract import paper_type
+    assert paper_type(chars, 40) == expected
+
+
+@pytest.mark.parametrize("pairs,expected", [
+    ([(1, 0), (1, 0), (1, 0)], None),             # every front has one serial, no back has one
+    ([(1, 0), (0, 1), (1, 0)], 1),                # back page missing → the next front lands on the back side
+    ([(0, 0), (1, 0)], 0),                        # break at the first pair
+    ([(1, 0), (1, 1)], 1),                        # serial on a back page
+    ([(1, 0), (2, 0)], 1),                        # two serials on one front
+])
+def test_first_broken_pair(pairs, expected):
+    from estamp.extract import first_broken_pair
+    assert first_broken_pair(pairs) == expected
 
 
 def test_real_rajasthan_ocr_text(settings):
@@ -521,25 +566,24 @@ def test_real_rajasthan_ocr_text(settings):
 
 @e2e
 def test_physical_papers_front_and_back(env):
-    """Merged scan: physical papers (front+back) mixed with an e-stamp – grouped, routed, issued, verified."""
+    """Scanned traditional upload (front + back pairs) – split in pairs, routed, issued, issue check passes.
+    The last pair's serial is smudged: that pair breaks pairing and goes to Needs Review, still 2 pages."""
     from estamp.cycle import run_cycle
     s, db, g = env
     pages = []
-    for i, serial in enumerate(["S 254201", "S 254202", "AB 100003"]):
-        pages += [samples.physical_front("RAJASTHAN", serial, 195), samples.physical_back("RAJASTHAN")]
-    pages += [samples.physical_front("RAJASTHAN", "(serial smudged)", 195), samples.physical_back("RAJASTHAN")]
-    pages.append(samples.paper_page(samples.cert("MH", 1), 200))
+    for serial in ["S 254201", "S 254202", "AB 100003", "(serial smudged)"]:
+        pages += [samples.scanned_front("RAJASTHAN", serial, 195), samples.scanned_back("RAJASTHAN")]
     g.add("vendor_scan.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
     g.add("orders", GSHEET, s.folder("orders_incoming"),
           tabs={"x": [["LOAN NO", "STATE"], ["RJLAN0001", "RAJASTHAN"], ["RJLAN0002", "RAJASTHAN"]]})
     ctx = _ctx(s, db, g)
     assert run_cycle(ctx)
     smudged = db.q("SELECT * FROM papers WHERE cert_no IS NULL")
-    assert len(smudged) == 1 and smudged[0]["page_to"] - smudged[0]["page_from"] == 1, smudged   # front+back kept together
-    assert smudged[0]["status"] == "NEEDS_REVIEW"
+    assert len(smudged) == 1 and (smudged[0]["page_from"], smudged[0]["page_to"]) == (7, 8), smudged
+    assert smudged[0]["status"] == "NEEDS_REVIEW" and "E107" in smudged[0]["notes"]
     papers = {r["cert_no"]: r for r in db.q("SELECT * FROM papers WHERE cert_no IS NOT NULL")}
-    assert set(papers) == {"RJ-S254201", "RJ-S254202", "RJ-AB100003", samples.cert("MH", 1)}, set(papers)
-    assert all(papers[k]["page_to"] - papers[k]["page_from"] == 1 for k in papers if k.startswith("RJ-"))
+    assert set(papers) == {"RJ-S254201", "RJ-S254202", "RJ-AB100003"}, set(papers)
+    assert all(papers[k]["page_to"] - papers[k]["page_from"] == 1 for k in papers)
     done = db.q("SELECT o.lan, a.cert_no, a.verified_cert, a.pdf_file_id FROM orders o JOIN allocations a ON a.order_id=o.id")
     assert len(done) == 2 and all(d["verified_cert"] == d["cert_no"] for d in done), done
     from pypdf import PdfReader
@@ -547,6 +591,155 @@ def test_physical_papers_front_and_back(env):
     assert all(len(PdfReader(_io.BytesIO(g.files[d["pdf_file_id"]]["data"])).pages) == 2 for d in done)
     left = [g.path_of(f["id"]) for f in g.files.values() if "inventory_root/RJ/195/" in g.path_of(f["id"])]
     assert len(left) == 1 and left[0].split("/")[-1] in {"RJ-S254201.pdf", "RJ-S254202.pdf", "RJ-AB100003.pdf"}, left
+
+
+def _upload_review(db, g, s, name):
+    """(upload status, upload notes, path of the original file) for a whole-upload Needs Review case."""
+    up = db.q1("SELECT * FROM uploads WHERE file_name=%s", (name,))
+    f = [f for f in g.files.values() if f["name"] == name][0]
+    return up["status"], up["notes"] or "", g.path_of(f["id"])
+
+
+@e2e
+def test_mixed_upload_goes_whole_to_needs_review(env):
+    """B-01: digital and scanned pages in one upload → whole file to Needs Review (E105), nothing split or stocked."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeSplitter
+    s, db, g = env
+    g.add("mixed.pdf", PDF, s.folder("upload_inbox"), samples.merged([
+        samples.paper_page(samples.cert("MH", 1), 200),
+        samples.scanned_front("RAJASTHAN", "S 254201", 195), samples.scanned_back("RAJASTHAN")]))
+    splitter = FakeSplitter()
+    assert run_cycle(Ctx(s, db, g, splitter=splitter))
+    status, notes, path = _upload_review(db, g, s, "mixed.pdf")
+    assert status == "REVIEW" and "E105" in notes and path.startswith("needs_review/"), (status, notes, path)
+    assert splitter.calls == [] and db.q1("SELECT count(*) n FROM papers")["n"] == 0
+
+
+@e2e
+def test_traditional_odd_page_count_goes_whole_to_review_before_split(env):
+    """B-02: the split API would happily return a 1-page last part, so the odd count is caught BEFORE calling it."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeSplitter
+    s, db, g = env
+    g.add("odd.pdf", PDF, s.folder("upload_inbox"), samples.merged([
+        samples.scanned_front("RAJASTHAN", "S 254201", 195), samples.scanned_back("RAJASTHAN"),
+        samples.scanned_front("RAJASTHAN", "S 254202", 195)]))
+    splitter = FakeSplitter()
+    assert run_cycle(Ctx(s, db, g, splitter=splitter))
+    status, notes, path = _upload_review(db, g, s, "odd.pdf")
+    assert status == "REVIEW" and "E106" in notes and path.startswith("needs_review/"), (status, notes, path)
+    assert splitter.calls == [] and db.q1("SELECT count(*) n FROM papers")["n"] == 0
+
+
+@e2e
+def test_traditional_upload_is_split_in_pairs_and_each_page_ocrd(env):
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeOcr, FakeSplitter
+    s, db, g = env
+    pages = []
+    for serial in ["S 254201", "S 254202"]:
+        pages += [samples.scanned_front("RAJASTHAN", serial, 195), samples.scanned_back("RAJASTHAN")]
+    g.add("pairs.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
+    ocr, splitter = FakeOcr(), FakeSplitter()
+    assert run_cycle(Ctx(s, db, g, ocr=ocr, splitter=splitter))
+    assert splitter.calls == [("pairs.pdf", 2)]
+    assert sorted(ocr.calls) == ["pairs.pdf_p1", "pairs.pdf_p2", "pairs.pdf_p3", "pairs.pdf_p4"]
+    rows = db.q("SELECT cert_no, page_from, page_to, status FROM papers ORDER BY page_from")
+    assert [(r["cert_no"], r["page_from"], r["page_to"], r["status"]) for r in rows] == [
+        ("RJ-S254201", 1, 2, "AVAILABLE"), ("RJ-S254202", 3, 4, "AVAILABLE")]
+
+
+@e2e
+def test_missing_back_page_sends_that_pair_and_all_later_pairs_to_review(env):
+    """B-03: F1 B1 F2 F3 B3 F4 – F2's back is missing, so F3 lands on F2's back side. Pair 1 is fine and is stocked;
+    from page 3 on every pair is suspect (E107), even (B3, F4) which a naive check might pass."""
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    f = lambda n: samples.scanned_front("RAJASTHAN", f"S 25420{n}", 195)
+    b = lambda: samples.scanned_back("RAJASTHAN")
+    g.add("broken.pdf", PDF, s.folder("upload_inbox"), samples.merged([f(1), b(), f(2), f(3), b(), f(4)]))
+    assert run_cycle(_ctx(s, db, g))
+    rows = db.q("SELECT page_from, page_to, status, notes FROM papers ORDER BY page_from")
+    assert [(r["page_from"], r["page_to"], r["status"]) for r in rows] == [
+        (1, 2, "AVAILABLE"), (3, 4, "NEEDS_REVIEW"), (5, 6, "NEEDS_REVIEW")], rows
+    assert all("E107" in r["notes"] and "page 3" in r["notes"] for r in rows[1:]), [r["notes"] for r in rows]
+
+
+@e2e
+def test_serial_the_api_returns_for_a_back_page_breaks_the_pairing(env):
+    """The OCR API may return an ID directly (not in its text). One found on a back page means fronts have shifted."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeOcr
+    s, db, g = env
+    pages = []
+    for n in (1, 2):
+        pages += [samples.scanned_front("RAJASTHAN", f"S 25420{n}", 195), samples.scanned_back("RAJASTHAN")]
+    g.add("api_cert.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
+    ocr = FakeOcr(certs={"api_cert.pdf_p4": samples.cert("RJ", 9)})
+    assert run_cycle(Ctx(s, db, g, ocr=ocr))
+    rows = db.q("SELECT page_from, status, notes FROM papers ORDER BY page_from")
+    assert [(r["page_from"], r["status"]) for r in rows] == [(1, "AVAILABLE"), (3, "NEEDS_REVIEW")], rows
+    assert "E107" in rows[1]["notes"]
+
+
+@e2e
+def test_traditional_parts_must_be_two_pages(env):
+    """A split that ignores splitSize (4-page parts) must not stock paper 2's front inside paper 1."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeSplitter
+    s, db, g = env
+    pages = []
+    for n in (1, 2):
+        pages += [samples.scanned_front("RAJASTHAN", f"S 25420{n}", 195), samples.scanned_back("RAJASTHAN")]
+    g.add("bad_split.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
+    ctx = Ctx(s, db, g, splitter=FakeSplitter(force_size=4))
+    run_cycle(ctx)
+    assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
+    assert any(f["name"] == "bad_split.pdf" for f in g.list_children(s.folder("upload_inbox")))   # retried later
+    assert any("not 2 page(s) each" in a for a in ctx.alerts), ctx.alerts
+
+
+@e2e
+def test_digital_page_with_two_ids_goes_alone_to_review(env):
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    two = f"{samples.cert('MH', 1)} {samples.cert('MH', 2)}"
+    g.add("two_ids.pdf", PDF, s.folder("upload_inbox"), samples.merged([
+        samples.paper_page(two, 200), samples.paper_page(samples.cert("MH", 3), 200)]))
+    assert run_cycle(_ctx(s, db, g))
+    rows = db.q("SELECT page_from, status, notes FROM papers ORDER BY page_from")
+    assert [(r["page_from"], r["status"]) for r in rows] == [(1, "NEEDS_REVIEW"), (2, "AVAILABLE")]
+    assert "more than one" in rows[0]["notes"]
+
+
+@e2e
+def test_crash_mid_upload_then_rerun_stocks_nothing_twice(env, monkeypatch):
+    """Crash while stocking pair 2 of 3: pair 1 is in the ledger, the file stays in the inbox. The next cycle finishes
+    the file without stocking pair 1 again."""
+    import estamp.intake as intake
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    pages = []
+    for n in (1, 2, 3):
+        pages += [samples.scanned_front("RAJASTHAN", f"S 25420{n}", 195), samples.scanned_back("RAJASTHAN")]
+    g.add("crash.pdf", PDF, s.folder("upload_inbox"), samples.merged(pages))
+    real = intake._stock_unit
+
+    def crashing(ctx, up, name, u):
+        if u.page_from == 3:
+            raise RuntimeError("simulated crash")
+        return real(ctx, up, name, u)
+
+    monkeypatch.setattr(intake, "_stock_unit", crashing)
+    run_cycle(_ctx(s, db, g))
+    assert db.q1("SELECT count(*) n FROM papers WHERE page_from=3")["n"] == 0
+    assert any(f["name"] == "crash.pdf" for f in g.list_children(s.folder("upload_inbox")))
+    monkeypatch.setattr(intake, "_stock_unit", real)
+    assert run_cycle(_ctx(s, db, g))
+    rows = db.q("SELECT cert_no, page_from FROM papers ORDER BY page_from")
+    assert [(r["cert_no"], r["page_from"]) for r in rows] == [("RJ-S254201", 1), ("RJ-S254202", 3), ("RJ-S254203", 5)]
+    assert not g.list_children(s.folder("upload_inbox"))
 
 
 @e2e

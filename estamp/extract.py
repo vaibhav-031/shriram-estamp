@@ -283,6 +283,32 @@ def analyze_paper(text: str, api_cert: str, settings: Settings, matcher: CertMat
     return a
 
 
+# ============================== PAPER TYPE + PAIRING (ADR-0003) ==============================
+
+def paper_type(page_text_chars: list[int], min_chars: int) -> str:
+    """Per upload, before splitting: 'digital' if every page has a real text layer (e-stamp PDF, 1 page per paper),
+    'traditional' if every page is a scan (front + back, 2 pages per paper), else 'mixed' (→ whole upload to
+    Needs Review). ADR-0002: values must come from the OCR API, not the text layer – until A-09 removes
+    `intake.use_pdf_text`, the configured reader may still read digital pages from it."""
+    if not page_text_chars:
+        return "mixed"
+    if all(c >= min_chars for c in page_text_chars):
+        return "digital"
+    if all(c < min_chars for c in page_text_chars):
+        return "traditional"
+    return "mixed"
+
+
+def first_broken_pair(id_counts: list[tuple[int, int]]) -> int | None:
+    """id_counts: (IDs found on the front page, IDs found on the back page) per traditional pair, in file order.
+    A good pair has exactly one serial on the front and none on the back. Returns the index of the first bad pair
+    – that pair and every later one go to Needs Review, since one missing page shifts every pair after it."""
+    for i, (front, back) in enumerate(id_counts):
+        if front != 1 or back != 0:
+            return i
+    return None
+
+
 # ============================== ORDER SHEETS ==============================
 
 def _norm_header(s: str) -> str:

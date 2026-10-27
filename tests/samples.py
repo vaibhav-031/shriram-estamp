@@ -123,3 +123,36 @@ def estamp_no_cert(state_name: str = "Karnataka") -> bytes:
     for line in ["INDIA NON JUDICIAL", f"Government of {state_name}", "e-Stamp", "Certificate No. : (unreadable)"]:
         c.drawString(50, y, line); y -= 24
     c.save(); return buf.getvalue()
+
+
+# ------------------------------------------------------------------ scanned (image-only) pages
+# A real scan has no text layer. These pages are a blank image plus a hidden page key holding what a perfect OCR
+# would read, so FakeOcr / FakeGoogle.ocr_text can "read" them while paper-type detection sees no text at all.
+OCR_KEY = "/EstampTestOcr"
+
+
+def scanned_page(lines: list[str]) -> bytes:
+    from PIL import Image
+    from pypdf.generic import NameObject, TextStringObject
+    from reportlab.lib.utils import ImageReader
+    buf = io.BytesIO(); c = canvas.Canvas(buf, pagesize=A4)
+    c.drawImage(ImageReader(Image.new("L", (60, 40), 200)), 50, 500, 400, 300); c.save()
+    w = PdfWriter(); w.add_page(PdfReader(io.BytesIO(buf.getvalue())).pages[0])
+    w.pages[0][NameObject(OCR_KEY)] = TextStringObject("\n".join(lines))
+    out = io.BytesIO(); w.write(out); return out.getvalue()
+
+
+def scanned_front(state_name: str, serial: str, amount: int) -> bytes:
+    return scanned_page(["INDIA NON JUDICIAL", f"Rs.{amount}", state_name, "24 SEP 2026", serial])
+
+
+def scanned_back(state_name: str, buyer="SHRIRAM FINANCE LIMITED") -> bytes:
+    return scanned_page(["245117", "24.09.2026", buyer, state_name, "Licence No. 28 / 2024"])
+
+
+def ocr_text_of(data: bytes) -> str:
+    """What a perfect OCR reads: the hidden key on scanned pages, the text layer otherwise."""
+    out = []
+    for p in PdfReader(io.BytesIO(data)).pages:
+        out.append(str(p[OCR_KEY]) if OCR_KEY in p else (p.extract_text() or ""))
+    return "\n".join(out)

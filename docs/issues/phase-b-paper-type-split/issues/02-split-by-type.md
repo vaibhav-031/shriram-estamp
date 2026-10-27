@@ -12,3 +12,4 @@ the split API. A traditional upload with an odd page count goes whole to Needs R
 - [ ] Cycle test: traditional odd-page file → whole file in Needs Review, reason names E106, split API not called
 
 ## Comments
+- 2026-10-27: done. splitSize 1/2 by type through ctx.splitter (local or split API); odd traditional page count → whole upload REVIEW (E106) before the splitter is called. Parts that are not exactly 1/2 pages → upload error, nothing stocked, retried.

@@ -91,7 +91,8 @@ class FakeGoogle:
                 f["name"] = new_name
 
     def ocr_text(self, data, name):
-        return "\n".join(p.extract_text() or "" for p in PdfReader(io.BytesIO(data)).pages)
+        from samples import ocr_text_of
+        return ocr_text_of(data)
 
     # ---------------------------------------------------------------- Sheets API surface
     def tab_titles(self, sid):

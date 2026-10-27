@@ -13,3 +13,4 @@ behaviour are kept and rewritten for the new rules; README tells ops how to fix 
 - [ ] Suite green 5×, volume test included
 
 ## Comments
+- 2026-10-27: done. Content grouping and physical_front_markers / estamp_markers removed; old front/back test rewritten for scanned pages; README ops table for E105/E106/E107.

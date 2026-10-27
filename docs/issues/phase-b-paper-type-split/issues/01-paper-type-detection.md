@@ -13,3 +13,4 @@ Status: ready-for-agent
 - [ ] Re-running the cycle does not process the file again
 
 ## Comments
+- 2026-10-27: done. Pure paper_type() in extract.py; threshold = intake.min_pdf_text_chars (one threshold for type + reader). Mixed → whole upload REVIEW (E105), nothing split. A page with an unreadable text layer counts as 0 chars (→ review, not a retry loop).

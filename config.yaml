@@ -52,9 +52,11 @@ orders:
 intake:
   settle_minutes: 0           # ignore uploads still being copied in
   split_provider: local       # local (pypdf) | zoop_api
-  # local split: every page is read, then grouped – a physical paper's back page stays with its front
-  use_pdf_text: true          # digital e-stamps: read the PDF's built-in text first (instant, exact)
-  min_pdf_text_chars: 40      # less text than this = scanned page → OCR
+  use_pdf_text: true          # digital e-stamps: read the PDF's built-in text first (instant, exact) – off with A-09
+  # Paper type per upload (ADR-0003): every page has ≥ min_pdf_text_chars text-layer characters → digital
+  # (1 page/paper); every page below it → traditional scan (front + back, 2 pages/paper); a mix → whole upload
+  # to Needs Review (E105).
+  min_pdf_text_chars: 40
   ocr_provider: drive         # drive | zoop_api   (only used for scanned pages)
   ocr_fallback_to_drive: true
   required_text: []           # e.g. ["SHRIRAM"] – turn on once sample papers confirm the party name prints
@@ -64,10 +66,6 @@ intake:
   stamp_duty_regex: 'STAMP\s*DUTY\s*AMOUNT[^0-9]{0,25}([\d,]+)'
   # Physical (non-judicial) stamp paper: serial number on the front, state printed as a name (RAJASTHAN).
   # The paper id becomes STATE-SERIAL, e.g. RJ-S254201. Add per-state patterns as you see more samples.
-  physical_front_markers: ["NON JUDICIAL", "गैर न्यायिक"]   # front of a physical paper even if serial unreadable
-  # A page with any of these is an e-stamp: always ONE page = one paper, never grouped with the next page
-  # (e-stamps also print "INDIA NON JUDICIAL", so this overrides physical_front_markers).
-  estamp_markers: ["E-STAMP", "UNIQUE DOC. REFERENCE", "SUBIN-"]
   serial_patterns:
     DEFAULT: '\b[A-Z]{1,2} ?\d{6}\b'               # e.g. "S 254201", "AB 123456"
   # Amount: tried in order – e-stamp line first, then the face value printed on physical paper

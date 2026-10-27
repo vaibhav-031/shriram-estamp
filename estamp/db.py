@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS uploads (
   drive_file_id TEXT NOT NULL UNIQUE,
   file_name     TEXT,
   md5           TEXT,
-  status        TEXT NOT NULL DEFAULT 'PROCESSING',   -- PROCESSING | DONE | DUPLICATE | FAILED
+  status        TEXT NOT NULL DEFAULT 'PROCESSING',   -- PROCESSING | DONE | DUPLICATE | REVIEW (whole file, E105/E106) | FAILED
   papers_found  INT  NOT NULL DEFAULT 0,
   notes         TEXT,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
