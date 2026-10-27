@@ -28,7 +28,7 @@ from pypdf import PdfReader, PdfWriter
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from estamp.context import Ctx  # noqa: E402
+from estamp.context import Ctx, setup_logging  # noqa: E402
 from estamp.extract import StateResolver  # noqa: E402
 from estamp.settings import load_settings  # noqa: E402
 
@@ -207,10 +207,20 @@ def drive_cycles(settings, db, google, max_cycles: int) -> int:
     ran = 0
     for i in range(max_cycles):
         print(f"  cycle {i + 1}/{max_cycles} …")
-        run_cycle(Ctx(settings, db, google))
+        t0 = time.time()
+        ctx = Ctx(settings, db, google)
+        ok = run_cycle(ctx)
+        st = ctx.stats
+        # one line per cycle so we can see what actually moved, not just that a cycle ran
+        print(f"    → {time.time() - t0:.0f}s  ok={ok}  uploads={st.uploads} stocked={st.papers_in} "
+              f"review={st.papers_review} issued={st.allocated} waiting={st.waiting} errors={st.errors}")
+        if ctx.alerts:
+            for a in ctx.alerts[:10]:
+                print(f"       ! {a}")
         ran += 1
         pg = db.pending_groups()
         if not pg or all(g["avail"] == 0 for g in pg):
+            print("    no pending LANs with available stock left – draining stops")
             break
     return ran
 
@@ -324,6 +334,10 @@ def main(argv=None) -> int:
     if settings.dry_run:
         print("dry_run is ON – pass --live to run a real e2e (nothing will be written otherwise). Aborting.")
         return 2   # abort before any DB/Google connection so a non-live run has zero side effects
+
+    # Stream the pipeline's own event log (intake/allocation/errors, via ctx.event) to the console and
+    # logs/estamp.log, so a live eval shows what the service is doing step by step, not just the eval's phases.
+    setup_logging(settings)
 
     from estamp.db import DB
     from estamp.google_clients import Google
