@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 
 from .constants import ORDERS_INCOMING, ORDERS_PROCESSED, ORDERS_REJECTED
 from .context import Ctx
+from .errors import line
 from .extract import ParsedOrderFile, parse_order_tabs
 from .google_clients import CSV, GSHEET, XLS, XLSX, parse_time
 
@@ -32,7 +33,7 @@ def run_ingest(ctx: Ctx, deadline: float) -> None:
             _ingest_file(ctx, f)
         except Exception as e:
             ctx.stats.files_rejected += 1
-            ctx.event("ERROR", "Orders", f"'{f['name']}' rejected: {e}", ref=f["id"])
+            ctx.event("ERROR", "Orders", line("E201", f"'{f['name']}' rejected: {e}"), ref=f["id"])
             if not ctx.dry:
                 g.move_rename(f["id"], s.folder(ORDERS_REJECTED))
 
@@ -108,9 +109,11 @@ def _ingest_file(ctx: Ctx, f: dict) -> None:
     ctx.event("INFO", "Orders", f"'{f['name']}': {sum(1 for r in to_insert if r[8] == 'PENDING')} LAN(s) queued",
               ref=f["id"])
     if parsed.invalid:
-        ctx.event("WARN", "Orders", f"'{f['name']}': {len(parsed.invalid)} row(s) skipped – " + " | ".join(parsed.invalid[:20]))
+        ctx.event("WARN", "Orders", line("E203", f"'{f['name']}': {len(parsed.invalid)} row(s) skipped – "
+                  + " | ".join(parsed.invalid[:20])))
     if dups:
-        ctx.event("WARN", "Orders", f"'{f['name']}': {len(dups)} duplicate(s) – " + " | ".join(dups[:20]))
+        ctx.event("WARN", "Orders", line("E205", f"'{f['name']}': {len(dups)} duplicate(s) – "
+                  + " | ".join(dups[:20])))
     if conflicts:
-        ctx.event("WARN", "Orders", f"'{f['name']}': {len(conflicts)} LAN(s) in CONFLICT – resolve in Order Actions: "
-                  + " | ".join(conflicts[:20]))
+        ctx.event("WARN", "Orders", line("E206", f"'{f['name']}': {len(conflicts)} LAN(s) in CONFLICT – resolve in "
+                  "Order Actions: " + " | ".join(conflicts[:20])))

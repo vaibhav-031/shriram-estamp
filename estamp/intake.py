@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from .constants import INVENTORY_ROOT, NEEDS_REVIEW, UPLOAD_ARCHIVE, UPLOAD_INBOX
 from .context import Ctx, log
 from .db import UniqueViolation
+from .errors import line
 from dataclasses import dataclass
 
 from .extract import (PaperAnalysis, analyze_fields, analyze_paper, first_broken_pair, ids_in_reading,
@@ -203,7 +204,7 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
     g, s, db = ctx.google, ctx.settings, ctx.db
     today = ctx.today().isoformat()
     if f.get("mimeType") != PDF:
-        ctx.event("WARN", "Intake", f"'{f['name']}' is not a PDF – moved to Needs Review/Not PDF", ref=f["id"])
+        ctx.event("WARN", "Intake", line("E102", f"'{f['name']}' – moved to Needs Review/Not PDF"), ref=f["id"])
         if not ctx.dry:
             g.move_rename(f["id"], g.folder_path(s.folder(NEEDS_REVIEW), ["Not PDF"]))
         return
@@ -213,7 +214,8 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
             units = _read_units(ctx, g.download(f["id"]), f["name"])
         except WholeUploadReview as w:
             ctx.preview.append(["UPLOAD", f["name"], "all pages", "", "", "", "Needs Review (whole file)", str(w)])
-            ctx.event("WARN", "Intake", f"'{f['name']}' would go to Needs Review as a whole – {w}", ref=f["id"])
+            ctx.event("WARN", "Intake",
+                      line(w.code, f"'{f['name']}' would go to Needs Review as a whole – {w.reason}"), ref=f["id"])
             return
         rows = []
         for u in units:
@@ -241,7 +243,8 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
     if twin:
         db.upload_finish(up["id"], "DUPLICATE", 0, f"same file content as '{twin['file_name']}' (upload {twin['id']})")
         g.move_rename(f["id"], g.folder_path(s.folder(NEEDS_REVIEW), ["Duplicate uploads"]))
-        ctx.event("WARN", "Intake", f"'{f['name']}' is an exact duplicate of '{twin['file_name']}' – not stocked again",
+        ctx.event("WARN", "Intake",
+                  line("E104", f"'{f['name']}' is an exact duplicate of '{twin['file_name']}' – not stocked again"),
                   ref=f["id"])
         return
 
@@ -251,7 +254,7 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
         db.upload_finish(up["id"], "REVIEW", 0, str(w))
         g.move_rename(f["id"], g.folder_path(s.folder(NEEDS_REVIEW), [today]))
         ctx.stats.uploads += 1
-        ctx.event("WARN", "Needs review", f"'{f['name']}' (whole file): {w}", ref=f["id"])
+        ctx.event("WARN", "Needs review", line(w.code, f"'{f['name']}' (whole file): {w.reason}"), ref=f["id"])
         return
     except ApiAuthError as e:
         # A-08: a bad key is a human fix, not a timeout – stop this upload loudly, keep it in the inbox, never loop.

@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .constants import BACKUP_ROOT, NEEDS_REVIEW, OUTPUT_ROOT
 from .context import Ctx
+from .errors import line
 from .extract import ids_in_reading, safe_file_name
 from .google_clients import file_link
 from .ocr_split import _split_local
@@ -84,8 +85,8 @@ def run_allocation(ctx: Ctx, deadline: float, report_shortage: bool = True) -> N
     for key, n in short.items():
         st, d = key.split("|")
         ctx.stats.waiting += n
-        ctx.event("WARN", "Shortage", f"{st} ₹{d}: {n} LAN(s) waiting – not enough AVAILABLE papers. "
-                  "They fulfil automatically once stock is uploaded.", alert_key=f"short|{key}")
+        ctx.event("WARN", "Shortage", line("E301", f"{st} ₹{d}: {n} LAN(s) waiting – not enough AVAILABLE papers. "
+                  "They fulfil automatically once stock is uploaded."), alert_key=f"short|{key}")
 
 
 def _preview(ctx: Ctx) -> None:
@@ -158,5 +159,8 @@ def _allocate_one(ctx: Ctx, order: dict) -> str:
         try:
             db.fail_allocation(order, paper, msg)
         finally:
-            ctx.event("ERROR", "Allocate", f"LAN {order['lan']} ({label}): {msg}", ref=str(order["id"]))
+            # Only an issued-PDF cert mismatch (E302) gets a code; other failing steps stay plain text.
+            details = line("E302", f"LAN {order['lan']} ({label}): {msg}") if isinstance(e, CertMismatch) \
+                else f"LAN {order['lan']} ({label}): {msg}"
+            ctx.event("ERROR", "Allocate", details, ref=str(order["id"]))
         return "ERROR"

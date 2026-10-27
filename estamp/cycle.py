@@ -57,6 +57,9 @@ def run_cycle(ctx: Ctx) -> bool:
             _send(ctx)
             ctx.heartbeat(ok)
             db.release_lock()
+    st = ctx.stats
+    ctx.event("INFO", "Cycle", f"summary: received {st.uploads} · stocked {st.papers_in} · in review {st.papers_review} "
+              f"· issued {st.allocated} · waiting {st.waiting} · errors {st.errors}")
     log.info(f"cycle done in {time.time() - t0:.0f}s: {ctx.stats.as_dict()}")
     return ok
 

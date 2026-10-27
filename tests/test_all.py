@@ -418,6 +418,16 @@ def test_ocr_auth_failure_stops_the_upload_loudly_without_retrying(env):
     assert db.q1("SELECT count(*) n FROM events WHERE level='ERROR' AND details ILIKE '%401%'")["n"] >= 1
 
 
+@e2e
+def test_non_pdf_upload_event_carries_the_error_code(env):
+    """A non-PDF upload is routed to Needs Review/Not PDF and its ops event carries the E102 code."""
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    g.add("notes.txt", "text/plain", s.folder("upload_inbox"), b"hello")
+    assert run_cycle(_ctx(s, db, g))
+    assert db.q1("SELECT count(*) n FROM events WHERE level='WARN' AND details LIKE '%E102%'")["n"] >= 1
+
+
 # ============================================================ split API (replays docs/api-samples/split)
 
 SPLIT_SAMPLES = ROOT / "docs" / "api-samples" / "split"
