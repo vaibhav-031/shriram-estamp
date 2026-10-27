@@ -8,6 +8,7 @@
   python -m estamp status         stock + queue summary in the terminal
   python -m estamp reconcile      find inventory files the ledger doesn't know about (and vice-versa)
   python -m estamp recheck-review re-run checks on Needs Review papers after a config fix (no re-upload)
+  python -m estamp explain E111   print what an error code means and what ops should do (no DB/Google)
 """
 from __future__ import annotations
 
@@ -38,11 +39,20 @@ def _build(args, need_google=True):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="estamp")
-    ap.add_argument("command", choices=["login", "init-db", "check-setup", "run-once", "run", "status", "reconcile", "recheck-review"])
+    ap.add_argument("command", choices=["login", "init-db", "check-setup", "run-once", "run", "status", "reconcile", "recheck-review", "explain"])
+    ap.add_argument("code", nargs="?", help="error code for `explain` (e.g. E111)")
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--dry-run", action="store_true", help="force dry run for this command")
     ap.add_argument("--live", action="store_true", help="force live mode for this command")
     args = ap.parse_args(argv)
+
+    if args.command == "explain":
+        # No DB/Google – just the catalogue (like login, works offline).
+        from .errors import explain
+        if not args.code:
+            ap.error("explain needs an error code, e.g. `explain E111`")
+        print(explain(args.code))
+        return 0
 
     if args.command == "login":
         from .google_clients import load_credentials
