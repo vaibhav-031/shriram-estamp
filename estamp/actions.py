@@ -195,9 +195,16 @@ def _order(ctx: Ctx, row: list[str]) -> str:
             ctx.event("WARN", "Cancel", f"LAN {o['lan']} cancelled; paper {p['cert_no']} marked AVAILABLE but could not "
                       f"be moved back to Inventory: {e}")
         if a:
-            sid = output_sheet_id(ctx, a["alloc_date"], a["state"], a["denomination"])
-            g.append_rows(sid, label_for(a["state"], a["denomination"]),
-                          [[o["lan"], p["cert_no"], "", "", ctx.now_str(), "CANCELLED – do not use"]])
+            # The "CANCELLED – do not use" row is the legal marker on Shriram's sheet. It is written after the
+            # commit, so if the sheet write fails it must be LOUD (ops add it by hand), never silently dropped.
+            try:
+                sid = output_sheet_id(ctx, a["alloc_date"], a["state"], a["denomination"])
+                g.append_rows(sid, label_for(a["state"], a["denomination"]),
+                              [[o["lan"], p["cert_no"], "", "", ctx.now_str(), "CANCELLED – do not use"]])
+            except Exception as e:
+                ctx.event("ERROR", "Cancel", f"LAN {o['lan']} cancelled and paper {p['cert_no']} returned, but writing "
+                          f"the 'CANCELLED – do not use' row to the {label_for(a['state'], a['denomination'])} output "
+                          f"sheet failed: {e}. Add it by hand so Shriram does not treat {p['cert_no']} as valid.")
         ctx.event("WARN", "Cancel", f"LAN {o['lan']} cancelled after issue; paper {p['cert_no']} returned to stock. "
                   "Make sure Shriram has not already used the issued PDF.")
         return "DONE: cancelled, paper returned to stock"

@@ -1728,3 +1728,38 @@ def test_alert_dedup_is_hourly_by_default_and_daily_when_asked(env):
     ctx.event("WARN", "Y", "shortage", alert_key="shortK", dedup="day")   # daily opt-out
     keys = [r["alert_key"] for r in db.q("SELECT alert_key FROM alerts_sent")]
     assert "shortK" in keys, keys                                # stored bare: one a day, no hour bucket
+
+
+# ── CANCEL marker: a failed output-sheet write must be loud, never a silently-lost "do not use" ──
+@e2e
+def test_cancel_sheet_marker_failure_is_loud_not_silent(env):
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    g.add("TEST_Shriram_MH_LANs_26Oct", GSHEET, s.folder("orders_incoming"),
+          tabs={"x": [samples.H, ["1", "LAN-M", "c", "b", "MH", "200"]]})
+    _stock(g, s, "MH", 200, 1)
+    assert run_cycle(_ctx(s, db, g))
+    o = db.q1("SELECT * FROM orders WHERE lan='LAN-M'")
+    assert o["status"] == "DONE"
+
+    ctl = g.sheets_data[s.get("control_sheet_id")]
+    orig = FakeGoogle.append_rows
+    def boom(self, sid, title, rows):   # only the CANCELLED marker append fails; everything else works
+        if any(len(r) > 5 and "do not use" in str(r[5]) for r in rows):
+            raise RuntimeError("Sheets 500")
+        return orig(self, sid, title, rows)
+    FakeGoogle.append_rows = boom
+    try:
+        ctl["Order Actions"].append(["LAN-M", "CANCEL", ""])
+        err_before = db.q1("SELECT count(*) n FROM events WHERE level='ERROR'")["n"]
+        assert run_cycle(_ctx(s, db, g))
+    finally:
+        FakeGoogle.append_rows = orig
+    # cancellation still committed despite the failed sheet write
+    assert ctl["Order Actions"][-1][3] == "DONE: cancelled, paper returned to stock"
+    assert db.q1("SELECT status FROM papers WHERE id=%s", (o["paper_id"],))["status"] == "AVAILABLE"
+    assert db.q1("SELECT status FROM orders WHERE lan='LAN-M'")["status"] == "CANCELLED"
+    # and the missing marker was reported loudly, not silently dropped
+    assert db.q1("SELECT count(*) n FROM events WHERE level='ERROR' AND action='Cancel' "
+                 "AND details LIKE '%do not use%'")["n"] >= 1
+    assert db.q1("SELECT count(*) n FROM events WHERE level='ERROR'")["n"] > err_before
