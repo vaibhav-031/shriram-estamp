@@ -1646,3 +1646,42 @@ def test_cancel_after_issue_commits_before_drive_move(env):
     assert py["status"] == "AVAILABLE" and py["order_id"] is None
     assert db.q1("SELECT status FROM orders WHERE lan='LAN-Y'")["status"] == "CANCELLED"
     assert db.q1("SELECT count(*) n FROM events WHERE level='WARN'")["n"] > warn_before
+
+
+# ── #10 wrap-up guard (lock never leaks) + Slack HTTP errors surfaced ────────────────────
+def test_send_alerts_logs_when_slack_returns_http_error(settings, monkeypatch, caplog):
+    # A Slack 4xx/5xx must surface in the log, not be silently swallowed (#10b).
+    monkeypatch.setenv("ESTAMP_SLACK_WEBHOOK", "https://hooks.example/slack")
+
+    class FakeResp:
+        ok = False
+        def raise_for_status(self):
+            raise requests.HTTPError("500 Server Error")
+
+    monkeypatch.setattr(requests, "post", lambda *a, **k: FakeResp())
+    ctx = Ctx(settings, db=None, google=None, ocr=object(), splitter=object())
+    with caplog.at_level("ERROR"):
+        ctx.send_alerts("subj", ["line"])
+    assert any("Slack alert failed" in r.message for r in caplog.records), caplog.text
+
+
+@e2e
+def test_lock_released_even_if_send_raises(env):
+    # If _send blows up in the finally block, the advisory lock must still be released and the run
+    # must still be recorded (#10a) – otherwise a single alert failure wedges every future cycle.
+    import estamp.cycle as _c
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    g.add("TEST_Shriram_MH_LANs_26Oct", GSHEET, s.folder("orders_incoming"), tabs={"x": samples.mh()})
+    _stock(g, s, "MH", 200, 2)
+    def boom(ctx):
+        raise RuntimeError("boom in _send")
+    orig = _c._send
+    _c._send = boom
+    try:
+        run_cycle(_ctx(s, db, g))
+    finally:
+        _c._send = orig
+    assert db.try_lock(), "advisory lock leaked after _send raised"
+    db.release_lock()
+    assert db.q1("SELECT count(*) n FROM runs WHERE finished_at IS NOT NULL")["n"] >= 1

@@ -155,7 +155,8 @@ class Ctx:
         hook = self.settings.env("alerts.slack_webhook_env")
         if hook:
             try:
-                requests.post(hook, json={"text": f"*{subject}*\n```\n{slack_body(lines)[:3500]}\n```"}, timeout=15)
+                resp = requests.post(hook, json={"text": f"*{subject}*\n```\n{slack_body(lines)[:3500]}\n```"}, timeout=15)
+                resp.raise_for_status()   # a Slack 4xx/5xx must not pass silently as success (#10)
             except Exception as e:
                 log.error(f"Slack alert failed: {e}")
         smtp = self.settings.get("alerts.smtp") or {}
@@ -177,6 +178,7 @@ class Ctx:
         url = self.settings.env("alerts.heartbeat_url_env")
         if url:
             try:
-                requests.get(url if ok else url.rstrip("/") + "/fail", timeout=10)
+                resp = requests.get(url if ok else url.rstrip("/") + "/fail", timeout=10)
+                resp.raise_for_status()
             except Exception as e:
                 log.error(f"heartbeat ping failed: {e}")

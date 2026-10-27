@@ -66,9 +66,20 @@ def run_cycle(ctx: Ctx) -> bool:
         try:
             _step(ctx, "Dashboard", lambda: run_dashboard(ctx))
         finally:
-            db.finish_run(run_id, ok, ctx.stats.as_dict())
-            _send(ctx)
-            ctx.heartbeat(ok)
+            # Each wrap-up call is independent: a failure in one must not skip the others, and
+            # release_lock() MUST always run or the advisory lock wedges every future cycle (#10).
+            try:
+                db.finish_run(run_id, ok, ctx.stats.as_dict())
+            except Exception as e:
+                log.error(f"finish_run failed: {e}")
+            try:
+                _send(ctx)
+            except Exception as e:
+                log.error(f"sending alerts failed: {e}")
+            try:
+                ctx.heartbeat(ok)
+            except Exception as e:
+                log.error(f"heartbeat failed: {e}")
             db.release_lock()
     st = ctx.stats
     ctx.event("INFO", "Cycle", f"summary: received {st.uploads} · stocked {st.papers_in} · in review {st.papers_review} "
