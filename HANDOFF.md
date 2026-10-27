@@ -2,7 +2,7 @@
 
 ## Current status (2026-10-27) – read this first
 
-**Works today (pilot code, `config.yaml` has `dry_run: false` = LIVE):** Upload Inbox → pypdf page split → read
+**Works today (pilot code; `config.yaml` is locked to `dry_run: true` – a live run needs Vaibhav's OK):** Upload Inbox → pypdf page split → read
 each page from its PDF text layer, else **Google Drive OCR** → pages grouped into papers by content → checks →
 `Inventory/<STATE>/<AMOUNT>/` or Needs Review. Order files → PENDING LANs → issue with `FOR UPDATE SKIP LOCKED` →
 issue check (second OCR) → output sheets, control sheet, Slack/SMTP/heartbeat alerts. The in-house OCR/split API
@@ -12,12 +12,26 @@ code is an unused stub written against a guessed contract.
 amended to ADR-0001. Code: A-01 volume test (~1,000 LANs, zero double issue), A-02 README fixes, A-04 OCR/split
 clients injected via the run context (`tests/fake_apis.py`). Suite: 34 passed + 1 expected-fail (A-08 target).
 
-**Not built:** everything else below. No live API call made; real Drive and `shriram_estamp` untouched.
+**Not built:** everything else below. No live API call made.
+
+**Test data reset (2026-10-27, by Vaibhav's decision – all of it was test data):** every table in `shriram_estamp`
+truncated, ID sequences reset (all 8 tables are data; setup lives in `state_config.csv` / `config.yaml`, unchanged);
+37 files in the Drive working folders moved to Trash (recoverable 30 days), folders and control sheet kept. No DB
+backup was taken. From now on, test only in dry run: `python -m estamp run-once --config config.dryrun.yaml --dry-run`
+(local, untracked file: scratch schema `estamp_dryrun`, "Dry run inbox" folder, control-sheet copy, alerts off).
+
+**Known issues from the first dry run (22 sample papers, 18 read):** 4 would stock (2 HP e-stamps, 2 MP traditional
+papers front + back); 14 → Needs Review:
+- **Unrecognised Paper ID formats – HR, JH, MH** (6 papers): "no certificate / serial number found"; patterns needed.
+- **Amounts missing in `state_config.csv`** (8 papers): JK ₹100 (allows 350), OD ₹500 (allows 100), PB ₹40,000
+  (allows 350), TN ₹100 (allows 200) – confirm with Shriram which amounts are real before adding them.
+- **Drive OCR took 83 min on one TN page** and the cycle hit its time budget (whole run 92 min; 4 papers never
+  read). Supports doing A-05 (OCR API) first, and every OCR call needs a **per-page timeout** (A-07).
 
 **Shortlist for the dev team, in priority order** (tickets in `docs/issues/`; deferred tickets are `needs-triage`):
 1. E-01 never append a LAN twice to an output sheet (real gap in today's live flow)
 2. A-03 capture redacted OCR API samples – **ask Vaibhav before each live call**
-3. A-05 OCR API adapter at intake + issue check, raw response stored per paper
+3. A-05 OCR API adapter at intake + issue check, raw response stored per paper, **per-page timeout** (see 83-min read)
 4. E-06 + E-08 (merged) corrections stored next to the API reading; issue check accepts either; auto second
    API attempt – needed as soon as A-05 lands, or every corrected paper fails its issue check
 5. A-07 rate limit + retry → A-08 failure policy (make the xfail test pass) → A-09 remove Drive OCR → A-10 throughput
@@ -27,7 +41,7 @@ clients injected via the run context (`tests/fake_apis.py`). Suite: 34 passed + 
 9. C (one merged ticket) coded `✗ [E###]` lines for the codes ops actually hit
 10. D-02 live Daily Report tab → D-03 `report --date` (Google Sheet only)
 11. G-01 audit of intake + issue paths → H-02 production URLs + rotated key → H-04 README ops guide
-- Waiting on Vaibhav: F-03 `reset-test-data` (which rows are test; Karnataka sample data).
+- F-03 `reset-test-data` command: still waiting on Vaibhav (the 2026-10-27 reset was done by hand, see above).
 - Deferred: split API (D2), auto re-map (D7 – still allowed by ADR-0001, not built), vendors + reconciliation,
   stray-file adoption, Manual Issues tab, RE-OCR/RECHECK, Drive declutter, Shared Drive move, storage estimate.
 

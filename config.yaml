@@ -4,7 +4,7 @@ client_name: Shriram Finance
 
 # true  = preview only: reads + OCRs, writes the "Dry Run Preview" tab, moves NOTHING, writes NOTHING to the ledger
 # false = live
-dry_run: false
+dry_run: true              # locked 2026-10-27: test in dry run only (test data cleared). Live needs Vaibhav's OK.
 
 timezone: Asia/Kolkata
 workers: 8                 # parallel threads for OCR / allocation (6–8 is safe for Drive API limits)
