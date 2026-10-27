@@ -388,5 +388,23 @@ class DB:
     def save_output_sheet(self, d: date, state: str, label: str, sid: str) -> None:
         self.q("INSERT INTO output_sheets VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING", (d, state, label, sid))
 
+    # ---------------------------------------------------------------- reconciliation report (D-2/D-3, read-only)
+    def issued_by_state_amount(self, d_from: date, d_to: date) -> list[dict]:
+        """Non-cancelled allocations issued in [d_from, d_to], counted per (state, denomination). Read-only."""
+        return self.q("""SELECT state, denomination, count(*) AS qty FROM allocations
+                         WHERE alloc_date BETWEEN %s AND %s AND cancelled_at IS NULL
+                         GROUP BY state, denomination ORDER BY state, denomination""", (d_from, d_to))
+
+    def papers_by_vendor(self) -> list[dict]:
+        """Paper counts per (vendor_code, state, denomination), split into the five reconciliation buckets.
+        received = every paper; rejected bucket folds in E126 duplicates (REJECTED) and ERROR papers. Read-only."""
+        return self.q("""SELECT COALESCE(vendor_code,'(unknown)') AS vendor_code, state, denomination,
+                           count(*) AS received,
+                           count(*) FILTER (WHERE status='ASSIGNED')     AS issued,
+                           count(*) FILTER (WHERE status='AVAILABLE')    AS in_stock,
+                           count(*) FILTER (WHERE status='NEEDS_REVIEW') AS in_review,
+                           count(*) FILTER (WHERE status IN ('REJECTED','ERROR')) AS rejected
+                         FROM papers GROUP BY 1,2,3 ORDER BY 1,2,3""")
+
 
 UniqueViolation = errors.UniqueViolation

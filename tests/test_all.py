@@ -107,7 +107,7 @@ def env(settings):
     g = FakeGoogle()
     root = g.folder("Shriram eStamp (Python)")
     for key in ["upload_inbox", "upload_archive", "needs_review", "inventory_root", "orders_incoming",
-                "orders_processed", "orders_rejected", "output_root", "backup_root"]:
+                "orders_processed", "orders_rejected", "output_root", "backup_root", "reconciliation_root"]:
         settings.raw["folders"][key] = g.folder(key, root)
     settings.raw["control_sheet_id"] = g.add("control", GSHEET, root, tabs={})
     db = DB(DB_URL, "estamp_test", max_size=12)
@@ -441,6 +441,103 @@ def test_output_never_appends_a_lan_twice_across_a_crash(env):
     run_outputs(_ctx(s, db, g))
     rows = mh200()
     assert len(rows) == 3 and rows[2][5].startswith("CANCELLED"), rows
+
+
+# ============================================================ D-2/D-3 report + vendor reconciliation
+
+def _alloc(db, lan, state, denom, d, cancelled=False):
+    """Seed one allocation (and a backing paper) straight into the ledger for report tests."""
+    pid = db.insert_paper(state=state, denomination=denom, status="ASSIGNED", cert_no=f"C-{lan}")
+    oid = db.q1("""INSERT INTO orders(lan, lan_key, state, denomination, status)
+                   VALUES (%s,%s,%s,%s,'DONE') RETURNING id""", (lan, lan.lower(), state, denom))["id"]
+    db.q("""INSERT INTO allocations(order_id, paper_id, lan, cert_no, state, denomination, alloc_date, cancelled_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s, CASE WHEN %s THEN now() ELSE NULL END)""",
+         (oid, pid, lan, f"C-{lan}", state, denom, d, cancelled))
+
+
+@e2e
+def test_report_per_state_rows_and_total(env):
+    """One row per (state, stamp duty); a state with two amounts yields two rows; a Total row at the end.
+    Quantity counts non-cancelled allocations issued that date; cancelled ones never count. Amount and the
+    totals are sheet formulas (so ops edits recalc)."""
+    from datetime import date
+
+    from estamp.report import run_report
+    s, db, g = env
+    d = date(2026, 10, 28)
+    _alloc(db, "L1", "MH", 200, d)
+    _alloc(db, "L2", "MH", 200, d)
+    _alloc(db, "L3", "MH", 500, d)                 # MH has two amounts → two rows
+    _alloc(db, "L4", "KA", 500, d)
+    _alloc(db, "L5", "KA", 500, d, cancelled=True)  # cancelled → not counted
+    _alloc(db, "L6", "TN", 200, date(2026, 10, 27))  # different date → excluded
+
+    sid = run_report(_ctx(s, db, g), d, d)
+    rows = g.sheets_data[sid]["Daily Report"]
+    assert rows[0] == ["State", "Stamp Duty (₹)", "Quantity", "Amount (₹)"]
+    body = rows[1:-1]
+    quantities = {(r[0], r[1]): r[2] for r in body}
+    assert quantities == {("MH", 200): 2, ("MH", 500): 1, ("KA", 500): 1}, body
+    assert len([r for r in body if r[0] == "MH"]) == 2, "state with two amounts → two rows"
+    assert "TN" not in {r[0] for r in body}, "other dates excluded"
+    for r in body:
+        assert str(r[3]).startswith("="), f"Amount must be a formula: {r}"
+    total = rows[-1]
+    assert total[0] == "Total"
+    assert str(total[2]).startswith("=") and str(total[3]).startswith("="), "totals must be formulas"
+    assert g.path_of(sid).startswith("reconciliation_root/2026-10-28/"), g.path_of(sid)
+
+
+@e2e
+def test_report_rerun_replaces_the_sheet(env):
+    """Re-running the same date replaces the sheet – one Daily Report sheet for that date (reused, not deleted)."""
+    from datetime import date
+
+    from estamp.report import run_report
+    s, db, g = env
+    d = date(2026, 10, 28)
+    _alloc(db, "L1", "MH", 200, d)
+    sid1 = run_report(_ctx(s, db, g), d, d)
+    _alloc(db, "L2", "MH", 200, d)
+    sid2 = run_report(_ctx(s, db, g), d, d)
+
+    assert sid1 == sid2, "re-run must reuse the same sheet, never create a second"
+    daily = [f for f in g.files.values() if f["name"] == "Daily Report" and not f["trashed"]]
+    assert len(daily) == 1, f"re-run must replace, not accumulate: {len(daily)} sheets"
+    assert g.sheets_data[sid2]["Daily Report"][1][2] == 2, "re-run reflects the newer counts"
+    assert any("replace" in e["details"].lower() for e in db.q("SELECT details FROM events")), "replacement logged"
+
+
+@e2e
+def test_vendor_reconciliation_balances_and_flags_e402(env):
+    """Per vendor × state × stamp duty: received / issued / in stock / in review / rejected-or-duplicate.
+    Balance check passes when received = issued + in stock + in review + rejected; a mismatch emits E402."""
+    from datetime import date
+
+    from estamp.report import run_report
+    s, db, g = env
+    # PAPEREASE / MH / 200: 1 issued + 1 available + 1 review + 1 rejected = 4 received → balances
+    db.insert_paper(vendor_code="PAPEREASE", state="MH", denomination=200, status="ASSIGNED", cert_no="A1")
+    db.insert_paper(vendor_code="PAPEREASE", state="MH", denomination=200, status="AVAILABLE", cert_no="A2")
+    db.insert_paper(vendor_code="PAPEREASE", state="MH", denomination=200, status="NEEDS_REVIEW", cert_no="A3")
+    db.insert_paper(vendor_code="PAPEREASE", state="MH", denomination=200, status="REJECTED", cert_no="A4")
+
+    d = date(2026, 10, 28)
+    sid = run_report(_ctx(s, db, g), d, d)
+    recon = g.sheets_data[sid]["Vendor Reconciliation"]
+    hdr = recon[0]
+    for col in ["Rate per paper (₹)", "Payable", "Disputed", "Net payable"]:
+        assert any(col in c for c in hdr), hdr
+    row = next(r for r in recon[1:] if r[0] == "PAPEREASE")
+    # received, issued, in stock, in review, rejected columns (after vendor/state/duty)
+    assert row[3:8] == [4, 1, 1, 1, 1], row
+    assert all(str(c).startswith("=") for c in row[-3:]), row  # Payable / Disputed / Net payable are formulas
+    assert not any("E402" in e["details"] for e in db.q("SELECT details FROM events")), "balanced → no E402"
+
+    # Now make it NOT balance: a RESERVED paper is received but in none of the five buckets.
+    db.insert_paper(vendor_code="PAPEREASE", state="MH", denomination=200, status="RESERVED", cert_no="A5")
+    run_report(_ctx(s, db, g), d, d)
+    assert any("E402" in e["details"] for e in db.q("SELECT details FROM events")), "mismatch → E402"
 
 
 @e2e
