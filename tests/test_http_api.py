@@ -185,3 +185,26 @@ def test_limiter_for_keeps_one_limiter_per_api_and_rate():
 def test_4xx_other_than_auth_and_429_is_returned_without_retry():
     out, n, _ = _run([Resp(400), Resp(200)])
     assert out.status_code == 400 and n == 1
+
+
+def test_a_pause_does_not_freeze_other_threads():
+    """H-4: during a 429 pause the limiter must NOT hold its lock while sleeping, or one 429 serializes every OCR
+    worker. With the fix all callers wait in parallel; the old lock-while-sleeping code would peak at 1 sleeper."""
+    peak, cur, lk = [0], [0], threading.Lock()
+
+    def rec_sleep(s):
+        with lk:
+            cur[0] += 1
+            peak[0] = max(peak[0], cur[0])
+        time.sleep(s)
+        with lk:
+            cur[0] -= 1
+
+    lim = RateLimiter(1000, sleep=rec_sleep)      # high rate → the window never blocks; only the pause sleeps
+    lim.pause(0.05)
+    ts = [threading.Thread(target=lim.acquire) for _ in range(4)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(2)
+    assert peak[0] >= 2, f"a pause serialized callers (peak={peak[0]}) – the lock is held during sleep (H-4)"

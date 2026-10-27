@@ -163,16 +163,18 @@ def _ocr_zoop(data: bytes, name: str, settings: Settings) -> OcrResult:
     'Not found' codes (211/212) are a normal reading – the paper checks report what is missing. Rate limit, retries
     and the per-page time cap (timeout_s per try, max_total_s overall) come from http_api / config."""
     c = settings.get("zoop_api.ocr") or {}
+    # Production endpoint comes from .env (ESTAMP_OCR_URL); dev falls back to zoop_api.ocr.url in config.yaml.
+    url = settings.env("zoop_api.ocr.url_env") or c.get("url")
     key, org = settings.env("zoop_api.ocr.api_key_env"), settings.env("zoop_api.ocr.org_acc_env")
-    if not c.get("url") or not c.get("config_id"):
-        raise RuntimeError("zoop_api.ocr.url / config_id is not set in config.yaml")
+    if not url or not c.get("config_id"):
+        raise RuntimeError("OCR endpoint not set – set ESTAMP_OCR_URL in .env (or zoop_api.ocr.url) and zoop_api.ocr.config_id")
     if not key or not org:
         raise RuntimeError(f"{c.get('api_key_env')} / {c.get('org_acc_env')} must be set in .env")
     body = {"mode": "sync", "ocr_config_id": c["config_id"], "documents": [{"data": base64.b64encode(data).decode()}]}
     timeout = int(c.get("timeout_s", 60))
     try:
         res = api_call(settings, "ocr", lambda: requests.post(
-            c["url"], json=body, timeout=timeout,
+            url, json=body, timeout=timeout,
             headers={"x-zoop-key": key, "x-zoop-org-acc": org, "Content-Type": "application/json"}))
     except requests.Timeout:
         raise RuntimeError(f"OCR API timed out after {timeout} s ('{name}')")

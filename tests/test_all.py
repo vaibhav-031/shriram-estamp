@@ -825,6 +825,17 @@ def test_ocr_api_request_and_fields(settings, ocr_api):
     assert c["timeout"] == settings.get("zoop_api.ocr.timeout_s")
 
 
+def test_ocr_endpoint_is_taken_from_env_over_config(settings, ocr_api, monkeypatch):
+    """Production OCR endpoint comes from .env (ESTAMP_OCR_URL) and overrides the dev url in config.yaml."""
+    from estamp.ocr_split import _ocr_zoop
+    calls, reply = ocr_api
+    monkeypatch.setenv("ESTAMP_OCR_URL", "https://prod-ocr.example/do")
+    reply["resp"] = _ocr_resp(_f(certification_no="IN-HP90000000000001A", state_code="HP", stamp_duty_amount="100"))
+    _ocr_zoop(b"%PDF-page", "up.pdf_p1", settings)
+    assert calls[-1]["url"] == "https://prod-ocr.example/do"
+    assert settings.get("zoop_api.ocr.url") != "https://prod-ocr.example/do"   # env won over the config fallback
+
+
 def test_ocr_api_not_found_is_a_reading_not_an_error(settings, ocr_api):
     """211 'Certificate number not found' (e.g. a back page) comes back as empty fields – the checks decide."""
     from estamp.ocr_split import _ocr_zoop
