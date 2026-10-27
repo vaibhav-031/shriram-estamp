@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from .extract import (PaperAnalysis, analyze_fields, analyze_paper, first_broken_pair, ids_in_reading,
                       pages_per_paper, safe_file_name)
 from .google_clients import FOLDER, PDF, parse_time
+from .http_api import ApiAuthError
 from .ocr_split import _split_local, merge_pdfs
 
 
@@ -119,9 +120,11 @@ def _read_units(ctx: Ctx, data: bytes, name: str) -> list[Unit]:
 
     def read(no):
         try:
-            return no, (ctx.ocr.read(singles[no - 1].data, f"{name}_p{no}"), "")
+            return no, (ctx.ocr.read(singles[no - 1].data, f"{name}_p{no}"), "", None)
+        except ApiAuthError as e:
+            return no, (None, f"OCR failed on page {no}: {e}", e)   # auth failure: surfaced loudly, never retried
         except Exception as e:
-            return no, (None, f"OCR failed on page {no}: {e}")
+            return no, (None, f"OCR failed on page {no}: {e}", None)
         finally:
             with ctx._lock:
                 done[0] += 1
@@ -131,20 +134,25 @@ def _read_units(ctx: Ctx, data: bytes, name: str) -> list[Unit]:
     with ThreadPoolExecutor(max_workers=int(s.get("workers", 8))) as ex:
         reads = dict(ex.map(read, range(1, len(singles) + 1)))
 
+    # A-08/D1: if ANY page failed OCR, the whole upload stays in the inbox and is retried next cycle – never
+    # stocked or reviewed page by page on a transient blip. An auth failure (401/403) surfaces loudly, not looped.
+    auth = next((reads[no][2] for no in sorted(reads) if reads[no][2] is not None), None)
+    if auth is not None:
+        raise auth
+    first_err = next((reads[no][1] for no in sorted(reads) if reads[no][1]), "")
+    if first_err:
+        raise RuntimeError(f"{first_err} – whole upload stays in the inbox, retried next cycle")
+
+    # Past this point every page read cleanly (any failure raised above).
     def ids(no):
-        r, e = reads[no]
-        return [] if e else ids_in_reading(r.text, r.cert, r.fields, s, ctx.matcher, ctx.resolver)
+        r = reads[no][0]
+        return ids_in_reading(r.text, r.cert, r.fields, s, ctx.matcher, ctx.resolver)
 
     page_ids = {no: ids(no) for no in reads}
     deciding = next((no for no in sorted(reads) if len(page_ids[no]) == 1), None)
     if deciding is None:
-        first_err = next((e for r, e in reads.values() if e), "")
-        if first_err:       # can't tell the type while pages are unreadable – retry the whole file next cycle
-            raise RuntimeError(f"{first_err} – the paper type can't be decided, retried next cycle")
         raise WholeUploadReview("E105", "no page has a readable certificate / serial, so 1- or 2-page papers can't "
                                         "be told apart. Check the file")
-    if any(e for no, (r, e) in reads.items() if no < deciding):
-        raise RuntimeError(f"{reads[min(no for no, (r, e) in reads.items() if e)][1]} – retried next cycle")
     size = pages_per_paper(page_ids[deciding][0], s)
     clash = [(no, h.cert) for no in sorted(reads) for h in page_ids[no] if pages_per_paper(h, s) != size]
     if clash:
@@ -164,19 +172,16 @@ def _read_units(ctx: Ctx, data: bytes, name: str) -> list[Unit]:
 
     def unit(p):
         pages = range(p.page_from, p.page_to + 1)
-        first, err = reads[p.page_from]
-        texts = [reads[no][0].text if reads[no][0] else "" for no in pages]
-        error = next((reads[no][1] for no in pages if reads[no][1]), "")
+        first = reads[p.page_from][0]
+        texts = [reads[no][0].text for no in pages]
         raw = None
-        if first is not None and first.fields is not None:
-            raw = {"fields": first.fields, "responses": {str(no): reads[no][0].raw for no in pages if reads[no][0]}}
-        return Unit(p.page_from, p.page_to, [p.data], texts, first.cert if first else "",
-                    first.via if first else "error", error, first.fields if first else None, raw)
+        if first.fields is not None:
+            raw = {"fields": first.fields, "responses": {str(no): reads[no][0].raw for no in pages}}
+        return Unit(p.page_from, p.page_to, [p.data], texts, first.cert, first.via, "", first.fields, raw)
 
     units = [unit(p) for p in pieces]
     if size == 2:
-        # A pair whose OCR failed can't prove or disprove the pairing; it goes to review on its own error.
-        counts = [(1, 0) if u.error else (len(page_ids[u.page_from]), len(page_ids[u.page_to])) for u in units]
+        counts = [(len(page_ids[u.page_from]), len(page_ids[u.page_to])) for u in units]
         k = first_broken_pair(counts)
         if k is not None:
             at = pieces[k].page_from
@@ -247,6 +252,28 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
         g.move_rename(f["id"], g.folder_path(s.folder(NEEDS_REVIEW), [today]))
         ctx.stats.uploads += 1
         ctx.event("WARN", "Needs review", f"'{f['name']}' (whole file): {w}", ref=f["id"])
+        return
+    except ApiAuthError as e:
+        # A-08: a bad key is a human fix, not a timeout – stop this upload loudly, keep it in the inbox, never loop.
+        ctx.event("ERROR", "Intake", f"'{f['name']}': OCR API refused the request – {e}. Fix the API key, then it "
+                  "reads next cycle. Not retried this cycle.", ref=f["id"], alert_key=f"intakeauth|{f['id']}")
+        return
+    except RuntimeError as e:
+        # A-08/D1: OCR (or split) failed. The whole upload stays in the inbox and is retried next cycle – unless it
+        # has been failing for longer than the give-up window, when it moves to Needs Review as a whole with an alert.
+        give_up = int(s.get("intake.ocr_fail_give_up_minutes", 30))
+        failing_for = (datetime.now(timezone.utc) - up["created_at"]).total_seconds()
+        if failing_for < give_up * 60:
+            ctx.event("WARN", "Intake", f"'{f['name']}': {e} – stays in the inbox, retried next cycle", ref=f["id"],
+                      alert_key=f"intakefail|{f['id']}")
+            return
+        reason = (f"OCR kept failing for over {give_up} min ({e}). Moved to Needs Review as a whole – nothing was "
+                  "stocked. Check the API / the file, then upload it again as a new file.")
+        db.upload_finish(up["id"], "REVIEW", 0, reason)
+        g.move_rename(f["id"], g.folder_path(s.folder("needs_review"), [today]))
+        ctx.stats.uploads += 1
+        ctx.event("WARN", "Needs review", f"'{f['name']}' (whole file): {reason}", ref=f["id"],
+                  alert_key=f"intakegiveup|{f['id']}")
         return
     done = db.pages_done(up["id"])
     todo = [u for u in units if u.page_from not in done]

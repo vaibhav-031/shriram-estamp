@@ -368,7 +368,6 @@ def test_intake_and_issue_check_read_through_the_context_clients(env):
 
 
 @e2e
-@pytest.mark.xfail(strict=True, reason="ticket A-08 not built: today one failed page goes to Needs Review on its own")
 def test_ocr_failure_keeps_the_whole_upload_in_the_inbox(env):
     """A-08: a read failure leaves the whole upload in the Upload Inbox for the next cycle – nothing half-stocked."""
     from estamp.cycle import run_cycle
@@ -378,6 +377,44 @@ def test_ocr_failure_keeps_the_whole_upload_in_the_inbox(env):
     assert run_cycle(Ctx(s, db, g, ocr=FakeOcr(fail={"vendor_MH_200_1.pdf_p2": RuntimeError("OCR API HTTP 503")})))
     assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
     assert [f["id"] for f in g.list_children(s.folder("upload_inbox"))] == [up]
+    assert db.q1("SELECT status FROM uploads")["status"] == "PROCESSING"   # still retryable next cycle
+
+
+@e2e
+def test_ocr_failure_escalates_to_needs_review_after_the_give_up_window(env):
+    """A-08/D1: once an upload has failed to read for longer than intake.ocr_fail_give_up_minutes, the WHOLE upload
+    moves to Needs Review (not stocked page by page) with a clear reason + ops alert, instead of retrying forever."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeOcr
+    s, db, g = env
+    up = _stock(g, s, "MH", 200, 3)
+    ocr = FakeOcr(fail={"vendor_MH_200_1.pdf_p2": RuntimeError("OCR API HTTP 503")})
+    # First cycle: failure, upload stays in the inbox, first-failure time recorded as now().
+    assert run_cycle(Ctx(s, db, g, ocr=ocr))
+    assert [f["id"] for f in g.list_children(s.folder("upload_inbox"))] == [up]
+    # Simulate the give-up window having elapsed since the first failure.
+    give_up = int(s.get("intake.ocr_fail_give_up_minutes", 30))
+    db.q("UPDATE uploads SET created_at = now() - make_interval(mins => %s)", (give_up + 1,))
+    assert run_cycle(Ctx(s, db, g, ocr=ocr))
+    assert db.q1("SELECT count(*) n FROM papers")["n"] == 0, "whole upload to review, never stocked page by page"
+    assert db.q1("SELECT status FROM uploads")["status"] == "REVIEW"
+    assert "OCR" in (db.q1("SELECT notes FROM uploads")["notes"] or "")
+    assert g.list_children(s.folder("upload_inbox")) == [], "upload left the inbox"
+    assert db.q1("SELECT count(*) n FROM events WHERE action='Needs review' AND level='WARN'")["n"] >= 1
+
+
+@e2e
+def test_ocr_auth_failure_stops_the_upload_loudly_without_retrying(env):
+    """A-08: a 401/403 (ApiAuthError) must surface clearly and keep the upload in the inbox – not loop silently."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeOcr
+    s, db, g = env
+    up = _stock(g, s, "MH", 200, 2)
+    ocr = FakeOcr(fail={"vendor_MH_200_1.pdf_p1": ApiAuthError("refused (HTTP 401)")})
+    assert run_cycle(Ctx(s, db, g, ocr=ocr))
+    assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
+    assert [f["id"] for f in g.list_children(s.folder("upload_inbox"))] == [up]
+    assert db.q1("SELECT count(*) n FROM events WHERE level='ERROR' AND details ILIKE '%401%'")["n"] >= 1
 
 
 # ============================================================ split API (replays docs/api-samples/split)
