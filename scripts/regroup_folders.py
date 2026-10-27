@@ -65,7 +65,8 @@ def main(argv=None) -> int:
     g = Google(s)
 
     root = g.get_file(s.folder(K.UPLOAD_INBOX))["parents"][0]   # the eStamp root = inbox's parent
-    system_id = g.folder_path(root, [SYSTEM_NAME]) if args.apply else None
+    # --apply creates System if missing; dry-run only looks it up (read-only) so the preview is accurate.
+    system_id = g.folder_path(root, [SYSTEM_NAME]) if args.apply else _find_child(g, root, SYSTEM_NAME)
     current = {key: g.get_file(s.folder(key)) for key in INTERNAL + list(HUMAN)}
     plan = build_plan(current, system_id)
 
@@ -91,6 +92,11 @@ def main(argv=None) -> int:
 
 def _key_of(current: dict[str, dict], name: str) -> str:
     return next(k for k, f in current.items() if f["name"] == name)
+
+
+def _find_child(g, parent: str, name: str) -> str | None:
+    """Read-only: the id of the sub-folder named `name` under `parent`, or None. Never creates anything."""
+    return next((f["id"] for f in g.list_children(parent, folders=True) if f["name"] == name), None)
 
 
 if __name__ == "__main__":
