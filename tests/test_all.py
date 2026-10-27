@@ -351,3 +351,21 @@ def test_real_estamp_text(settings, text, ref, state, amount):
     r = StateResolver(settings.states); m = CertMatcher(settings.get("intake.cert_patterns"), r)
     a = analyze_paper(text, "", settings, m, lambda c: False)
     assert (a.cert, a.state, a.amount, a.issues) == (ref, state, amount, [])
+
+
+@pytest.mark.parametrize("words,n", [("One Hundred", 100), ("One Hundred Ninety Five", 195), ("One Thousand", 1000),
+                                     ("Three Hundred Fifty", 350), ("Fifty", 50), ("One Lakh Twenty Thousand", 120000)])
+def test_words_to_number(words, n):
+    from estamp.extract import words_to_number
+    assert words_to_number(words) == n
+
+
+@pytest.mark.parametrize("variant", [
+    "SUBIN-UPUP1405480472259151020965Y\nStamp Duty Amount (Rs.)\n23-Sep-2026\nSHRIRAM\n(One Hundred only)\nINDIA NON JUDICIAL",
+    "\\*0000000100\nSUBIN-UPUP1405480472259151020965Y\nStamp Duty Amount (Rs.)\nSHRIRAM FINANCE LIMITED",
+])
+def test_up_estamp_amount_layout_variants(settings, variant):
+    """Amount found even when the number isn't next to its label (words, or the *0000000100 code)."""
+    r = StateResolver(settings.states); m = CertMatcher(settings.get("intake.cert_patterns"), r)
+    a = analyze_paper(variant, "", settings, m, lambda c: False)
+    assert (a.state, a.amount, a.issues) == ("UP", 100, [])
