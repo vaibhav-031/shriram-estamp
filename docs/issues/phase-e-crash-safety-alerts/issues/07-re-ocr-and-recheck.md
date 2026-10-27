@@ -1,6 +1,6 @@
 # 07: RE-OCR and RECHECK review actions
 
-Status: ready-for-agent
+Status: needs-triage
 
 **What to build:** in Review Actions, RE-OCR sends the paper to the API again and re-runs the checks; RECHECK
 re-validates the stored API result after a config fix, with no API call. Passing papers move into Inventory.
@@ -13,3 +13,4 @@ re-validates the stored API result after a config fix, with no API call. Passing
 - [ ] README review-action docs updated
 
 ## Comments
+- 2026-10-27 Vaibhav: deferred – not on the approved shortlist (see HANDOFF.md → Current status).

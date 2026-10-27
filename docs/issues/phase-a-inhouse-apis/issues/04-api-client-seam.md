@@ -13,3 +13,4 @@ the code does today.
 - [ ] All existing tests pass unchanged, 5× in a row
 
 ## Comments
+- 2026-10-27: done. Open review points for the dev team: intake still reads `intake.split_provider` to decide grouping instead of asking the splitter; fakes can script failures but not OCR values; FakeOcr failure keys match by substring (`_p2` also hits `_p20`); issue check still splits with the private pypdf helper; new Ctx fields sit before `resolver` (keyword use only); ConfiguredOcr captures `google` at construction.

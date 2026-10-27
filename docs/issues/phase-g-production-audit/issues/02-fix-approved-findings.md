@@ -11,3 +11,4 @@ this placeholder once the report is approved.
 - [ ] AUDIT.md updated with the outcome per finding
 
 ## Comments
+- 2026-10-27 Vaibhav: deferred – not on the approved shortlist (see HANDOFF.md → Current status).

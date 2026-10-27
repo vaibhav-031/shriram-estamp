@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from .context import Ctx
 from .extract import identify, normalize_ocr, safe_file_name
 from .google_clients import file_link
-from .ocr_split import _split_local, read_paper
+from .ocr_split import _split_local
 
 
 class CertMismatch(RuntimeError):
@@ -31,7 +31,7 @@ def verify_issued(ctx: Ctx, file_id: str, expected: str, name: str) -> tuple[str
     """OCR every page of the issued file; return (id found, via). Raises CertMismatch unless it is exactly `expected`."""
     texts, via = [], ""
     for p in _split_local(ctx.google.download(file_id), 1):
-        r = read_paper(p.data, f"{name}_p{p.page_from}", ctx.settings, ctx.google)
+        r = ctx.ocr.read(p.data, f"{name}_p{p.page_from}")
         texts.append(r.text + ("\n" + r.cert if r.cert else ""))
         via = r.via
     found = {h.cert for h in identify(normalize_ocr("\n".join(texts)), ctx.settings, ctx.matcher, ctx.resolver)}

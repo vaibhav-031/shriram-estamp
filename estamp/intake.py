@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 from .extract import PaperAnalysis, analyze_paper, identify, normalize_ocr, safe_file_name
 from .google_clients import FOLDER, PDF, parse_time
-from .ocr_split import merge_pdfs, read_paper, split_pdf
+from .ocr_split import merge_pdfs
 
 
 def _collect(g, folder_id: str, depth: int = 0, max_depth: int = 4) -> tuple[list[dict], list[dict]]:
@@ -92,14 +92,14 @@ def _read_units(ctx: Ctx, data: bytes, name: str) -> list[Unit]:
     Grouping rule: a page carrying a certificate/serial starts a new paper. A page WITHOUT one that directly
     follows the front page of a PHYSICAL paper is that paper's back side. E-stamps are always one page.
     Anything else stands alone (and will go to Needs Review with the reason)."""
-    s, g = ctx.settings, ctx.google
-    pieces = split_pdf(data, name, s)
+    s = ctx.settings
+    pieces = ctx.splitter.split(data, name)
     ctx.event("INFO", "Intake", f"'{name}': {len(pieces)} page(s)/piece(s) – reading them now")
     done = [0]
 
     def read(p):
         try:
-            r = read_paper(p.data, f"{name}_p{p.page_from}", s, g)
+            r = ctx.ocr.read(p.data, f"{name}_p{p.page_from}")
             out = (r.text, r.cert, r.via, "")
         except Exception as e:
             out = ("", "", "error", f"OCR failed: {e}")

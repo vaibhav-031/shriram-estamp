@@ -1,5 +1,40 @@
 # Shriram eStamp – Handoff (Claude Code + dev team)
 
+## Current status (2026-10-27) – read this first
+
+**Works today (pilot code, `config.yaml` has `dry_run: false` = LIVE):** Upload Inbox → pypdf page split → read
+each page from its PDF text layer, else **Google Drive OCR** → pages grouped into papers by content → checks →
+`Inventory/<STATE>/<AMOUNT>/` or Needs Review. Order files → PENDING LANs → issue with `FOR UPDATE SKIP LOCKED` →
+issue check (second OCR) → output sheets, control sheet, Slack/SMTP/heartbeat alerts. The in-house OCR/split API
+code is an unused stub written against a guessed contract.
+
+**Committed:** this plan, `GLOSSARY.md`, `docs/adr/0001–0005`, specs + tickets in `docs/issues/`, CLAUDE.md
+amended to ADR-0001. Code: A-01 volume test (~1,000 LANs, zero double issue), A-02 README fixes, A-04 OCR/split
+clients injected via the run context (`tests/fake_apis.py`). Suite: 34 passed + 1 expected-fail (A-08 target).
+
+**Not built:** everything else below. No live API call made; real Drive and `shriram_estamp` untouched.
+
+**Shortlist for the dev team, in priority order** (tickets in `docs/issues/`; deferred tickets are `needs-triage`):
+1. E-01 never append a LAN twice to an output sheet (real gap in today's live flow)
+2. A-03 capture redacted OCR API samples – **ask Vaibhav before each live call**
+3. A-05 OCR API adapter at intake + issue check, raw response stored per paper
+4. E-06 + E-08 (merged) corrections stored next to the API reading; issue check accepts either; auto second
+   API attempt – needed as soon as A-05 lands, or every corrected paper fails its issue check
+5. A-07 rate limit + retry → A-08 failure policy (make the xfail test pass) → A-09 remove Drive OCR → A-10 throughput
+6. B-01…B-03 (+B-04 merged) paper type, 1/2-page split **with local pypdf** (split API deferred), pairing safety
+7. E-02 self-heal stuck issues → E-09 crash-resume tests
+8. E-10 + E-11 (merged) Gmail major-issue emails + CRASH/HEARTBEAT; keep the heartbeat URL
+9. C (one merged ticket) coded `✗ [E###]` lines for the codes ops actually hit
+10. D-02 live Daily Report tab → D-03 `report --date` (Google Sheet only)
+11. G-01 audit of intake + issue paths → H-02 production URLs + rotated key → H-04 README ops guide
+- Waiting on Vaibhav: F-03 `reset-test-data` (which rows are test; Karnataka sample data).
+- Deferred: split API (D2), auto re-map (D7 – still allowed by ADR-0001, not built), vendors + reconciliation,
+  stray-file adoption, Manual Issues tab, RE-OCR/RECHECK, Drive declutter, Shared Drive move, storage estimate.
+
+⚠️ **The OCR API key was shared in chat – rotate it before go-live.** Keys live only in `.env`; never commit them.
+
+---
+
 Owner: Vaibhav (APM, ZoopSign). Status: working pilot on a Mac; this document defines the work to make it
 production-ready. Put this file in the repo root as `HANDOFF.md`. Rules in `CLAUDE.md` always apply.
 
@@ -368,7 +403,7 @@ Tests: alert routing (major vs not), dedup window, digest, no secrets/PII in bod
 
 ## 13. Definition of done (every phase)
 
-All tests pass 5× in a row · new behaviour covered by tests (incl. failure paths) · volume test at 10.8k LANs
+All tests pass 5× in a row · new behaviour covered by tests (incl. failure paths) · volume test (~1,000 LANs, decided 2026-10-27)
 passes with zero double allocation · README updated · no new manual step for ops unless approved · committed with
 a clear message after built-in `code-review`.
 

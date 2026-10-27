@@ -14,3 +14,4 @@ It guards every later phase (definition of done).
 - [ ] HANDOFF.md definition of done says "~1,000 LANs" instead of "10.8k"
 
 ## Comments
+- 2026-10-27: done. Runs every suite run with the fake OCR client; 3.7 s per run. Proven to fail when paper reservation is broken.

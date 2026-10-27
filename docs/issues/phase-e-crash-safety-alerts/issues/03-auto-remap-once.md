@@ -1,6 +1,6 @@
 # 03: Re-map once after a failed issue check (D7, ADR-0001)
 
-Status: ready-for-agent
+Status: needs-triage
 
 **What to build:** when the issue check fails, the issued PDF moves to Needs Review/<date>/Cert mismatch, the paper
 is quarantined, and the same LAN gets the next Inventory paper (E302). A second failure on the same LAN puts it in
@@ -14,3 +14,4 @@ ERROR (E303).
 - [ ] Ops README describes what E302/E303 mean and what to check
 
 ## Comments
+- 2026-10-27 Vaibhav: deferred – not on the approved shortlist (see HANDOFF.md → Current status).

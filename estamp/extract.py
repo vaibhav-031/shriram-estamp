@@ -1,6 +1,6 @@
 """Pure logic (no Google, no DB): state resolution, OCR parsing, paper checks, order-sheet parsing.
 
-Everything here is unit-tested in tests/test_extract.py.
+Everything here is unit-tested in tests/test_all.py (the tests that take no DB / Drive fixture).
 """
 from __future__ import annotations
 

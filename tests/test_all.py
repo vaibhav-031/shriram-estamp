@@ -268,6 +268,69 @@ def test_inbox_accepts_uploaded_folders(env):
     assert paths and paths[0].startswith("upload_archive/"), paths
 
 
+@e2e
+def test_volume_no_double_issue(env):
+    """~1,000 LANs over four state + stamp duty groups (TN short by 50): every LAN gets at most one paper,
+    no paper is issued twice, and the LANs without stock stay PENDING. Guard for every phase (definition of done)."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeOcr
+    s, db, g = env
+    groups = [("MH", 200, 300, 300), ("UP", 100, 300, 300), ("GJ", 300, 200, 200), ("TN", 200, 200, 150)]
+    rows = [samples.H]
+    for st, amt, lans, papers in groups:
+        rows += [[str(len(rows)), f"VOL-{st}-{i:05d}", "c", "b", st, str(amt)] for i in range(lans)]
+        _stock(g, s, st, amt, papers)
+    g.add("volume_orders", GSHEET, s.folder("orders_incoming"), tabs={"x": rows})
+
+    for _ in range(3):                       # a cycle is time-boxed; repeat until nothing is left to issue
+        assert run_cycle(Ctx(s, db, g, ocr=FakeOcr()))   # fake reader: independent of Drive OCR / text layer
+        if not db.pending_groups() or all(grp["avail"] == 0 for grp in db.pending_groups()):
+            break
+
+    st = {r["status"]: r["n"] for r in db.q("SELECT status, count(*) n FROM orders GROUP BY 1")}
+    assert st == {"DONE": 950, "PENDING": 50}, st
+    assert {r["state"] for r in db.q("SELECT state FROM orders WHERE status='PENDING'")} == {"TN"}
+    allocs = db.q("SELECT * FROM allocations WHERE cancelled_at IS NULL")
+    assert len(allocs) == 950
+    assert len({a["paper_id"] for a in allocs}) == 950, "a paper was issued twice"
+    assert len({a["order_id"] for a in allocs}) == 950, "a LAN got two papers"
+    assert len({a["pdf_file_id"] for a in allocs}) == 950
+    assert db.q1("SELECT count(*) n FROM papers WHERE status='ASSIGNED'")["n"] == 950
+    assert db.q1("SELECT count(*) n FROM papers WHERE status NOT IN ('ASSIGNED')")["n"] == 0
+    for a in allocs:
+        assert g.path_of(a["pdf_file_id"]).endswith(f"/{a['lan']}.pdf")
+
+
+@e2e
+def test_intake_and_issue_check_read_through_the_context_clients(env):
+    """Intake splits and reads, and the issue check reads, only through the run context's split + OCR clients."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeOcr, FakeSplitter
+    s, db, g = env
+    _stock(g, s, "MH", 200, 2)
+    g.add("orders", GSHEET, s.folder("orders_incoming"),
+          tabs={"x": [samples.H, ["1", "LAN-A", "c", "b", "MH", "200"]]})
+    ocr, splitter = FakeOcr(), FakeSplitter()
+    assert run_cycle(Ctx(s, db, g, ocr=ocr, splitter=splitter))
+    assert splitter.calls == ["vendor_MH_200_1.pdf"]
+    assert sorted(ocr.calls) == ["LAN-A.pdf_p1", "vendor_MH_200_1.pdf_p1", "vendor_MH_200_1.pdf_p2"]
+    a = db.q1("SELECT * FROM allocations")
+    assert a["lan"] == "LAN-A" and a["verified_via"] == "fake"
+
+
+@e2e
+@pytest.mark.xfail(strict=True, reason="ticket A-08 not built: today one failed page goes to Needs Review on its own")
+def test_ocr_failure_keeps_the_whole_upload_in_the_inbox(env):
+    """A-08: a read failure leaves the whole upload in the Upload Inbox for the next cycle – nothing half-stocked."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeOcr
+    s, db, g = env
+    up = _stock(g, s, "MH", 200, 3)
+    assert run_cycle(Ctx(s, db, g, ocr=FakeOcr(fail={"_p2": RuntimeError("OCR API HTTP 503")})))
+    assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
+    assert [f["id"] for f in g.list_children(s.folder("upload_inbox"))] == [up]
+
+
 def test_real_rajasthan_ocr_text(settings):
     """OCR text captured from the vendor's real scan (front + back of a physical RJ stamp paper)."""
     from estamp.extract import identify

@@ -1,6 +1,6 @@
 # 05: Manual Issues tab (system-down fallback)
 
-Status: ready-for-agent
+Status: needs-triage
 
 **What to build:** a Manual Issues tab (`LAN | Paper ID | Issued by | Result | Processed At`). When ops issued a
 paper by hand, the service validates it (LAN PENDING, paper AVAILABLE, same state + stamp duty) and records it
@@ -13,3 +13,4 @@ only Result and Processed At.
 - [ ] The ops runbook row "System down, must issue by hand" in README matches the behaviour
 
 ## Comments
+- 2026-10-27 Vaibhav: deferred – not on the approved shortlist (see HANDOFF.md → Current status).

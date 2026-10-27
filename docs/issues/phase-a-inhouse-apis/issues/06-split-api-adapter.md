@@ -1,6 +1,6 @@
 # 06: Split API adapter
 
-Status: ready-for-agent
+Status: needs-triage
 
 **What to build:** uploads are split by the in-house split API instead of pypdf; the adapter returns
 (page_from, page_to, bytes) parts. In this phase it is called with `splitSize=1`; Phase B chooses the size per
@@ -14,3 +14,4 @@ paper type.
 - [ ] A full cycle with fake split + fake OCR stocks a merged upload correctly
 
 ## Comments
+- 2026-10-27 Vaibhav: deferred – not on the approved shortlist (see HANDOFF.md → Current status).

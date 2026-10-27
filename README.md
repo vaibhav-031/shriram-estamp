@@ -21,9 +21,9 @@ Shriram eStamp (Python)/
 
 **Python**
 ```bash
-brew install python@3.12
+brew install python@3.15
 cd shriram-estamp-python
-python3.12 -m venv .venv && source .venv/bin/activate
+python3.15 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -38,8 +38,8 @@ pip install -r requirements.txt
 If the Cloud Console or the consent screen is blocked, your Workspace admin has to allow it.
 
 **Postgres – pilot on your Mac (no password, no approvals):** install Postgres.app from postgresapp.com,
-open it, click Initialize, then in `.env` set
-`ESTAMP_DB_URL=postgresql://<your-mac-username>@localhost:5432/postgres` and run `python -m estamp init-db`.
+open it, click Initialize, set its port to **3000** (Postgres.app → Server Settings), then in `.env` set
+`ESTAMP_DB_URL=postgresql://<your-mac-username>@localhost:3000/postgres` and run `python -m estamp init-db`.
 The ledger then lives on your Mac only – fine for the pilot, not for go-live.
 
 **Postgres (Zoop's existing server, for go-live)** – ask whoever manages the DB to run this once, so the
@@ -58,12 +58,14 @@ python -m estamp check-setup
 
 ## 2. Pilot run
 
-1. `config.yaml` ships with `dry_run: true`.
-2. Put a few sample papers in **📥 Upload Inbox** (the five sample LAN sheets are already in Orders Incoming).
-3. `python -m estamp run-once` → open the control sheet → **Dry Run Preview** shows where every paper
+> ⚠️ `config.yaml` currently has **`dry_run: false` – every `run-once` / `run` is LIVE**: it moves real Drive files,
+> writes the ledger and issues papers. To preview, always pass `--dry-run`.
+
+1. Put a few sample papers in **📥 Upload Inbox** (the five sample LAN sheets are already in Orders Incoming).
+2. `python -m estamp run-once --dry-run` → open the control sheet → **Dry Run Preview** shows where every paper
    would be filed and which paper every LAN would get. Nothing is moved, nothing is written to the ledger.
-4. Happy? Set `dry_run: false`, `python -m estamp run-once` again, check Output / Backup / dashboard.
-5. Continuous: `caffeinate -i python -m estamp run` (caffeinate keeps the Mac awake).
+3. Happy? `python -m estamp run-once` (live), check Output / Backup / dashboard.
+4. Continuous: `caffeinate -i python -m estamp run` (caffeinate keeps the Mac awake).
 
 ## 3. Daily operation
 
@@ -120,9 +122,10 @@ Logs: `logs/estamp.log` (rotating), the **Log** tab, and the `events` table.
 
 ```bash
 pip install pytest reportlab
-ESTAMP_TEST_DB_URL=postgresql://localhost/test python -m pytest -q tests/
+ESTAMP_TEST_DB_URL=postgresql://<your-mac-username>@localhost:3000/postgres python -m pytest -q tests/
 ```
-The end-to-end tests use their own `estamp_test` schema and an in-memory Drive.
+The end-to-end tests create and drop only their own `estamp_test` schema and use an in-memory Drive – they never
+touch `shriram_estamp` or real Drive folders. Before committing, run the suite 5× in a row (see `CLAUDE.md`).
 
 ## 7. Moving off the Mac
 

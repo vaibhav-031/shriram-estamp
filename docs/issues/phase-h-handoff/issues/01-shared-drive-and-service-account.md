@@ -1,6 +1,6 @@
 # 01: Move to the procurement Shared Drive and a service account
 
-Status: ready-for-human
+Status: needs-triage
 
 **What to build:** all folders in the procurement Shared Drive, the service running as a service account,
 config folder IDs updated, `check-setup` green.
@@ -13,3 +13,4 @@ config folder IDs updated, `check-setup` green.
 - [ ] One supervised `run-once` succeeds
 
 ## Comments
+- 2026-10-27 Vaibhav: deferred – not on the approved shortlist (see HANDOFF.md → Current status).

@@ -1,5 +1,8 @@
 """Split a vendor PDF into single papers, and read each paper's text.
 
+The run context holds a split client and an OCR client (`Ctx.splitter`, `Ctx.ocr`); intake and the issue check
+only go through those, so tests swap in fakes. The default clients below use the providers configured here.
+
 Providers (config.yaml → intake):
   split_provider: local     – pypdf, every `pages_per_paper` pages = one paper (works today)
                   zoop_api  – your in-house split API (fill zoop_api.split once the contract is final)
@@ -131,6 +134,26 @@ def read_paper(data: bytes, name: str, settings: Settings, google) -> OcrResult:
                 raise
             return OcrResult(google.ocr_text(data, name), "", f"drive (API failed: {str(e)[:100]})")
     return OcrResult(google.ocr_text(data, name), "", "drive")
+
+
+class ConfiguredOcr:
+    """Default OCR client: reads a paper with the providers set in config."""
+
+    def __init__(self, settings: Settings, google):
+        self.settings, self.google = settings, google
+
+    def read(self, data: bytes, name: str) -> OcrResult:
+        return read_paper(data, name, self.settings, self.google)
+
+
+class ConfiguredSplitter:
+    """Default split client: splits an upload with the provider set in config."""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    def split(self, data: bytes, name: str) -> list[PaperPdf]:
+        return split_pdf(data, name, self.settings)
 
 
 def _ocr_zoop(data: bytes, name: str, settings: Settings) -> OcrResult:

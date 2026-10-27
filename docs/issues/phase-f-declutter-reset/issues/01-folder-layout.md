@@ -1,6 +1,6 @@
 # 01: Numbered Drive layout with a System folder
 
-Status: ready-for-human
+Status: needs-triage
 
 **What to build:** the target layout from HANDOFF §8 on the real Drive (numbered ops folders, vendor subfolders,
 Reconciliation, "⚙️ System (don't touch)" holding Inventory, Backup, Upload Archive, Orders Processed, Orders
@@ -15,3 +15,4 @@ Rejected), proven by `check-setup`.
 - [ ] README folder tree updated
 
 ## Comments
+- 2026-10-27 Vaibhav: deferred – not on the approved shortlist (see HANDOFF.md → Current status).

@@ -1,6 +1,6 @@
 # 02: Archive pilot leftovers (after confirmation)
 
-Status: ready-for-human
+Status: needs-triage
 
 **What to build:** move each confirmed leftover out of the ops view into an archive folder: Old samples (wrong
 amounts), TEST_Shriram_Order_Summary_26Oct, Shriram eStamp (Test) + its control sheet, control-sheet tabs Sheet1
@@ -14,3 +14,4 @@ and Dry Run Preview.
 - [ ] Decision on the Dry Run Preview tab recorded (the dry-run feature recreates it)
 
 ## Comments
+- 2026-10-27 Vaibhav: deferred – not on the approved shortlist (see HANDOFF.md → Current status).

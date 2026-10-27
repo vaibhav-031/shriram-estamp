@@ -14,6 +14,7 @@ import requests
 
 from .db import DB
 from .extract import CertMatcher, StateResolver
+from .ocr_split import ConfiguredOcr, ConfiguredSplitter
 from .settings import Settings
 
 log = logging.getLogger("estamp")
@@ -59,6 +60,8 @@ class Ctx:
     settings: Settings
     db: DB
     google: object                       # Google, or a fake in tests
+    ocr: object = None                   # .read(data, name) -> OcrResult; default from config, a fake in tests
+    splitter: object = None              # .split(data, name) -> [PaperPdf]; default from config, a fake in tests
     resolver: StateResolver = None       # type: ignore[assignment]
     matcher: CertMatcher = None          # type: ignore[assignment]
     stats: Stats = field(default_factory=Stats)
@@ -73,6 +76,10 @@ class Ctx:
         self.resolver = StateResolver(self.settings.states)
         self.matcher = CertMatcher(self.settings.get("intake.cert_patterns"), self.resolver)
         self.dry = self.settings.dry_run
+        if self.ocr is None:
+            self.ocr = ConfiguredOcr(self.settings, self.google)
+        if self.splitter is None:
+            self.splitter = ConfiguredSplitter(self.settings)
 
     # ---------------------------------------------------------------- time
     @property

@@ -12,3 +12,4 @@ Status: ready-for-agent
 - [ ] No code behaviour changes
 
 ## Comments
+- 2026-10-27: done.
