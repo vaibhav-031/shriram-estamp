@@ -1,10 +1,13 @@
 """Ops actions, entered as rows in two control-sheet tabs. The service only ever fills the Result columns,
 so ops rows are never overwritten.
 
-Review Actions:  Paper ID | Action (APPROVE / REJECT) | Cert No | State | Stamp Duty | Result | Processed At
+Review Actions:  Paper ID | Action (APPROVE / REJECT / RE-OCR) | Cert No | State | Stamp Duty | Edited By | Result | Processed At
    APPROVE – optional corrected Cert No / State / Stamp Duty; checks run again, then the paper moves to
-             Inventory/<STATE>/<AMOUNT>/<CERT>.pdf and becomes AVAILABLE.
+             Inventory/<STATE>/<AMOUNT>/<CERT>.pdf and becomes AVAILABLE. A correction records an audit trail
+             (the pre-edit API values + who/when) for the Corrections tab (E-07).
    REJECT  – paper is never used (stays in Needs Review for the vendor dispute).
+   RE-OCR  – re-reads the paper from its stored PDF (a NEW OCR call, unlike recheck) and either moves it to
+             Inventory if it now passes, or refreshes its Needs Review notes with the new reading.
 
 Order Actions:   LAN ID | Action (CANCEL / RETRY / KEEP_STATE) | State | Result | Processed At
    CANCEL     – unfulfilled LAN → CANCELLED. Fulfilled LAN → paper goes back to stock (renamed to its cert),
@@ -22,7 +25,7 @@ from .extract import id_format_ok, parse_amount
 from .outputs import output_sheet_id
 
 REVIEW_TAB, ORDER_TAB = "Review Actions", "Order Actions"
-REVIEW_HEADER = ["Paper ID", "Action", "Cert No", "State", "Stamp Duty", "Result", "Processed At"]
+REVIEW_HEADER = ["Paper ID", "Action", "Cert No", "State", "Stamp Duty", "Edited By", "Result", "Processed At"]
 ORDER_HEADER = ["LAN ID", "Action", "State", "Result", "Processed At"]
 
 
@@ -32,10 +35,10 @@ def run_actions(ctx: Ctx) -> None:
         return
     ctx.google.ensure_tabs(sid, {REVIEW_TAB: REVIEW_HEADER, ORDER_TAB: ORDER_HEADER})
     updates = []
-    for i, row in enumerate(ctx.google.read_range(sid, f"'{REVIEW_TAB}'!A2:G"), start=2):
-        row = (row + [""] * 7)[:7]
-        if row[1].strip() and not row[5].strip():
-            updates.append((f"'{REVIEW_TAB}'!F{i}:G{i}", [[_review(ctx, row), ctx.now_str()]]))
+    for i, row in enumerate(ctx.google.read_range(sid, f"'{REVIEW_TAB}'!A2:H"), start=2):
+        row = (row + [""] * 8)[:8]
+        if row[1].strip() and not row[6].strip():
+            updates.append((f"'{REVIEW_TAB}'!G{i}:H{i}", [[_review(ctx, row), ctx.now_str()]]))
     for i, row in enumerate(ctx.google.read_range(sid, f"'{ORDER_TAB}'!A2:E"), start=2):
         row = (row + [""] * 5)[:5]
         if row[1].strip() and not row[3].strip():
@@ -58,8 +61,10 @@ def _review(ctx: Ctx, row: list[str]) -> str:
         db.update_paper(p["id"], status="REJECTED", notes=f"rejected by ops | was: {p['notes']}")
         ctx.event("INFO", "Review", f"paper {pid} rejected")
         return "DONE: rejected"
+    if action == "RE-OCR":
+        return _re_ocr(ctx, p)
     if action != "APPROVE":
-        return "ERROR: Action must be APPROVE or REJECT"
+        return "ERROR: Action must be APPROVE, REJECT or RE-OCR"
 
     cert = (row[2].strip().upper() or p["cert_no"] or "")
     state = ctx.resolver.resolve(row[3]) if row[3].strip() else (p["state"] or "")
@@ -73,9 +78,15 @@ def _review(ctx: Ctx, row: list[str]) -> str:
         return f"ERROR: ₹{amount} not allowed for {state} {st.amounts}"
     if not id_format_ok(cert, state, s, ctx.matcher):
         return f"ERROR: '{cert}' is not a valid certificate / serial for {state} (physical paper: {state}-<SERIAL>, e.g. {state}-S254201)"
+    # E-07: a correction (cert/state/amount changed) records an audit trail of the pre-edit API values + who/when.
+    audit: dict = {}
+    if (cert, state, amount) != (p["cert_no"], p["state"], p["denomination"]):
+        if p.get("api_cert_no") is None and p.get("api_state") is None and p.get("api_denomination") is None:
+            audit.update(api_cert_no=p["cert_no"], api_state=p["state"], api_denomination=p["denomination"])
+        audit.update(ops_edited_by=(row[5].strip() or "ops"), ops_edited_at=ctx.now())
     try:
         db.update_paper(p["id"], cert_no=cert, state=state, denomination=amount, status="AVAILABLE",
-                        notes=f"approved by ops | was: {p['notes']}")
+                        notes=f"approved by ops | was: {p['notes']}", **audit)
     except UniqueViolation:
         return f"ERROR: certificate {cert} is already in stock / used – this looks like a duplicate"
     try:
@@ -85,6 +96,38 @@ def _review(ctx: Ctx, row: list[str]) -> str:
         ctx.event("WARN", "Review", f"paper {pid} approved but could not be moved into Inventory: {e}")
     ctx.event("INFO", "Review", f"paper {pid} approved as {cert} {state} ₹{amount}")
     return f"DONE: approved → {state}/{amount}/{cert}.pdf"
+
+
+def _re_ocr(ctx: Ctx, p: dict) -> str:
+    """Re-read a NEEDS_REVIEW paper from its stored PDF (a fresh OCR call) and re-analyze. Passes → Inventory;
+    otherwise its Needs Review notes are refreshed with the new reading. Mirrors recheck_review, but re-OCRs."""
+    from .extract import analyze_fields, analyze_paper
+    db, g, s = ctx.db, ctx.google, ctx.settings
+    if not p["drive_file_id"]:
+        return "ERROR: paper has no stored PDF to re-OCR"
+    res = ctx.ocr.read(g.download(p["drive_file_id"]), p["file_name"] or f"paper_{p['id']}.pdf")
+    if res.fields is not None:
+        a = analyze_fields(res.fields, s, ctx.matcher, db.cert_is_live, ctx.resolver)
+    else:
+        a = analyze_paper(res.text, res.cert, s, ctx.matcher, db.cert_is_live, ctx.resolver)
+    if not a.ok:
+        db.update_paper(p["id"], ocr_raw=res.raw, ocr_via=res.via, ocr_text=res.text or None, notes="; ".join(a.issues))
+        ctx.event("INFO", "Re-OCR", f"paper {p['id']} re-read, still needs review: {'; '.join(a.issues)}")
+        return f"DONE: re-OCR'd, still needs review: {'; '.join(a.issues)}"
+    try:
+        db.update_paper(p["id"], cert_no=a.cert, cert_state=a.cert_state, state=a.state, denomination=a.amount,
+                        ocr_amount=a.amount, ocr_raw=res.raw, ocr_via=res.via, ocr_text=res.text or None,
+                        status="AVAILABLE", notes=f"re-OCR OK | was: {p['notes']}")
+    except UniqueViolation:
+        db.update_paper(p["id"], notes=f"duplicate certificate {a.cert} – already in stock")
+        return f"ERROR: certificate {a.cert} is already in stock / used – this looks like a duplicate"
+    try:
+        g.move_rename(p["drive_file_id"], g.folder_path(s.folder(INVENTORY_ROOT), [a.state, str(a.amount)]), f"{a.cert}.pdf")
+        db.update_paper(p["id"], file_name=f"{a.cert}.pdf")
+    except Exception as e:
+        ctx.event("WARN", "Re-OCR", f"paper {p['id']} re-OCR passed but could not be moved into Inventory: {e}")
+    ctx.event("INFO", "Re-OCR", f"paper {p['id']} re-OCR'd and moved to Inventory as {a.cert} {a.state} ₹{a.amount}")
+    return f"DONE: re-OCR'd → {a.state}/{a.amount}/{a.cert}.pdf"
 
 
 def _order(ctx: Ctx, row: list[str]) -> str:

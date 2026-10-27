@@ -190,7 +190,7 @@ def test_full_flow(env):
     ctx2 = _ctx(s, db, g)
     assert run_cycle(ctx2)
 
-    assert [r[5] for r in ctl["Review Actions"][1:]][0].startswith("DONE: approved")
+    assert [r[6] for r in ctl["Review Actions"][1:]][0].startswith("DONE: approved")
     results = [r[3] for r in ctl["Order Actions"][1:]]
     assert results[0].startswith("DONE: MH kept") and results[1].startswith("DONE: cancelled, paper returned"), results
     st = {r["status"]: r["n"] for r in db.q("SELECT status, count(*) n FROM orders GROUP BY 1")}
@@ -198,6 +198,126 @@ def test_full_flow(env):
     up_paper = db.q1("SELECT p.* FROM papers p JOIN orders o ON o.paper_id = p.id WHERE o.lan='TEST-UP-000010'")
     assert up_paper["status"] == "AVAILABLE" and g.path_of(up_paper["drive_file_id"]).startswith("inventory_root/UP/100/")
     assert outs["UP-100"][-1][5].startswith("CANCELLED")
+
+
+@e2e
+def test_active_run_age_reports_newest_unfinished_run(env):
+    s, db, g = env
+    assert db.active_run_age_seconds() is None                 # no runs yet
+    done = db.start_run()
+    db.finish_run(done, True, {})
+    assert db.active_run_age_seconds() is None                 # finished runs don't count
+    live = db.start_run()
+    db.q("UPDATE runs SET started_at = now() - interval '40 minutes' WHERE id=%s", (live,))
+    age = db.active_run_age_seconds()
+    assert age is not None and age >= 40 * 60                  # age of the newest unfinished run
+
+
+@e2e
+def test_a_wedged_cycle_holder_raises_an_alert_instead_of_skipping_silently(env):
+    import zlib
+
+    import psycopg
+
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    # A second session holds the advisory lock and has a run that started 40 min ago but never finished –
+    # i.e. a wedged process blocking every new cycle. The skip must escalate to an alert, not stay silent.
+    holder = psycopg.connect(DB_URL, autocommit=True)
+    holder.execute("SELECT pg_advisory_lock(%s)", (zlib.crc32(f"estamp:{db.schema}".encode()),))
+    stuck = db.start_run()
+    db.q("UPDATE runs SET started_at = now() - interval '40 minutes' WHERE id=%s", (stuck,))
+    try:
+        runs_before = db.q1("SELECT count(*) n FROM runs")["n"]
+        ctx = _ctx(s, db, g)
+        assert run_cycle(ctx)                                       # returns True (skipped)
+        assert db.q1("SELECT count(*) n FROM runs")["n"] == runs_before, "a skipped cycle must not start a new run"
+        wedged = [e["details"] for e in db.q("SELECT details FROM events WHERE level='ERROR' AND action='Cycle'")]
+        assert any("wedged" in d for d in wedged), wedged
+        assert any("wedged" in a for a in ctx.alerts)
+    finally:
+        holder.close()
+
+
+@e2e
+def test_a_brief_overlap_skips_quietly_without_an_alert(env):
+    import zlib
+
+    import psycopg
+
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    # Holder started just now (normal overlap of two cycles) – no alert, just a quiet skip.
+    holder = psycopg.connect(DB_URL, autocommit=True)
+    holder.execute("SELECT pg_advisory_lock(%s)", (zlib.crc32(f"estamp:{db.schema}".encode()),))
+    db.start_run()
+    try:
+        ctx = _ctx(s, db, g)
+        assert run_cycle(ctx)
+        assert db.q1("SELECT count(*) n FROM events WHERE level='ERROR'")["n"] == 0, "brief overlap must not alert"
+        assert ctx.alerts == []
+    finally:
+        holder.close()
+
+
+@e2e
+def test_active_run_age_reports_newest_unfinished_run(env):
+    s, db, g = env
+    assert db.active_run_age_seconds() is None                 # no runs yet
+    done = db.start_run()
+    db.finish_run(done, True, {})
+    assert db.active_run_age_seconds() is None                 # finished runs don't count
+    live = db.start_run()
+    db.q("UPDATE runs SET started_at = now() - interval '40 minutes' WHERE id=%s", (live,))
+    age = db.active_run_age_seconds()
+    assert age is not None and age >= 40 * 60                  # age of the newest unfinished run
+
+
+@e2e
+def test_a_wedged_cycle_holder_raises_an_alert_instead_of_skipping_silently(env):
+    import zlib
+
+    import psycopg
+
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    # A second session holds the advisory lock and has a run that started 40 min ago but never finished –
+    # i.e. a wedged process blocking every new cycle. The skip must escalate to an alert, not stay silent.
+    holder = psycopg.connect(DB_URL, autocommit=True)
+    holder.execute("SELECT pg_advisory_lock(%s)", (zlib.crc32(f"estamp:{db.schema}".encode()),))
+    stuck = db.start_run()
+    db.q("UPDATE runs SET started_at = now() - interval '40 minutes' WHERE id=%s", (stuck,))
+    try:
+        runs_before = db.q1("SELECT count(*) n FROM runs")["n"]
+        ctx = _ctx(s, db, g)
+        assert run_cycle(ctx)                                       # returns True (skipped)
+        assert db.q1("SELECT count(*) n FROM runs")["n"] == runs_before, "a skipped cycle must not start a new run"
+        wedged = [e["details"] for e in db.q("SELECT details FROM events WHERE level='ERROR' AND action='Cycle'")]
+        assert any("wedged" in d for d in wedged), wedged
+        assert any("wedged" in a for a in ctx.alerts)
+    finally:
+        holder.close()
+
+
+@e2e
+def test_a_brief_overlap_skips_quietly_without_an_alert(env):
+    import zlib
+
+    import psycopg
+
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    # Holder started just now (normal overlap of two cycles) – no alert, just a quiet skip.
+    holder = psycopg.connect(DB_URL, autocommit=True)
+    holder.execute("SELECT pg_advisory_lock(%s)", (zlib.crc32(f"estamp:{db.schema}".encode()),))
+    db.start_run()
+    try:
+        ctx = _ctx(s, db, g)
+        assert run_cycle(ctx)
+        assert db.q1("SELECT count(*) n FROM events WHERE level='ERROR'")["n"] == 0, "brief overlap must not alert"
+        assert ctx.alerts == []
+    finally:
+        holder.close()
 
 
 @e2e
@@ -1189,3 +1309,86 @@ def test_cli_reset_refuses_production_schema_without_force(env, monkeypatch):
     assert "refus" in out.lower()
     # nothing was truncated
     assert db.q1("SELECT count(*) n FROM uploads")["n"] == 1
+
+
+# ------------------------------------------------------------ E-07: ops-correction audit + RE-OCR + Corrections tab
+
+def _needs_review_paper(db, g, s, drive_data, cert, state, amount, notes):
+    """A NEEDS_REVIEW paper backed by a real stored PDF in Needs Review, ready for APPROVE / RE-OCR."""
+    fid = g.add("review.pdf", PDF, s.folder("needs_review"), drive_data)
+    return db.insert_paper(drive_file_id=fid, file_name="review.pdf", cert_no=cert, state=state,
+                           denomination=amount, status="NEEDS_REVIEW", notes=notes)
+
+
+def _review_result(ctx, s, g, pid, row_after_action):
+    """Append a Review Actions row and run actions; return (result string, paper row)."""
+    from estamp.actions import run_actions
+    sid = s.get("control_sheet_id")
+    g.ensure_tabs(sid, {"Review Actions": ["Paper ID", "Action", "Cert No", "State", "Stamp Duty", "Edited By",
+                                           "Result", "Processed At"]})
+    g.sheets_data[sid]["Review Actions"].append([str(pid)] + row_after_action)
+    run_actions(ctx)
+    res = g.sheets_data[sid]["Review Actions"][-1]
+    return res, ctx.db.q1("SELECT * FROM papers WHERE id=%s", (pid,))
+
+
+@e2e
+def test_approve_with_correction_records_audit_and_still_approves(env):
+    s, db, g = env
+    pid = _needs_review_paper(db, g, s, samples.paper_page(samples.cert("MH", 1), 200),
+                              cert="", state="MH", amount=200, notes="no certificate / serial number found")
+    ctx = _ctx(s, db, g)
+    res, p = _review_result(ctx, s, g, pid, ["APPROVE", samples.cert("MH", 777), "MH", "200", "ravi"])
+    assert res[6].startswith("DONE: approved"), res
+    assert p["status"] == "AVAILABLE" and p["cert_no"] == samples.cert("MH", 777)
+    # audit: pre-edit API value captured, ops identity recorded
+    assert p["api_cert_no"] == "" and p["api_state"] == "MH" and p["api_denomination"] == 200
+    assert p["ops_edited_by"] == "ravi" and p["ops_edited_at"] is not None
+    # approval behaviour preserved: file moved into Inventory
+    assert g.path_of(p["drive_file_id"]).startswith("inventory_root/MH/200/")
+
+
+@e2e
+def test_approve_without_correction_records_no_audit(env):
+    s, db, g = env
+    cert = samples.cert("MH", 5)
+    pid = _needs_review_paper(db, g, s, samples.paper_page(cert, 200),
+                              cert=cert, state="MH", amount=200, notes="duplicate certificate – held")
+    ctx = _ctx(s, db, g)
+    res, p = _review_result(ctx, s, g, pid, ["APPROVE", "", "", "", ""])
+    assert res[6].startswith("DONE: approved"), res
+    assert p["status"] == "AVAILABLE"
+    assert p["ops_edited_at"] is None and p["ops_edited_by"] is None and p["api_cert_no"] is None
+
+
+@e2e
+def test_re_ocr_rereads_and_moves_a_now_passing_paper_to_inventory(env):
+    from fake_apis import FakeApiOcr
+    s, db, g = env
+    # stored PDF reads cleanly through the API, but the paper sits in Needs Review (e.g. an earlier bad reading)
+    good = samples.merged([samples.api_page(certification_no="IN-HP90000000000009A", state_code="HP",
+                                            state_name="HIMACHAL PRADESH", stamp_duty_amount="100")])
+    pid = _needs_review_paper(db, g, s, good, cert="", state="", amount=0, notes="no certificate / serial number found")
+    ocr = FakeApiOcr()
+    ctx = Ctx(s, db, g, ocr=ocr)
+    res, p = _review_result(ctx, s, g, pid, ["RE-OCR", "", "", "", ""])
+    assert res[6].startswith("DONE: re-OCR'd →"), res
+    assert p["status"] == "AVAILABLE" and p["cert_no"] == "IN-HP90000000000009A"
+    assert g.path_of(p["drive_file_id"]).startswith("inventory_root/HP/100/")
+    assert ocr.calls, "RE-OCR must make a new OCR call"
+
+
+@e2e
+def test_corrections_tab_lists_an_edited_paper(env):
+    from estamp.dashboard import run_dashboard
+    s, db, g = env
+    pid = _needs_review_paper(db, g, s, samples.paper_page(samples.cert("MH", 2), 200),
+                              cert="", state="MH", amount=200, notes="no certificate / serial number found")
+    ctx = _ctx(s, db, g)
+    ops_cert = samples.cert("MH", 778)
+    _review_result(ctx, s, g, pid, ["APPROVE", ops_cert, "MH", "200", "ravi"])
+    run_dashboard(ctx)
+    tab = g.sheets_data[s.get("control_sheet_id")]["Corrections"]
+    assert tab[0][:4] == ["Paper ID", "API read (cert/state/₹)", "Ops value (cert/state/₹)", "Edited By"]
+    row = [r for r in tab[1:] if r[0] == pid][0]
+    assert ops_cert in row[2] and row[3] == "ravi" and row[4]

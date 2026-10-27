@@ -1,7 +1,7 @@
 """Control sheet = the window ops and you look at. Postgres is the source of truth; these tabs are rewritten
 every cycle (except the two Actions tabs, which ops write into).
 
-Tabs: Summary · Stock · Needs Review · Exceptions · Log · Dry Run Preview
+Tabs: Summary · Stock · Needs Review · Exceptions · Corrections · Log · Dry Run Preview
 """
 from __future__ import annotations
 
@@ -56,6 +56,8 @@ def run_dashboard(ctx: Ctx) -> None:
         "Needs Review": ["Paper ID", "Upload", "Page", "Cert No (OCR)", "State (OCR)", "Stamp Duty (OCR)", "Reason",
                          "Open PDF", "Added At"],
         "Exceptions": ["LAN ID", "State", "Stamp Duty", "Status", "Notes", "Source File", "Updated At"],
+        "Corrections": ["Paper ID", "API read (cert/state/₹)", "Ops value (cert/state/₹)", "Edited By", "Edited At",
+                        "LAN issued to"],
         "Log": ["Time", "Level", "Action", "Details"],
     }
     if ctx.dry:
@@ -97,6 +99,15 @@ def run_dashboard(ctx: Ctx) -> None:
     exc = db.q("SELECT * FROM orders WHERE status IN ('ERROR','CONFLICT') ORDER BY updated_at DESC LIMIT 3000")
     g.overwrite_tab(sid, "Exceptions", [tabs["Exceptions"]] + [
         [r["lan"], r["state"], r["denomination"], r["status"], r["notes"], r["source_file"], t(r["updated_at"])] for r in exc])
+
+    corr = db.q("""SELECT p.*, a.lan FROM papers p
+                   LEFT JOIN allocations a ON a.paper_id = p.id AND a.cancelled_at IS NULL
+                   WHERE p.ops_edited_at IS NOT NULL ORDER BY p.ops_edited_at DESC LIMIT 3000""")
+    fmt = lambda c, st, amt: f"{c or ''} / {st or ''} / ₹{amt or ''}"
+    g.overwrite_tab(sid, "Corrections", [tabs["Corrections"]] + [
+        [r["id"], fmt(r["api_cert_no"], r["api_state"], r["api_denomination"]),
+         fmt(r["cert_no"], r["state"], r["denomination"]), r["ops_edited_by"], t(r["ops_edited_at"]), r["lan"] or ""]
+        for r in corr])
 
     ev = db.q("SELECT * FROM events ORDER BY id DESC LIMIT 500")
     g.overwrite_tab(sid, "Log", [tabs["Log"]] + [[t(e["ts"]), e["level"], e["action"], e["details"][:2000]] for e in ev])

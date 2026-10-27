@@ -104,6 +104,11 @@ ALTER TABLE allocations ADD COLUMN IF NOT EXISTS verified_cert TEXT;
 ALTER TABLE allocations ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ;
 ALTER TABLE allocations ADD COLUMN IF NOT EXISTS verified_via TEXT;
 ALTER TABLE papers ADD COLUMN IF NOT EXISTS ocr_raw JSONB;      -- OCR API reading per paper (A-05)
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS api_cert_no TEXT;         -- pre-edit API values vs the ops correction (E-07)
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS api_denomination INT;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS api_state TEXT;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS ops_edited_by TEXT;
+ALTER TABLE papers ADD COLUMN IF NOT EXISTS ops_edited_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS alloc_unwritten_idx ON allocations(alloc_date, state, denomination) WHERE NOT output_written;
 
 CREATE TABLE IF NOT EXISTS output_sheets (
@@ -228,6 +233,14 @@ class DB:
     def start_run(self) -> int:
         return self.q1("INSERT INTO runs DEFAULT VALUES RETURNING id")["id"]
 
+    def active_run_age_seconds(self) -> float | None:
+        """Seconds since the newest still-running cycle started, or None if no cycle is running. When a new
+        cycle can't get the lock, this says how long the holder has been going – a value far past a normal
+        cycle means the holder is wedged and blocking all work (#3). A hard crash drops the lock, so if the
+        lock is held there really is a live holder and the newest unfinished run is it."""
+        row = self.q1("SELECT extract(epoch FROM now() - max(started_at)) AS age FROM runs WHERE finished_at IS NULL")
+        return float(row["age"]) if row and row["age"] is not None else None
+
     def finish_run(self, run_id: int, ok: bool, summary: dict) -> None:
         self.q("UPDATE runs SET finished_at=now(), ok=%s, summary=%s WHERE id=%s",
                (ok, json.dumps(summary, default=str), run_id))
@@ -263,7 +276,8 @@ class DB:
 
     def update_paper(self, paper_id: int, **f: Any) -> None:
         sets = ", ".join(f"{k}=%s" for k in f)
-        self.q(f"UPDATE papers SET {sets}, updated_at=now() WHERE id=%s", (*f.values(), paper_id))
+        vals = tuple(Jsonb(v) if isinstance(v, dict) else v for v in f.values())
+        self.q(f"UPDATE papers SET {sets}, updated_at=now() WHERE id=%s", (*vals, paper_id))
 
     # ---------------------------------------------------------------- orders
     def existing_orders(self, lan_keys: list[str]) -> dict[str, list[dict]]:
