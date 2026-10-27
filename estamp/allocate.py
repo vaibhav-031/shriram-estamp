@@ -17,6 +17,7 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+from .constants import BACKUP_ROOT, NEEDS_REVIEW, OUTPUT_ROOT
 from .context import Ctx
 from .extract import ids_in_reading, safe_file_name
 from .google_clients import file_link
@@ -128,11 +129,11 @@ def _allocate_one(ctx: Ctx, order: dict) -> str:
     pdf_name = f"{lan_safe}.pdf"
     step = "prepare folders"
     try:
-        out_folder = g.folder_path(s.folder("output_root"), [d.isoformat(), state, f"{label} PDFs"])
+        out_folder = g.folder_path(s.folder(OUTPUT_ROOT), [d.isoformat(), state, f"{label} PDFs"])
         if g.child_exists(out_folder, pdf_name):
             raise RuntimeError(f"'{pdf_name}' already exists in the output folder")
         step = "backup copy"
-        backup_folder = g.folder_path(s.folder("backup_root"), [d.isoformat(), state, str(denom)])
+        backup_folder = g.folder_path(s.folder(BACKUP_ROOT), [d.isoformat(), state, str(denom)])
         backup_id = g.copy(paper["drive_file_id"], backup_folder, f"{lan_safe}__{paper['cert_no']}.pdf")
         step = "rename + move"
         g.move_rename(paper["drive_file_id"], out_folder, pdf_name)
@@ -143,7 +144,7 @@ def _allocate_one(ctx: Ctx, order: dict) -> str:
                 verified, via = verify_issued(ctx, paper["drive_file_id"], paper["cert_no"], pdf_name)
             except CertMismatch:
                 g.move_rename(paper["drive_file_id"],
-                              g.folder_path(s.folder("needs_review"), [d.isoformat(), "Cert mismatch"]),
+                              g.folder_path(s.folder(NEEDS_REVIEW), [d.isoformat(), "Cert mismatch"]),
                               f"{lan_safe}__expected_{paper['cert_no']}.pdf")
                 raise
         step = "update ledger"

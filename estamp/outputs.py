@@ -9,6 +9,7 @@ import threading
 from itertools import groupby
 
 from .allocate import label_for
+from .constants import OUTPUT_ROOT
 from .context import Ctx
 
 OUTPUT_HEADER = ["LAN ID", "Certificate No", "PDF Name", "PDF Link", "Processed At", "Status"]
@@ -21,7 +22,7 @@ def output_sheet_id(ctx: Ctx, d, state: str, denom: int) -> str:
         sid = ctx.db.output_sheet(d, state, label)
         if sid:
             return sid
-        folder = ctx.google.folder_path(ctx.settings.folder("output_root"), [d.isoformat(), state])
+        folder = ctx.google.folder_path(ctx.settings.folder(OUTPUT_ROOT), [d.isoformat(), state])
         sid = ctx.google.create_sheet(folder, label, OUTPUT_HEADER)
         ctx.db.save_output_sheet(d, state, label, sid)
         return sid

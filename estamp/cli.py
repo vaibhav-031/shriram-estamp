@@ -14,6 +14,8 @@ from __future__ import annotations
 import argparse
 import sys
 
+from .constants import (BACKUP_ROOT, INVENTORY_ROOT, NEEDS_REVIEW, ORDERS_INCOMING, ORDERS_PROCESSED,
+                        ORDERS_REJECTED, OUTPUT_ROOT, UPLOAD_ARCHIVE, UPLOAD_INBOX)
 from .context import Ctx, setup_logging
 from .db import DB
 from .settings import load_settings
@@ -81,7 +83,7 @@ def main(argv=None) -> int:
         db.close()
     return 0
 
-
+# config and env check
 def _check(s, db, google) -> int:
     ok = True
 
@@ -96,8 +98,8 @@ def _check(s, db, google) -> int:
         line(n >= 8, f"Postgres schema '{s.schema}'", f"{n} tables" + ("" if n >= 8 else " – run init-db"))
     except Exception as e:
         line(False, "Postgres", str(e))
-    for key in ["upload_inbox", "upload_archive", "needs_review", "inventory_root", "orders_incoming",
-                "orders_processed", "orders_rejected", "output_root", "backup_root"]:
+    for key in [UPLOAD_INBOX, UPLOAD_ARCHIVE, NEEDS_REVIEW, INVENTORY_ROOT, ORDERS_INCOMING,
+                ORDERS_PROCESSED, ORDERS_REJECTED, OUTPUT_ROOT, BACKUP_ROOT]:
         try:
             f = google.get_file(s.folder(key))
             line(not f.get("trashed"), f"folder {key}", f"'{f['name']}'")
@@ -130,11 +132,25 @@ def _check(s, db, google) -> int:
     print("\nAll good." if ok else "\nFix the ✗ items above.")
     return 0 if ok else 1
 
-
+# current status of the jobs
 def _status(s, db) -> int:
     from .context import Ctx
     ctx = Ctx(s, db, None)
     from .dashboard import stock_rows
+    print("Stock per state/denomination:")
+    for abbr, meaning in (
+        ("ST", "state"),
+        ("₹", "denomination"),
+        ("daily", "daily issue rate"),
+        ("avail", "papers ready"),
+        ("review", "awaiting human"),
+        ("pending", "LANs waiting for stock"),
+        ("net", "avail − pending"),
+        ("cover", "days of stock left"),
+        ("flag", "OK / LOW / SHORT / INACTIVE"),
+    ):
+        print(f"  {abbr:<8}{meaning}")
+    print()
     print(f"{'ST':<4}{'₹':>6}{'daily':>7}{'avail':>7}{'review':>8}{'pending':>9}{'net':>7}{'cover':>7}  flag")
     for r in stock_rows(ctx):
         print(f"{r[0]:<4}{r[2]:>6}{r[3]:>7}{r[4]:>7}{r[5]:>8}{r[6]:>9}{r[7]:>7}{str(r[8]):>7}  {r[13]}")
@@ -145,7 +161,7 @@ def _status(s, db) -> int:
 
 def _reconcile(s, db, google) -> int:
     known = {r["drive_file_id"] for r in db.q("SELECT drive_file_id FROM papers WHERE drive_file_id IS NOT NULL")}
-    root = s.folder("inventory_root")
+    root = s.folder(INVENTORY_ROOT)
     orphans = []
     for st in google.list_children(root, folders=True):
         for dn in google.list_children(st["id"], folders=True):

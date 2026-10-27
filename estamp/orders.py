@@ -13,6 +13,7 @@ import io
 import time
 from datetime import datetime, timezone
 
+from .constants import ORDERS_INCOMING, ORDERS_PROCESSED, ORDERS_REJECTED
 from .context import Ctx
 from .extract import ParsedOrderFile, parse_order_tabs
 from .google_clients import CSV, GSHEET, XLS, XLSX, parse_time
@@ -21,7 +22,7 @@ from .google_clients import CSV, GSHEET, XLS, XLSX, parse_time
 def run_ingest(ctx: Ctx, deadline: float) -> None:
     g, s = ctx.google, ctx.settings
     settle = int(s.get("orders.settle_minutes", 15)) * 60
-    for f in g.list_children(s.folder("orders_incoming"), folders=False):
+    for f in g.list_children(s.folder(ORDERS_INCOMING), folders=False):
         if time.time() > deadline:
             return
         age = (datetime.now(timezone.utc) - parse_time(f["modifiedTime"])).total_seconds()
@@ -33,7 +34,7 @@ def run_ingest(ctx: Ctx, deadline: float) -> None:
             ctx.stats.files_rejected += 1
             ctx.event("ERROR", "Orders", f"'{f['name']}' rejected: {e}", ref=f["id"])
             if not ctx.dry:
-                g.move_rename(f["id"], s.folder("orders_rejected"))
+                g.move_rename(f["id"], s.folder(ORDERS_REJECTED))
 
 
 def _read_tabs(ctx: Ctx, f: dict) -> list[tuple[str, list[list[str]]]]:
@@ -98,7 +99,7 @@ def _ingest_file(ctx: Ctx, f: dict) -> None:
             ctx.preview.append(["ORDER", f["name"], "", "", "", "", "SKIPPED", m])
     else:
         db.insert_orders(to_insert)
-        g.move_rename(f["id"], s.folder("orders_processed"))
+        g.move_rename(f["id"], s.folder(ORDERS_PROCESSED))
 
     ctx.stats.orders_in += sum(1 for r in to_insert if r[8] == "PENDING")
     ctx.stats.rows_rejected += len(parsed.invalid)

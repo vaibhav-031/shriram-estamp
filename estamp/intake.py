@@ -16,6 +16,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
+from .constants import INVENTORY_ROOT, NEEDS_REVIEW, UPLOAD_ARCHIVE, UPLOAD_INBOX
 from .context import Ctx, log
 from .db import UniqueViolation
 from dataclasses import dataclass
@@ -44,7 +45,7 @@ def _collect(g, folder_id: str, depth: int = 0, max_depth: int = 4) -> tuple[lis
 
 def run_intake(ctx: Ctx, deadline: float) -> None:
     g, s = ctx.google, ctx.settings
-    inbox = s.folder("upload_inbox")
+    inbox = s.folder(UPLOAD_INBOX)
     settle = int(s.get("intake.settle_minutes", 5)) * 60
     files, folders = _collect(g, inbox)
     for f in sorted(files, key=lambda x: x["modifiedTime"]):
@@ -61,7 +62,7 @@ def run_intake(ctx: Ctx, deadline: float) -> None:
                       ref=f["id"], alert_key=f"intakefail|{f['id']}")
     # Uploaded folders that are now empty go to the archive (deepest first), so the inbox stays clean.
     if not ctx.dry:
-        archive = g.folder_path(s.folder("upload_archive"), [ctx.today().isoformat()])
+        archive = g.folder_path(s.folder(UPLOAD_ARCHIVE), [ctx.today().isoformat()])
         for fo in reversed(folders):
             try:
                 if not g.list_children(fo["id"]):
@@ -199,7 +200,7 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
     if f.get("mimeType") != PDF:
         ctx.event("WARN", "Intake", f"'{f['name']}' is not a PDF – moved to Needs Review/Not PDF", ref=f["id"])
         if not ctx.dry:
-            g.move_rename(f["id"], g.folder_path(s.folder("needs_review"), ["Not PDF"]))
+            g.move_rename(f["id"], g.folder_path(s.folder(NEEDS_REVIEW), ["Not PDF"]))
         return
 
     if ctx.dry:
@@ -224,17 +225,17 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
 
     up = db.upload_get_or_create(f["id"], f["name"], f.get("md5Checksum", ""))
     if up["status"] in ("DONE", "DUPLICATE"):
-        g.move_rename(f["id"], g.folder_path(s.folder("upload_archive"), [today]))
+        g.move_rename(f["id"], g.folder_path(s.folder(UPLOAD_ARCHIVE), [today]))
         return
     if up["status"] == "REVIEW":          # decided earlier (crash before the move, or ops moved it back)
-        g.move_rename(f["id"], g.folder_path(s.folder("needs_review"), [today]))
+        g.move_rename(f["id"], g.folder_path(s.folder(NEEDS_REVIEW), [today]))
         ctx.event("WARN", "Needs review", f"'{f['name']}' was already sent to Needs Review as a whole ({up['notes']}) – "
                   "moved back there. To process it after a fix, upload it again as a new file.", ref=f["id"])
         return
     twin = db.upload_same_md5_done(f.get("md5Checksum", ""), up["id"])
     if twin:
         db.upload_finish(up["id"], "DUPLICATE", 0, f"same file content as '{twin['file_name']}' (upload {twin['id']})")
-        g.move_rename(f["id"], g.folder_path(s.folder("needs_review"), ["Duplicate uploads"]))
+        g.move_rename(f["id"], g.folder_path(s.folder(NEEDS_REVIEW), ["Duplicate uploads"]))
         ctx.event("WARN", "Intake", f"'{f['name']}' is an exact duplicate of '{twin['file_name']}' – not stocked again",
                   ref=f["id"])
         return
@@ -243,7 +244,7 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
         units = _read_units(ctx, g.download(f["id"]), f["name"])
     except WholeUploadReview as w:
         db.upload_finish(up["id"], "REVIEW", 0, str(w))
-        g.move_rename(f["id"], g.folder_path(s.folder("needs_review"), [today]))
+        g.move_rename(f["id"], g.folder_path(s.folder(NEEDS_REVIEW), [today]))
         ctx.stats.uploads += 1
         ctx.event("WARN", "Needs review", f"'{f['name']}' (whole file): {w}", ref=f["id"])
         return
@@ -253,7 +254,7 @@ def _process_upload(ctx: Ctx, f: dict) -> None:
         list(ex.map(lambda u: _stock_unit(ctx, up, f["name"], u), todo))
 
     db.upload_finish(up["id"], "DONE", len(units))
-    g.move_rename(f["id"], g.folder_path(s.folder("upload_archive"), [today]))
+    g.move_rename(f["id"], g.folder_path(s.folder(UPLOAD_ARCHIVE), [today]))
     ctx.stats.uploads += 1
     ctx.event("INFO", "Intake", f"'{f['name']}': {len(units)} paper(s) processed", ref=f["id"])
 
@@ -268,7 +269,7 @@ def _stock_unit(ctx: Ctx, up: dict, upload_name: str, u: Unit) -> None:
                   ocr_amount=a.amount or None, ocr_via=u.via, ocr_text=u.text[:20000], ocr_raw=u.raw)
 
     if a.ok:
-        folder = g.folder_path(s.folder("inventory_root"), [a.state, str(a.amount)])
+        folder = g.folder_path(s.folder(INVENTORY_ROOT), [a.state, str(a.amount)])
         name = f"{a.cert}.pdf"
         file_id = g.upload_pdf(folder, name, data)
         try:
@@ -278,11 +279,11 @@ def _stock_unit(ctx: Ctx, up: dict, upload_name: str, u: Unit) -> None:
             return
         except UniqueViolation:
             a.issues.append(f"duplicate certificate {a.cert} – already in stock")
-            g.move_rename(file_id, g.folder_path(s.folder("needs_review"), [ctx.today().isoformat()]), review_name)
+            g.move_rename(file_id, g.folder_path(s.folder(NEEDS_REVIEW), [ctx.today().isoformat()]), review_name)
             db.insert_paper(**fields, drive_file_id=file_id, file_name=review_name, status="NEEDS_REVIEW",
                             notes="; ".join(a.issues))
     else:
-        folder = g.folder_path(s.folder("needs_review"), [ctx.today().isoformat()])
+        folder = g.folder_path(s.folder(NEEDS_REVIEW), [ctx.today().isoformat()])
         file_id = g.upload_pdf(folder, review_name, data)
         db.insert_paper(**fields, drive_file_id=file_id, file_name=review_name, status="NEEDS_REVIEW",
                         notes="; ".join(a.issues))

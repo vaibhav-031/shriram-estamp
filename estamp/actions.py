@@ -15,6 +15,7 @@ Order Actions:   LAN ID | Action (CANCEL / RETRY / KEEP_STATE) | State | Result 
 from __future__ import annotations
 
 from .allocate import label_for
+from .constants import INVENTORY_ROOT
 from .context import Ctx
 from .db import UniqueViolation
 from .extract import id_format_ok, parse_amount
@@ -78,7 +79,7 @@ def _review(ctx: Ctx, row: list[str]) -> str:
     except UniqueViolation:
         return f"ERROR: certificate {cert} is already in stock / used – this looks like a duplicate"
     try:
-        g.move_rename(p["drive_file_id"], g.folder_path(s.folder("inventory_root"), [state, str(amount)]), f"{cert}.pdf")
+        g.move_rename(p["drive_file_id"], g.folder_path(s.folder(INVENTORY_ROOT), [state, str(amount)]), f"{cert}.pdf")
         db.update_paper(p["id"], file_name=f"{cert}.pdf")
     except Exception as e:  # paper is usable anyway; allocation moves it from wherever it is
         ctx.event("WARN", "Review", f"paper {pid} approved but could not be moved into Inventory: {e}")
@@ -130,7 +131,7 @@ def _order(ctx: Ctx, row: list[str]) -> str:
             db.q("UPDATE orders SET status='CANCELLED', notes='cancelled by ops after issue; paper NOT returned', "
                  "updated_at=now() WHERE id=%s", (o["id"],))
             return "DONE: cancelled; paper kept as used"
-        g.move_rename(p["drive_file_id"], g.folder_path(s.folder("inventory_root"), [p["state"], str(p["denomination"])]),
+        g.move_rename(p["drive_file_id"], g.folder_path(s.folder(INVENTORY_ROOT), [p["state"], str(p["denomination"])]),
                       f"{p['cert_no']}.pdf")
         with db.conn() as c, c.transaction():
             c.execute("UPDATE papers SET status='AVAILABLE', order_id=NULL, file_name=%s, "
@@ -177,7 +178,7 @@ def recheck_review(ctx: Ctx) -> tuple[int, int]:
             db.update_paper(p["id"], notes=f"duplicate certificate {a.cert} – already in stock")
             still += 1
             continue
-        g.move_rename(p["drive_file_id"], g.folder_path(s.folder("inventory_root"), [a.state, str(a.amount)]),
+        g.move_rename(p["drive_file_id"], g.folder_path(s.folder(INVENTORY_ROOT), [a.state, str(a.amount)]),
                       f"{a.cert}.pdf")
         db.update_paper(p["id"], file_name=f"{a.cert}.pdf")
         moved += 1
