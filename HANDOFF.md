@@ -38,33 +38,35 @@ papers front + back); 14 → Needs Review:
 
 **Shortlist for the dev team, in priority order** (tickets in `docs/issues/`; deferred tickets are `needs-triage`;
 ✅/🟡/❌ = code-verified status on 2026-10-28):
-1. ❌ E-01 never append a LAN twice to an output sheet (real gap in today's live flow) – only the `output_written`
-   flag guards it (`outputs.py:31-46`); no by-LAN check before `append_rows`, so a crash between append and
-   `mark_written` can double-append.
+1. ✅ E-01 never append a LAN twice to an output sheet – by-LAN guard reads the sheet's existing LANs and de-dupes
+   the batch before `append_rows` (`outputs.py`), covered by a crash-between-append-and-`mark_written` test.
 2. ✅ A-03 capture redacted OCR API samples – `docs/api-samples/ocr/` (digital, traditional, not-pdf).
 3. ✅ A-05 OCR API adapter at intake + issue check, raw response stored per paper, **per-page timeout** –
    `ocr_split.py:182` `_ocr_zoop`, `allocate.py:35` reuses `ctx.ocr`, `db.py:106` `ocr_raw`, `timeout_s`/`max_total_s`.
-4. ❌ E-06 + E-08 (merged) corrections stored next to the API reading; issue check accepts either; auto second
-   API attempt – none built: no audit fields, no RE-OCR action (`actions.py:62` APPROVE/REJECT only), no auto
-   second attempt, `verify_issued` accepts only the ledger cert.
-5. 🟡 A-07 ✅ rate limit + retry (`http_api.py`) → A-08 🟡 failure policy (file stays in inbox ✅ but xfail still
-   strict + no "after M cycles" escalation) → A-09 ❌ remove Drive OCR (`ocr_split.py:158` fallback still present)
-   → A-10 ❌ throughput measurement.
+4. ✅ E-06 + E-08 (merged) – auto second OCR attempt before a paper lands in Needs Review (`intake.py`), and
+   `verify_issued` accepts the ledger cert OR the stored `api_cert_no` (`allocate.py`). The correction audit
+   fields (api vs ops value, edited-by/at), the RE-OCR action, and the Corrections tab landed in **E-07** (`db.py`,
+   `actions.py`, `dashboard.py`).
+5. 🟡 A-07 ✅ rate limit + retry (`http_api.py`) → A-08 ✅ failure policy (whole upload stays in inbox, escalates to
+   Needs Review after `ocr_fail_give_up_minutes`; the xfail is flipped) → A-09 ✅ Drive OCR + pdf-text read path
+   removed (API-only) → A-10 ❌ throughput measurement (needs live OCR calls – gated on Vaibhav).
 6. ✅ B-01…B-03 (+B-04 merged) paper type, 1/2-page split (`splitSize` 1/2; reject odd pages before calling it),
    pairing safety (E105/E106/E107) – `intake.py:139-186`, `extract.py:365/376`; content grouping removed.
 7. 🟡 E-02 self-heal stuck issues (`db.py:315` only moves to ERROR, no Drive-location heal) → 🟡 E-09 crash-resume
    tests (2 of the required steps covered).
 8. 🟡 E-10 + E-11 (merged) Gmail major-issue emails + CRASH/HEARTBEAT – Slack/SMTP/heartbeat exist
    (`context.py`); **no Gmail, no major-vs-minor routing, no CRASH/HEARTBEAT codes**. Keep the heartbeat URL.
-9. ❌ C (one merged ticket) coded `✗ [E###]` lines – no `estamp/errors.py`, no `explain` command; only
-   E105/E106/E107 emitted in code.
+9. ✅ C – `estamp/errors.py` catalogue (E101–E506) + `explain E###` command + call sites in intake/allocate/orders
+   routed through `errors.line` so events carry their code; end-of-cycle summary event added. (Remaining call
+   sites in `actions.py`/`extract.py` can follow; the catalogue + the main paths are done.)
 10. ❌ D-02 live Daily Report tab → D-03 `report --date` – no report subcommand, no Daily Report tab.
 11. ❌ G-01 audit of intake + issue paths (no `docs/AUDIT.md`) → H-02 production URLs + rotated key (still dev
     endpoint) → H-04 README ops guide. (Service-account + Shared-Drive *capability* ✅ in `google_clients.py`.)
-- ❌ F-03 `reset-test-data` command: still waiting on Vaibhav (the 2026-10-27 reset was done by hand, see above).
-- Deferred: ❌ auto re-map (D7 – still allowed by ADR-0001, not built), ❌ vendors + reconciliation,
-  ❌ stray-file adoption, ❌ Manual Issues tab, RECHECK ✅ / RE-OCR ❌, ❌ Drive declutter, ❌ Shared Drive move,
-  ❌ storage estimate.
+- ✅ F-03 `reset-test-data` command built (typed-YES confirm + production-schema guard; DB wipe only). *Running* it
+  against real data still waits on Vaibhav.
+- Deferred: ❌ auto re-map (D7 – still allowed by ADR-0001, not built), ✅ vendors (D-1) / ❌ reconciliation (D-3),
+  ❌ stray-file adoption, ❌ Manual Issues tab, RECHECK ✅ / RE-OCR ✅ (E-07), ✅ Drive declutter (Phase F regroup +
+  archive, applied to live Drive 2026-10-28), ❌ Shared Drive move, ❌ storage estimate.
 
 ⚠️ **The OCR API key was shared in chat – rotate it before go-live.** Keys live only in `.env`; never commit them.
 
