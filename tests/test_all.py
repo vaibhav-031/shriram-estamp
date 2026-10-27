@@ -253,6 +253,50 @@ def test_issue_time_ocr_catches_swapped_file(env):
 
 
 @e2e
+def test_output_never_appends_a_lan_twice_across_a_crash(env):
+    """E-01: crash after append_rows but before mark_written commits must not duplicate a LAN.
+    Allocate one LAN, run outputs with mark_written crashing (row lands in the sheet, ledger NOT flagged),
+    then run outputs again normally – the sheet must still hold exactly one row for that LAN."""
+    from estamp.cycle import run_cycle
+    from estamp.outputs import run_outputs
+
+    s, db, g = env
+    _stock(g, s, "MH", 200, 1)
+    g.add("TEST_Shriram_MH_LANs_26Oct", GSHEET, s.folder("orders_incoming"),
+          tabs={"x": [samples.H, ["1", "LAN-ONLY", "c", "b", "MH", "200"]]})
+
+    # first cycle: intake + issue, but make the output write "crash" after append_rows
+    ctx = _ctx(s, db, g)
+    orig = db.mark_written
+    db.mark_written = lambda ids: (_ for _ in ()).throw(RuntimeError("crash after append"))
+    run_cycle(ctx)
+    db.mark_written = orig
+
+    def mh200():
+        return [rows for sid, tabs in g.sheets_data.items() if sid in g.files
+                and g.files[sid]["name"] == "MH-200" for rows in tabs.values()][0]
+
+    assert len(mh200()) == 2, "one header + one issued LAN after the crash"
+    assert db.q1("SELECT count(*) n FROM allocations WHERE NOT output_written")["n"] == 1, "crash left it unwritten"
+
+    # next cycle re-fetches the same allocation as unwritten – must NOT append it again
+    run_outputs(_ctx(s, db, g))
+    rows = mh200()
+    assert len(rows) == 2, f"LAN appended twice after crash+rerun: {rows}"
+    assert [r[0] for r in rows[1:]] == ["LAN-ONLY"]
+    assert db.q1("SELECT count(*) n FROM allocations WHERE NOT output_written")["n"] == 0, "rerun flagged it"
+
+    # A later CANCELLED row for the same LAN (written by the cancel action, not run_outputs) is still allowed,
+    # and a further run_outputs must leave it in place (the guard keys on LAN presence, not status).
+    label = next(t for t in g.sheets_data[next(sid for sid, f in g.files.items() if f["name"] == "MH-200")])
+    sid = next(sid for sid, f in g.files.items() if f["name"] == "MH-200")
+    g.append_rows(sid, label, [["LAN-ONLY", "IN-MH90000000000001A", "", "", "2026-10-28 02:00:00", "CANCELLED – do not use"]])
+    run_outputs(_ctx(s, db, g))
+    rows = mh200()
+    assert len(rows) == 3 and rows[2][5].startswith("CANCELLED"), rows
+
+
+@e2e
 def test_inbox_accepts_uploaded_folders(env):
     """Ops drag whole folders (any name, nested) into the inbox – papers inside are processed, folders archived."""
     from estamp.cycle import run_cycle

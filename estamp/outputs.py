@@ -35,12 +35,27 @@ def run_outputs(ctx: Ctx) -> None:
     for (d, state, denom), grp in groupby(rows, key=lambda r: (r["alloc_date"], r["state"], r["denomination"])):
         grp = list(grp)
         try:
+            label = label_for(state, denom)
             sid = output_sheet_id(ctx, d, state, denom)
-            ctx.google.append_rows(sid, label_for(state, denom), [
-                [r["lan"], r["verified_cert"] or r["cert_no"], r["pdf_name"], r["pdf_link"],
-                 r["created_at"].astimezone(ctx.tz).strftime("%Y-%m-%d %H:%M:%S"), "ISSUED"] for r in grp])
+            # By-LAN guard (E-01): a crash after append_rows but before mark_written leaves the row in the
+            # sheet yet the allocation unwritten, so the next cycle re-fetches it. Column A holds the LAN ID;
+            # skip any LAN already present (including dupes within this batch) so re-running is idempotent.
+            present = {row[0] for row in ctx.google.read_range(sid, f"{label}!A2:A") if row}
+            to_write, seen = [], set(present)
+            for r in grp:
+                if r["lan"] in seen:
+                    continue
+                seen.add(r["lan"])
+                to_write.append([r["lan"], r["verified_cert"] or r["cert_no"], r["pdf_name"], r["pdf_link"],
+                                 r["created_at"].astimezone(ctx.tz).strftime("%Y-%m-%d %H:%M:%S"), "ISSUED"])
+            if to_write:
+                ctx.google.append_rows(sid, label, to_write)
+            skipped = len(grp) - len(to_write)
+            if skipped:
+                ctx.event("INFO", "Output sheet", f"{d} {state}-{denom}: {skipped} LAN(s) already in sheet, not re-appended")
+            # Flag the whole batch – the already-present ones too, so they aren't retried forever.
             ctx.db.mark_written([r["id"] for r in grp])
-            ctx.stats.outputs_written += len(grp)
+            ctx.stats.outputs_written += len(to_write)
         except Exception as e:
             ctx.event("ERROR", "Output sheet", f"{d} {state}-{denom}: {e} – will retry next cycle",
                       alert_key=f"outfail|{d}|{state}|{denom}")
