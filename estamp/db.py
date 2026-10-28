@@ -8,6 +8,7 @@ Concurrency model
 from __future__ import annotations
 
 import json
+import re
 import zlib
 from contextlib import contextmanager
 from datetime import date
@@ -151,6 +152,17 @@ CREATE TABLE IF NOT EXISTS runs (
 LIVE_ORDER_STATUSES = ("PENDING", "ALLOCATING", "DONE", "ERROR")
 
 
+def expected_schema() -> tuple[dict[str, set[str]], set[str]]:
+    """({table: columns}, index names) that SCHEMA_SQL defines – read from SCHEMA_SQL itself, so a new
+    column or index added there is checked automatically (no second list to keep in sync)."""
+    cols: dict[str, set[str]] = {}
+    for table, body in re.findall(r"CREATE TABLE IF NOT EXISTS (\w+) \((.*?)\n\);", SCHEMA_SQL, re.S):
+        cols[table] = {c for c in re.findall(r"^\s+(\w+)\s", body, re.M) if c.upper() != "PRIMARY"}
+    for table, col in re.findall(r"ALTER TABLE (\w+) ADD COLUMN IF NOT EXISTS (\w+)", SCHEMA_SQL):
+        cols.setdefault(table, set()).add(col)
+    return cols, set(re.findall(r"INDEX IF NOT EXISTS (\w+) ON", SCHEMA_SQL))
+
+
 class DB:
     def __init__(self, url: str, schema: str, max_size: int = 12):
         if not url:
@@ -168,6 +180,28 @@ class DB:
     def init_schema(self) -> None:
         with psycopg.connect(self.url, autocommit=True) as c:
             c.execute(SCHEMA_SQL.format(schema=self.schema))
+
+    def missing_schema(self) -> list[str]:
+        """What SCHEMA_SQL defines but this schema lacks ('table x', 'x.col', 'index y'); [] = up to date.
+        Read-only. Code pulled without `init-db` would otherwise fail mid-cycle on the first missing column."""
+        want_cols, want_idx = expected_schema()
+        # pg_catalog, not information_schema: the latter hides columns the role lacks privileges on.
+        have = {(r["table_name"], r["column_name"]) for r in self.q(
+            """SELECT c.relname AS table_name, a.attname AS column_name
+               FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = %s AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped""",
+            (self.schema,))}
+        have_idx = {r["indexname"] for r in self.q(
+            "SELECT indexname FROM pg_indexes WHERE schemaname=%s", (self.schema,))}
+        tables = {t for t, _ in have}
+        missing: list[str] = []
+        for table, cols in want_cols.items():
+            if table not in tables:
+                missing.append(f"table {table}")
+                continue
+            missing += [f"{table}.{c}" for c in sorted(cols) if (table, c) not in have]
+        return missing + [f"index {i}" for i in sorted(want_idx - have_idx)]
 
     def table_counts(self) -> dict[str, int]:
         """Row count per table in this schema, enumerated from information_schema (not hardcoded)."""

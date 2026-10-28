@@ -34,8 +34,8 @@ folders:
   output_root:      16OXBf4-xk2raMDZ9gb0ct-J3ZdsI91rK   # DATE/STATE/<STATE-AMOUNT> sheet + PDFs
   backup_root:      1u-rz3pYzOmgESZrROvt89xW9q3qnpVXa   # DATE/STATE/AMOUNT/<LAN>__<CERT>.pdf
   # D-2/D-3 `report`: DATE/<Daily Report> (ops-manager daily figures + vendor reconciliation).
-  # GO-LIVE: create this Drive folder and paste its ID here before the first live `report` run.
-  reconciliation_root: REPLACE_WITH_RECONCILIATION_FOLDER_ID
+  # Live-only: config.dryrun.yaml deliberately has no reconciliation_root, so a dry-run report cannot overwrite these.
+  reconciliation_root: 1stoXKjZ7PCo_pMFWGhpwVKmw-RdvSK4B
 
 control_sheet_id: 1UJ7MP-lX270LOonlOIOYm_Q7ELaWnrD_ZjZm8WPbzRE
 

@@ -18,7 +18,7 @@ import argparse
 import sys
 
 from .constants import (BACKUP_ROOT, INVENTORY_ROOT, NEEDS_REVIEW, ORDERS_INCOMING, ORDERS_PROCESSED,
-                        ORDERS_REJECTED, OUTPUT_ROOT, UPLOAD_ARCHIVE, UPLOAD_INBOX)
+                        ORDERS_REJECTED, OUTPUT_ROOT, RECONCILIATION_ROOT, UPLOAD_ARCHIVE, UPLOAD_INBOX)
 from .context import Ctx, alert_channels, setup_logging
 from .db import DB
 from .settings import load_settings
@@ -85,6 +85,7 @@ def main(argv=None) -> int:
     try:
         if args.command == "check-setup":
             return _check(s, db, google)
+        _require_current_schema(s, db, warn_only=args.command == "status")
         if args.command == "status":
             return _status(s, db)
         if args.command == "report":
@@ -142,6 +143,18 @@ def _reset_test_data(s, db, confirm: bool, force: bool) -> int:
 
 
 # config and env check
+def _require_current_schema(s, db, warn_only: bool = False) -> None:
+    """Stop before any work if the ledger is behind the code (e.g. pulled without running init-db).
+    warn_only: read-only diagnostics (`status`) still run – that's when ops need them most."""
+    missing = db.missing_schema()
+    if missing:
+        msg = (f"Postgres schema '{s.schema}' is out of date – missing: {', '.join(missing)}.\n"
+               f"Run `python -m estamp init-db` first (additive only: adds what is missing, changes no rows).")
+        if not warn_only:
+            raise SystemExit(msg)
+        print("WARNING:", msg, "\n")
+
+
 def _check(s, db, google) -> int:
     ok = True
 
@@ -152,12 +165,13 @@ def _check(s, db, google) -> int:
 
     print("Mode:", "DRY RUN" if s.dry_run else "LIVE")
     try:
-        n = db.q1("SELECT count(*) n FROM information_schema.tables WHERE table_schema=%s", (s.schema,))["n"]
-        line(n >= 8, f"Postgres schema '{s.schema}'", f"{n} tables" + ("" if n >= 8 else " – run init-db"))
+        missing = db.missing_schema()
+        line(not missing, f"Postgres schema '{s.schema}'",
+             "up to date" if not missing else f"missing {', '.join(missing)} – run init-db")
     except Exception as e:
         line(False, "Postgres", str(e))
     for key in [UPLOAD_INBOX, UPLOAD_ARCHIVE, NEEDS_REVIEW, INVENTORY_ROOT, ORDERS_INCOMING,
-                ORDERS_PROCESSED, ORDERS_REJECTED, OUTPUT_ROOT, BACKUP_ROOT]:
+                ORDERS_PROCESSED, ORDERS_REJECTED, OUTPUT_ROOT, BACKUP_ROOT, RECONCILIATION_ROOT]:
         try:
             f = google.get_file(s.folder(key))
             line(not f.get("trashed"), f"folder {key}", f"'{f['name']}'")

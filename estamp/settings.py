@@ -80,7 +80,7 @@ class Settings:
 
     def folder(self, key: str) -> str:
         fid = self.get(f"folders.{key}", "")
-        if not fid:
+        if not fid or str(fid).startswith("REPLACE_WITH"):   # shipped placeholder = not set (never send it to Drive)
             raise ValueError(f"folders.{key} is not set in config.yaml")
         return fid
 
