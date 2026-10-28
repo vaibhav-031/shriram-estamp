@@ -21,13 +21,14 @@ Shriram eStamp (Python)/
 
 ## 1. One-time setup on your Mac (≈30 min)
 
-**Python (uv)** – install uv once (`brew install uv`), then:
+**Tools – one script** (safe to re-run; installs tools only, never touches Drive or the DB):
 ```bash
-cd shriram-estamp
-make setup          # creates .venv (Python 3.13, pinned in .python-version) and installs everything
+./setup.sh                                                # macOS: Xcode CLT (git, make), Homebrew, uv, Python + deps, Postgres.app
+powershell -ExecutionPolicy Bypass -File .\setup.ps1      # Windows: Git, uv, Python + deps, PostgreSQL (via winget)
 ```
-`make setup` is `uv sync`. Every other step runs inside that venv via `uv run` – no manual `activate`.
-Run `make` on its own to list all tasks.
+Python 3.13 (pinned in `.python-version`) and every dependency land in `.venv` via `uv sync`; every other step runs
+inside it via `uv run` – no manual `activate`. On the Mac, run `make` on its own to list all tasks. The Makefile is
+macOS-only: on Windows run the same commands as `uv run python -m estamp <command>`.
 
 **Google sign-in (OAuth, runs as you)**
 1. console.cloud.google.com → create a project (e.g. "shriram-estamp").
