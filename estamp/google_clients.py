@@ -6,6 +6,10 @@ Auth
   * service_account  – for a server later. Must work inside a Shared Drive (service accounts
                        have no My Drive storage).
 
+Shared account
+  * google.account (e.g. procurement@zoop.one): every laptop must be signed in as this one account, so all
+    ops see the same Drive. Checked when Google() is built – a different account stops the command.
+
 Thread safety: googleapiclient objects are not thread-safe, so each worker thread builds its own.
 Every call retries 429/5xx with backoff (num_retries).
 """
@@ -31,6 +35,15 @@ CSV = "text/csv"
 R = 5  # retries per call
 
 
+def shared_account(settings: Settings) -> str:
+    """The one account every laptop must sign in as, or '' (not enforced). Only for oauth: a service account
+    always acts as its own …iam.gserviceaccount.com identity, which `login` can't change."""
+    acct = str(settings.get("google.account") or "").strip()
+    if settings.get("google.auth", "oauth") != "oauth" or acct.startswith("REPLACE_WITH"):
+        return ""
+    return acct
+
+
 def load_credentials(settings: Settings):
     mode = settings.get("google.auth", "oauth")
     if mode == "service_account":
@@ -51,7 +64,8 @@ def load_credentials(settings: Settings):
             creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file(str(settings.path("google.oauth_client_file")), SCOPES)
-            creds = flow.run_local_server(port=0)
+            hint = {"login_hint": shared_account(settings)} if shared_account(settings) else {}
+            creds = flow.run_local_server(port=0, **hint)   # pre-selects the shared account in the browser
         token_path.parent.mkdir(parents=True, exist_ok=True)
         token_path.write_text(creds.to_json())
     return creds
@@ -73,6 +87,10 @@ def _tab(title: str) -> str:
     return "'" + title.replace("'", "''") + "'"
 
 
+class WrongGoogleAccount(RuntimeError):
+    pass
+
+
 class Google:
     def __init__(self, settings: Settings, credentials=None):
         self.settings = settings
@@ -80,6 +98,28 @@ class Google:
         self._local = threading.local()
         self._folder_lock = threading.Lock()
         self._folder_cache: dict[tuple[str, str], str] = {}
+        self._email: str | None = None
+        self._require_account()
+
+    def account_email(self) -> str:
+        return self.drive.about().get(fields="user(emailAddress)").execute(num_retries=R)["user"]["emailAddress"]
+
+    @property
+    def email(self) -> str:
+        """The signed-in account, looked up once per client."""
+        if self._email is None:
+            self._email = self.account_email()
+        return self._email
+
+    def _require_account(self) -> None:
+        """Signed in as google.account, or stop: another account would see a different Drive."""
+        expected = shared_account(self.settings)
+        if not expected:
+            return
+        actual = self.email
+        if actual.lower() != expected.lower():
+            raise WrongGoogleAccount(f"Signed in to Google as {actual}, but this setup must use {expected}. "
+                                     f"Run `python -m estamp login` and choose {expected}.")
 
     # ---------------------------------------------------------------- per-thread services
     @property

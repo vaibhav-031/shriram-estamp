@@ -11,6 +11,9 @@ See `README.md` for the flow and `estamp/cycle.py` for the order of steps in one
 
 - **Drive: never delete user files.** Move / rename / copy only. There is no delete anywhere in the code
   (the old temporary-OCR-doc delete in `google_clients.ocr_text` went away with Drive OCR in A-09 – keep it that way).
+- **Drive boundary: only the Shared Drive "Shriram Finance eStamps" (`0AECjrUF6gCffUk9PVA`).** Live runs sign in as
+  procurement@zoop.one; every live folder ID must sit inside this Shared Drive, and nothing outside it (any My Drive,
+  any other Shared Drive) is ever created, moved, renamed or edited.
 - **Never touch the real Drive folders or the real database without asking first.** That includes
   `python -m estamp run-once|run|recheck-review|reconcile`, any write to schema `shriram_estamp`, and any script that
   uses the folder IDs in `config.yaml`. `config.yaml` has `dry_run: false` – a run is LIVE.

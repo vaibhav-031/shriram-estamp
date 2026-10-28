@@ -18,26 +18,29 @@ db:
 
 google:
   auth: oauth              # oauth = your Google account (Mac pilot) | service_account (server, Shared Drive only)
+  account: procurement@zoop.one   # every laptop must sign in as this ONE account, so all ops see the same Drive
   oauth_client_file: secrets/client_secret.json
   oauth_token_file: secrets/token.json
   service_account_file: secrets/service_account.json
 
-# Drive folder IDs – the "Shriram eStamp (Python)" test set in your Drive
+# Drive folder IDs – ALL inside the Shared Drive "Shriram Finance eStamps" (0AECjrUF6gCffUk9PVA), owned by the
+# org, used as procurement@zoop.one. Nothing outside that Shared Drive is ever touched (CLAUDE.md).
 folders:
-  upload_inbox:     1yGKi1TFXDqGnftenBY26Mh2QjVEjTxoC   # 📥 ops upload vendor PDFs here (merged or single)
-  upload_archive:   1qQNEoIWgGrKlwWKSfs4M4GI1C92Mthvb   # originals after processing (never deleted)
-  needs_review:     1i6qCL58qpWU6IWvnKzLvW9ZaCDxKQ7YL   # papers that failed a check
-  inventory_root:   1--Zx-Dj8vvDpgO2xmjitWu1vWCYI7t25   # STATE/AMOUNT/<CERT>.pdf – created automatically
-  orders_incoming:  1A-chhNDQBKv07bCjirwbzzE2qmN0s6d2   # Shriram's state LAN sheets
-  orders_processed: 1CBYMCbvDJa7RFIedvTjBe5mJMTA5-ZNu
-  orders_rejected:  11ZB4dBoH7_U2mLkZJ2eWC8lDr2PmbuLH
-  output_root:      16OXBf4-xk2raMDZ9gb0ct-J3ZdsI91rK   # DATE/STATE/<STATE-AMOUNT> sheet + PDFs
-  backup_root:      1u-rz3pYzOmgESZrROvt89xW9q3qnpVXa   # DATE/STATE/AMOUNT/<LAN>__<CERT>.pdf
+  upload_inbox:     1oUlqWYotKUl82uzrMLmiX5UObt7VKdFJ   # 1 · 📥 Upload Inbox – ops upload vendor PDFs (inside a vendor subfolder)
+  orders_incoming:  1X4JsBz-vb7nnqcmUaqJ1SpzRYrs8UnaB   # 2 · 📥 Orders Incoming – Shriram's state LAN sheets
+  needs_review:     1xa1UnrIWfZlOf3sdrHD4JPkR8EPZSzfU   # 3 · ⚠️ Needs Review – papers that failed a check
+  output_root:      1Dc4bpQxBWxszS5bo9BEZhw81znc9VfZz   # 4 · 📤 Output – DATE/STATE/<STATE-AMOUNT> sheet + PDFs
   # D-2/D-3 `report`: DATE/<Daily Report> (ops-manager daily figures + vendor reconciliation).
   # Live-only: config.dryrun.yaml deliberately has no reconciliation_root, so a dry-run report cannot overwrite these.
-  reconciliation_root: 1stoXKjZ7PCo_pMFWGhpwVKmw-RdvSK4B
+  reconciliation_root: 10Mg5K5iIGaaUiJKhI-GVd9ameuwXmfLO   # 5 · 💰 Reconciliation
+  # ⚙️ System — do not touch/
+  inventory_root:   1KuzxaJjx7dtf7-lILdl6v91Ys65HThjE   # STATE/AMOUNT/<CERT>.pdf – created automatically
+  backup_root:      1dMFD3nUc_UajGeTroGPgpwmwzwScFrdm   # DATE/STATE/AMOUNT/<LAN>__<CERT>.pdf
+  upload_archive:   1h5Ukpeh-VvGCVTJ_s-j18Zk7g1JqHTrf   # originals after processing (never deleted)
+  orders_processed: 12ezTHCWyVD4aTBgDwclIfNccBFT2vvjp
+  orders_rejected:  1e7UglPqjTCIu6TFV6Zk8cjvrBp50nihl
 
-control_sheet_id: 1UJ7MP-lX270LOonlOIOYm_Q7ELaWnrD_ZjZm8WPbzRE
+control_sheet_id: 1beTcMqITQUOJdafBVoO7_tyO0-y9sIk1fMiisLtjLRM   # Shriram eStamp Control (Python), Shared Drive root
 
 state_config_file: state_config.csv
 vendors_file: vendors.csv

@@ -34,8 +34,11 @@ def _build(args, need_google=True):
     db = DB(s.env("db.url_env"), s.schema, max_size=int(s.get("workers", 8)) + 4)
     google = None
     if need_google:
-        from .google_clients import Google
-        google = Google(s)
+        from .google_clients import Google, WrongGoogleAccount
+        try:
+            google = Google(s)
+        except WrongGoogleAccount as e:
+            raise SystemExit(str(e))
     return s, db, google
 
 
@@ -62,10 +65,20 @@ def main(argv=None) -> int:
         return 0
 
     if args.command == "login":
-        from .google_clients import load_credentials
+        from . import google_clients
         s = load_settings(args.config)
-        load_credentials(s)
-        print("Google sign-in OK – token saved to", s.path("google.oauth_token_file"))
+        token = s.path("google.oauth_token_file")
+        for attempt in (1, 2):   # 1: cached token (if any); 2: fresh browser sign-in after dropping a wrong one
+            try:
+                g = google_clients.Google(s, credentials=google_clients.load_credentials(s))
+                break
+            except google_clients.WrongGoogleAccount as e:
+                # Never leave a wrong-account token behind – every later command would pick it up.
+                token.unlink(missing_ok=True)
+                if attempt == 2:
+                    raise SystemExit(f"{e}\n(The token for the wrong account was removed.)")
+                print(f"{e}\nOpening the browser to sign in again…")
+        print(f"Google sign-in OK as {g.email} – token saved to", token)
         return 0
 
     if args.command == "init-db":
@@ -170,6 +183,12 @@ def _check(s, db, google) -> int:
              "up to date" if not missing else f"missing {', '.join(missing)} – run init-db")
     except Exception as e:
         line(False, "Postgres", str(e))
+    from . import google_clients
+    try:
+        line(True, "Google account", google.email + ("" if google_clients.shared_account(s)
+                                                     else " (google.account not enforced – any account allowed)"))
+    except Exception as e:
+        line(False, "Google account", str(e)[:150])
     for key in [UPLOAD_INBOX, UPLOAD_ARCHIVE, NEEDS_REVIEW, INVENTORY_ROOT, ORDERS_INCOMING,
                 ORDERS_PROCESSED, ORDERS_REJECTED, OUTPUT_ROOT, BACKUP_ROOT, RECONCILIATION_ROOT]:
         try:

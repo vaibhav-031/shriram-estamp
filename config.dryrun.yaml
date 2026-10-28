@@ -19,7 +19,7 @@ db:
 google:
   auth: oauth              # oauth = your Google account (Mac pilot) | service_account (server, Shared Drive only)
   oauth_client_file: secrets/client_secret.json
-  oauth_token_file: secrets/token.json
+  oauth_token_file: secrets/token.dryrun.json   # own token: dry run stays on your account; live (config.yaml) = procurement@
   service_account_file: secrets/service_account.json
 
 # Drive folder IDs – the "Shriram eStamp (Python)" test set in your Drive
