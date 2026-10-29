@@ -9,6 +9,9 @@
   7. outputs   – Output sheets for everything issued
   8. alerts    – low stock, cycle summary (errors/warnings), daily summary, heartbeat
   9. dashboard – control sheet tabs
+
+The advisory lock is re-checked before every step: if its connection dropped, another process may already be
+running a cycle, so this one stops (ERROR) rather than work alongside it (M-2).
 """
 from __future__ import annotations
 
@@ -42,8 +45,13 @@ def run_cycle(ctx: Ctx) -> bool:
         else:
             log.warning("another run is in progress – skipping this cycle")
         return True
+    crashed = db.close_crashed_runs()   # we hold the lock, so any still-open run died hard (M-7)
+    if crashed:
+        ctx.event("WARN", "Recovery", f"{len(crashed)} earlier cycle(s) never finished (process killed?) – "
+                  "marked as crashed; stuck LANs/papers are handled by the recovery step.")
     run_id = db.start_run()
     ok = True
+    lock_lost = False
     t0 = time.time()
     budget = float(s.get("cycle.max_seconds", 900))
     try:
@@ -52,19 +60,30 @@ def run_cycle(ctx: Ctx) -> bool:
             if o or p:
                 ctx.event("ERROR", "Recovery", f"{o} LAN(s) and {p} paper(s) were stuck mid-allocation (crash?) – "
                           "moved to ERROR. Check Output/Backup folders, then RETRY in Order Actions.")
-        _step(ctx, "Actions", lambda: run_actions(ctx))
-        _step(ctx, "Ingest", lambda: run_ingest(ctx, t0 + budget * 0.2))
-        _step(ctx, "Allocate", lambda: run_allocation(ctx, t0 + budget * 0.45, report_shortage=False))
-        _step(ctx, "Intake", lambda: run_intake(ctx, t0 + budget * 0.8))
-        _step(ctx, "Allocate", lambda: run_allocation(ctx, t0 + budget * 0.95))
-        _step(ctx, "Outputs", lambda: run_outputs(ctx))
-        _step(ctx, "Low stock", lambda: low_stock_alerts(ctx))
+        for name, fn in (
+            ("Actions", lambda: run_actions(ctx)),
+            ("Ingest", lambda: run_ingest(ctx, t0 + budget * 0.2)),
+            ("Allocate", lambda: run_allocation(ctx, t0 + budget * 0.45, report_shortage=False)),
+            ("Intake", lambda: run_intake(ctx, t0 + budget * 0.8)),
+            ("Allocate", lambda: run_allocation(ctx, t0 + budget * 0.95)),
+            ("Outputs", lambda: run_outputs(ctx)),
+            ("Low stock", lambda: low_stock_alerts(ctx)),
+        ):
+            if not db.lock_held():
+                raise LockLost(name)
+            _step(ctx, name, fn)
+    except LockLost as e:
+        ok, lock_lost = False, True
+        ctx.event("ERROR", "Cycle", f"lost the database lock before step '{e}' (Postgres connection dropped?) – "
+                  "stopped this cycle so two cycles can never run at once. The next cycle picks up safely; if this "
+                  "repeats, check the Postgres connection.", alert_key="cycle_lock_lost")
     except Exception as e:
         ok = False
         ctx.event("ERROR", "Cycle", f"cycle crashed: {e}\n{traceback.format_exc()[-1500:]}")
     finally:
         try:
-            _step(ctx, "Dashboard", lambda: run_dashboard(ctx))
+            if not lock_lost:
+                _step(ctx, "Dashboard", lambda: run_dashboard(ctx))
         finally:
             # Each wrap-up call is independent: a failure in one must not skip the others, and
             # release_lock() MUST always run or the advisory lock wedges every future cycle (#10).
@@ -88,6 +107,10 @@ def run_cycle(ctx: Ctx) -> bool:
     return ok
 
 
+class LockLost(RuntimeError):
+    """The cycle lock was gone before a step started (M-2); the message is that step's name."""
+
+
 def _step(ctx: Ctx, name: str, fn) -> None:
     try:
         fn()
@@ -97,6 +120,7 @@ def _step(ctx: Ctx, name: str, fn) -> None:
 
 def _send(ctx: Ctx) -> None:
     s, st = ctx.settings, ctx.stats
+    ctx.alerts.sort(key=_severity)   # ERROR, then WARN (stable): the 40-line cap drops the least urgent (L-3)
     name = s.get("client_name", "Shriram")
     if ctx.alerts and (not ctx.dry or s.get("alerts.in_dry_run", False)):
         lines = [f"Issued {st.allocated} · LANs in {st.orders_in} · papers in {st.papers_in} · review {st.papers_review} · "
@@ -119,6 +143,10 @@ def _send(ctx: Ctx) -> None:
         lines += [f"  {r[0]} ₹{r[2]}: avail {r[4]}, pending {r[6]}, net {r[7]}, cover {r[8]}d → {r[13]}"
                   for r in stock_rows(ctx) if r[13] != "OK"] or ["  all OK"]
         ctx.send_alerts(f"[{name} eStamp] Daily summary {d}", lines)
+
+
+def _severity(alert: str) -> int:
+    return {"ERROR": 0, "WARN": 1}.get(alert.split(" · ", 1)[0], 2)
 
 
 def run_forever(ctx_factory, interval: int) -> None:

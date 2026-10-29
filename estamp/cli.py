@@ -15,21 +15,24 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from .constants import (BACKUP_ROOT, INVENTORY_ROOT, NEEDS_REVIEW, ORDERS_INCOMING, ORDERS_PROCESSED,
                         ORDERS_REJECTED, OUTPUT_ROOT, RECONCILIATION_ROOT, UPLOAD_ARCHIVE, UPLOAD_INBOX)
 from .context import Ctx, alert_channels, safe_console, setup_logging
 from .db import DB
-from .settings import load_settings
+from .settings import load_settings, secret_file_problems, startup_problems
 
 
-def _build(args, need_google=True):
+def _build(args, need_google=True, startup_checks=False):
     s = load_settings(args.config)
     if args.dry_run:
         s.raw["dry_run"] = True
     if args.live:
         s.raw["dry_run"] = False
+    if startup_checks:
+        _startup_checks(s)            # before logging, DB or Google: nothing is touched on a misconfig
     setup_logging(s)
     db = DB(s.env("db.url_env"), s.schema, max_size=int(s.get("workers", 8)) + 4)
     google = None
@@ -79,6 +82,8 @@ def main(argv=None) -> int:
                 if attempt == 2:
                     raise SystemExit(f"{e}\n(The token for the wrong account was removed.)")
                 print(f"{e}\nOpening the browser to sign in again…")
+        if os.name != "nt" and token.exists():
+            token.chmod(0o600)        # owner-only, or run/run-once refuse to start (H-2)
         print(f"Google sign-in OK as {g.email} – token saved to", token)
         return 0
 
@@ -95,7 +100,8 @@ def main(argv=None) -> int:
         finally:
             db.close()
 
-    s, db, google = _build(args, need_google=args.command not in ("status",))
+    s, db, google = _build(args, need_google=args.command not in ("status",),
+                           startup_checks=args.command in ("run-once", "run", "recheck-review"))
     try:
         if args.command == "check-setup":
             return _check(s, db, google)
@@ -157,6 +163,18 @@ def _reset_test_data(s, db, confirm: bool, force: bool) -> int:
 
 
 # config and env check
+def _startup_checks(s) -> None:
+    """Refuse run/run-once/recheck-review with one message listing every missing key and readable secret (L-1, H-2)."""
+    problems = startup_problems(s) + secret_file_problems(s)
+    if not s.dry_run and not alert_channels(s):
+        # same rule check-setup applies (#2); a dry run legitimately has no channel (config.dryrun.yaml)
+        problems.append("no alert channel – set the Slack webhook env (alerts.slack_webhook_env) or alerts.smtp "
+                        "host + to; a live run must be able to tell ops when it is stuck")
+    if problems:
+        raise SystemExit("Refusing to start – fix these first (nothing was touched):\n"
+                         + "\n".join(f"  ✗ {p}" for p in problems))
+
+
 def _require_current_schema(s, db, warn_only: bool = False) -> None:
     """Stop before any work if the ledger is behind the code (e.g. pulled without running init-db).
     warn_only: read-only diagnostics (`status`) still run – that's when ops need them most."""
@@ -220,6 +238,11 @@ def _check(s, db, google) -> int:
     channels = alert_channels(s)
     line(bool(channels), "alerts", ", ".join(channels) or "none configured – you will not hear about failures")
     line(True, "heartbeat", "configured" if s.env("alerts.heartbeat_url_env") else "not set (optional)")
+    problems = startup_problems(s)
+    line(not problems, "run/run-once config", "; ".join(problems) or "every required folder id, key and file is set")
+    loose = secret_file_problems(s)
+    line(not loose, "secret file permissions",
+         "; ".join(loose) or ("skipped on Windows" if os.name == "nt" else "owner-only"))
     print("\nAll good." if ok else "\nFix the ✗ items above.")
     return 0 if ok else 1
 

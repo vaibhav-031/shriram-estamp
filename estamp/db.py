@@ -241,14 +241,34 @@ class DB:
         rows = self.q(sql, params)
         return rows[0] if rows else None
 
+    @property
+    def _lock_key(self) -> int:
+        return zlib.crc32(f"estamp:{self.schema}".encode())
+
     def try_lock(self) -> bool:
-        key = zlib.crc32(f"estamp:{self.schema}".encode())
-        self._lock_conn = psycopg.connect(self.url, autocommit=True)
-        got = self._lock_conn.execute("SELECT pg_try_advisory_lock(%s)", (key,)).fetchone()[0]
+        # keepalives: a half-open session (NAT/network drop) must error out so lock_held() says False, not hang (M-2)
+        self._lock_conn = psycopg.connect(self.url, autocommit=True, connect_timeout=10, keepalives=1,
+                                          keepalives_idle=30, keepalives_interval=10, keepalives_count=3)
+        got = self._lock_conn.execute("SELECT pg_try_advisory_lock(%s)", (self._lock_key,)).fetchone()[0]
         if not got:
             self._lock_conn.close()
             self._lock_conn = None
         return bool(got)
+
+    def lock_held(self) -> bool:
+        """True while this process still holds the cycle lock. The lock lives on its own session (_lock_conn); if
+        that connection drops, Postgres releases the lock and a second process could start a cycle alongside
+        this one (M-2) – so the cycle asks before each step. A bigint advisory key shows in pg_locks as
+        classid (high 32 bits) / objid (low 32 bits) with objsubid 1."""
+        if self._lock_conn is None or self._lock_conn.closed:
+            return False
+        try:
+            row = self._lock_conn.execute(
+                """SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND granted AND pid=pg_backend_pid()
+                   AND objsubid=1 AND ((classid::bigint << 32) | objid::bigint) = %s""", (self._lock_key,)).fetchone()
+        except psycopg.Error:
+            return False
+        return row[0] > 0
 
     def release_lock(self) -> None:
         if self._lock_conn is not None:
@@ -271,11 +291,19 @@ class DB:
     def start_run(self) -> int:
         return self.q1("INSERT INTO runs DEFAULT VALUES RETURNING id")["id"]
 
+    def close_crashed_runs(self) -> list[int]:
+        """Mark every unfinished run as crashed; returns their ids. Call only while holding the cycle lock: then no
+        other cycle is live, so an unfinished row can only be one whose process died hard (power loss, kill -9).
+        Left open, it would be reported as the lock holder's age by active_run_age_seconds – a false "wedged"
+        alarm whenever the real holder has no open row (e.g. while it wraps up after finish_run) (M-7)."""
+        return [r["id"] for r in self.q("""UPDATE runs SET finished_at=now(), ok=false, summary=%s
+                                           WHERE finished_at IS NULL RETURNING id""", (json.dumps({"crashed": True}),))]
+
     def active_run_age_seconds(self) -> float | None:
         """Seconds since the newest still-running cycle started, or None if no cycle is running. When a new
         cycle can't get the lock, this says how long the holder has been going – a value far past a normal
-        cycle means the holder is wedged and blocking all work (#3). A hard crash drops the lock, so if the
-        lock is held there really is a live holder and the newest unfinished run is it."""
+        cycle means the holder is wedged and blocking all work (#3). Every holder closes crashed runs as soon as
+        it gets the lock (close_crashed_runs), so an unfinished row is the live holder's own, never a stale one."""
         row = self.q1("SELECT extract(epoch FROM now() - max(started_at)) AS age FROM runs WHERE finished_at IS NULL")
         return float(row["age"]) if row and row["age"] is not None else None
 

@@ -57,6 +57,7 @@ else
 	cp .env.example .env
 	echo "created from .env.example – fill in ESTAMP_DB_URL and the API keys"
 fi
+chmod 600 .env   # owner-only: run/run-once refuse a group/other-readable .env
 
 step "secrets/"
 mkdir -p secrets
