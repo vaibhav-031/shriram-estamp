@@ -47,8 +47,8 @@ class FakeGoogle:
 
     # ---------------------------------------------------------------- Drive API surface
     def get_file(self, fid):
-        f = self.files[fid]
-        return {k: f[k] for k in ("id", "name", "mimeType", "parents", "trashed", "modifiedTime", "md5Checksum")}
+        f = self.files[fid]   # like Drive, a field the item lacks is simply absent (L-2: e.g. modifiedTime)
+        return {k: f[k] for k in ("id", "name", "mimeType", "parents", "trashed", "modifiedTime", "md5Checksum") if k in f}
 
     def list_children(self, folder_id, folders=None):
         out = []
@@ -58,7 +58,7 @@ class FakeGoogle:
             if folders is False and f["mimeType"] == FOLDER:
                 continue
             out.append(self.get_file(f["id"]))
-        return sorted(out, key=lambda f: f["modifiedTime"])
+        return sorted(out, key=lambda f: f.get("modifiedTime", ""))
 
     def child_exists(self, folder_id, name):
         return self.child_id(folder_id, name) is not None
@@ -137,7 +137,11 @@ class FakeGoogle:
         self.sheets_data.setdefault(sid, {}).setdefault(title, []).extend([list(r) for r in rows])
 
     def create_sheet(self, folder_id, name, header):
+        """M-1: like the real client, an existing sheet of that name in the folder is reused, never duplicated."""
         with self.lock:
+            hit = [f for f in self.children(folder_id) if f["name"] == name and f["mimeType"] == GSHEET]
+            if hit:
+                return hit[0]["id"]
             sid = self.add(name, GSHEET, folder_id)
-        self.sheets_data[sid] = {name: [list(header)]}
+            self.sheets_data[sid] = {name: [list(header)]}
         return sid

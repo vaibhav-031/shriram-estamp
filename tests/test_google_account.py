@@ -72,9 +72,9 @@ def _login(tmp_path, monkeypatch, emails: list[str]):
     monkeypatch.setattr(cli, "load_settings", lambda path: s)
     monkeypatch.setattr(google_clients, "load_credentials", lambda settings: loads.append(1) or object())
     seq = iter(emails)
-    current = {}
+    # Pinned on the instance, not id(self): the first Google dies in __init__ and the next one can reuse its id.
     monkeypatch.setattr(Google, "account_email",
-                        lambda self: current.setdefault(id(self), next(seq)))
+                        lambda self: self.__dict__.setdefault("_fake_email", next(seq)))
     return cli, token, loads
 
 

@@ -50,6 +50,7 @@ orders:
   header_scan_rows: 10
   lan_regex: '^[A-Za-z0-9][A-Za-z0-9\-_/]{3,39}$'   # tighten once Shriram's LAN format is confirmed
   reject_file_on_any_invalid_row: false
+  max_rows_per_tab: 50000     # a tab with more filled rows is refused whole (E201) instead of eating the cycle budget
   columns:                    # header names are matched case/punctuation-insensitively
     lan: [loan no, loan number, loan no., lan id, lan, lan no, lan number, loan account number, loan account no]
     state: [state, state code, state name]
