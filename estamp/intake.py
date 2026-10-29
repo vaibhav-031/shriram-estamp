@@ -24,7 +24,7 @@ from .errors import line
 from dataclasses import dataclass
 
 from .extract import (PaperAnalysis, analyze_fields, analyze_paper, first_broken_pair, ids_in_reading,
-                      pages_per_paper, safe_file_name)
+                      pages_per_paper, review_code, safe_file_name)
 from .google_clients import FOLDER, PDF, parse_time
 from .http_api import ApiAuthError
 from .ocr_split import _split_local, merge_pdfs
@@ -144,6 +144,18 @@ class WholeUploadReview(Exception):
         self.code, self.reason = code, reason
 
 
+class ReadFailed(RuntimeError):
+    """A-08: a split (E110) or OCR (E111) call failed – the whole upload stays in the inbox for the next cycle."""
+
+    def __init__(self, code: str, detail: str):
+        super().__init__(detail)
+        self.code = code
+
+
+def _coded(code: str, text: str) -> str:
+    return line(code, text) if code else text
+
+
 def _read_units(ctx: Ctx, data: bytes, name: str) -> list[Unit]:
     """OCR every page → pages per paper from the IDs (ADR-0006) → split → papers.
 
@@ -183,7 +195,7 @@ def _read_units(ctx: Ctx, data: bytes, name: str) -> list[Unit]:
         raise auth
     first_err = next((reads[no][1] for no in sorted(reads) if reads[no][1]), "")
     if first_err:
-        raise RuntimeError(f"{first_err} – whole upload stays in the inbox, retried next cycle")
+        raise ReadFailed("E111", first_err)
 
     # Past this point every page read cleanly (any failure raised above).
     def ids(no):
@@ -206,11 +218,16 @@ def _read_units(ctx: Ctx, data: bytes, name: str) -> list[Unit]:
         raise WholeUploadReview("E106", f"{len(singles)} pages (odd) – every paper here needs front + back. "
                                         "Find the missing page and upload again")
 
-    pieces = ctx.splitter.split(data, name, size)
+    try:
+        pieces = ctx.splitter.split(data, name, size)
+    except ApiAuthError:
+        raise
+    except RuntimeError as e:
+        raise ReadFailed("E110", str(e))
     wrong = [p for p in pieces if p.page_to - p.page_from + 1 != size]
     if wrong:   # never stock a part that holds more (or less) than one paper – retried next cycle
-        raise RuntimeError(f"split returned parts that are not {size} page(s) each "
-                           f"(e.g. pages {wrong[0].page_from}-{wrong[0].page_to}) – nothing stocked")
+        raise ReadFailed("E110", f"split returned parts that are not {size} page(s) each "
+                                 f"(e.g. pages {wrong[0].page_from}-{wrong[0].page_to}) – nothing stocked")
 
     def unit(p):
         pages = range(p.page_from, p.page_to + 1)
@@ -318,20 +335,22 @@ def _process_upload(ctx: Ctx, f: dict, vendor_code: str = "") -> None:
         return
     except ApiAuthError as e:
         # A-08: a bad key is a human fix, not a timeout – stop this upload loudly, keep it in the inbox, never loop.
-        ctx.event("ERROR", "Intake", f"'{f['name']}': OCR API refused the request – {e}. Fix the API key, then it "
-                  "reads next cycle. Not retried this cycle.", ref=f["id"], alert_key=f"intakeauth|{f['id']}")
+        ctx.event("ERROR", "Intake", line("E113", f"'{f['name']}': the API refused the request – {e}. Fix the API "
+                  "key, then it reads next cycle. Not retried this cycle."), ref=f["id"],
+                  alert_key=f"intakeauth|{f['id']}")
         return
     except RuntimeError as e:
         # A-08/D1: OCR (or split) failed. The whole upload stays in the inbox and is retried next cycle – unless it
         # has been failing for longer than the give-up window, when it moves to Needs Review as a whole with an alert.
+        code = getattr(e, "code", "")
         give_up = int(s.get("intake.ocr_fail_give_up_minutes", 30))
         failing_for = (datetime.now(timezone.utc) - up["created_at"]).total_seconds()
         if failing_for < give_up * 60:
-            ctx.event("WARN", "Intake", f"'{f['name']}': {e} – stays in the inbox, retried next cycle", ref=f["id"],
-                      alert_key=f"intakefail|{f['id']}")
+            ctx.event("WARN", "Intake", _coded(code, f"'{f['name']}': {e} – whole upload stays in the inbox, retried "
+                      "next cycle"), ref=f["id"], alert_key=f"intakefail|{f['id']}")
             return
-        reason = (f"Reading this upload kept failing for over {give_up} min ({e}). Moved to Needs Review as a whole – "
-                  "nothing was stocked. Check the API / the file, then upload it again as a new file.")
+        reason = _coded(code, f"Reading this upload kept failing for over {give_up} min ({e}). Moved to Needs Review "
+                        "as a whole – nothing was stocked. Check the API / the file, then upload it again as a new file.")
         db.upload_finish(up["id"], "REVIEW", 0, reason)
         g.move_rename(f["id"], g.folder_path(s.folder(NEEDS_REVIEW), [today]))
         ctx.stats.uploads += 1
@@ -403,18 +422,17 @@ def _stock_unit(ctx: Ctx, up: dict, upload_name: str, u: Unit, vendor_code: str 
                 return
             except UniqueViolation:
                 a.issues.append(f"duplicate certificate {a.cert} – already in stock")
-                reason = "; ".join(a.issues)
+                reason = _coded(review_code(a), "; ".join(a.issues))
                 g.move_rename(file_id, g.folder_path(s.folder(NEEDS_REVIEW), [ctx.today().isoformat()]), review_name)
                 db.insert_paper(**fields, drive_file_id=file_id, file_name=review_name, status="NEEDS_REVIEW",
                                 notes=reason)
     else:
         # E-06: these reach Needs Review only AFTER the automatic second OCR attempt also failed. Where an E-code fits
-        # the leftover reason, stamp it so ops see it (E120 no cert, E124 unreadable amount).
+        # the leftover reason, stamp it so ops see it. An E107 pairing note keeps its own "E107 …" prefix – recheck
+        # skips papers by that prefix, so it must not be re-tagged.
         reason = "; ".join(a.issues)
-        if not a.cert:
-            reason = line("E120", reason)
-        elif "not readable" in reason or "not an allowed amount" in reason:
-            reason = line("E124", reason)
+        if not u.error:
+            reason = _coded(review_code(a), reason)
         folder = g.folder_path(s.folder(NEEDS_REVIEW), [ctx.today().isoformat()])
         file_id = _reuse_or_upload(ctx, folder, review_name, data)
         db.insert_paper(**fields, drive_file_id=file_id, file_name=review_name, status="NEEDS_REVIEW", notes=reason)

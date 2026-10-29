@@ -1644,8 +1644,8 @@ def test_second_ocr_attempt_rescues_a_paper_that_failed_the_first_reading(env):
 
 @e2e
 def test_paper_failing_both_ocr_attempts_goes_to_needs_review(env):
-    """When the retry reading also fails the checks, the paper lands in Needs Review (coded E124 for a bad amount) –
-    the API output is still on the row, and no third attempt is made."""
+    """When the retry reading also fails the checks, the paper lands in Needs Review (coded E125: the amount read
+    fine but is not allowed for the state) – the API output is still on the row, and no third attempt is made."""
     from estamp.cycle import run_cycle
     from fake_apis import ScriptedOcr
     s, db, g = env
@@ -1653,7 +1653,7 @@ def test_paper_failing_both_ocr_attempts_goes_to_needs_review(env):
     ocr = ScriptedOcr(script={}, default=_hp_fields(amount="999"))   # valid cert, bad amount both times
     run_cycle(Ctx(s, db, g, ocr=ocr))
     p = db.q1("SELECT * FROM papers")
-    assert p["status"] == "NEEDS_REVIEW" and "E124" in (p["notes"] or ""), p
+    assert p["status"] == "NEEDS_REVIEW" and "[E125]" in (p["notes"] or ""), p
     assert len(ocr.calls) == 2, ocr.calls
 
 
@@ -1948,3 +1948,93 @@ def test_cancel_sheet_marker_failure_is_loud_not_silent(env):
     assert db.q1("SELECT count(*) n FROM events WHERE level='ERROR' AND action='Cancel' "
                  "AND details LIKE '%do not use%'")["n"] >= 1
     assert db.q1("SELECT count(*) n FROM events WHERE level='ERROR'")["n"] > err_before
+
+
+# ------------------------------------------------------------ error codes on every intake path (catalogue wiring)
+
+@pytest.mark.parametrize("issues,cert,code", [
+    (["duplicate certificate IN-X – already in stock or used"], "IN-X", "E126"),
+    (["more than one certificate / serial number on this paper: A, B"], "", "E121"),
+    (["certificate state code 'ZZ' is not in state_config.csv"], "IN-ZZ1", "E122"),
+    (["state of 'X1' is not in state_config.csv", "stamp duty amount not readable"], "X1", "E122"),
+    (["no certificate / serial number found", "stamp duty amount not readable"], "", "E120"),
+    (["stamp duty amount not readable"], "IN-X", "E124"),
+    (["stamp duty ₹999 is not an allowed amount for HP [100]"], "IN-X", "E125"),
+    (["state KL is marked inactive in state_config.csv (x)"], "IN-X", ""),
+])
+def test_review_code_picks_the_catalogue_code(issues, cert, code):
+    from estamp.extract import PaperAnalysis, review_code
+    assert review_code(PaperAnalysis(cert=cert, issues=issues)) == code
+
+
+def _events(db, like):
+    return [e["details"] for e in db.q("SELECT details FROM events WHERE details LIKE %s", (like,))]
+
+
+@e2e
+def test_paper_review_notes_carry_e121_e122_e126(env):
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    two = f"{samples.cert('MH', 1)} {samples.cert('MH', 2)}"
+    g.add("codes.pdf", PDF, _vendor_folder(g, s), samples.merged([
+        samples.paper_page(two, 200), samples.paper_page(samples.cert("ZZ", 3), 200),
+        samples.paper_page(samples.cert("MH", 4), 200), samples.paper_page(samples.cert("MH", 4), 200)]))
+    assert run_cycle(_ctx(s, db, g))
+    notes = {r["page_from"]: r["notes"] or "" for r in db.q("SELECT page_from, notes FROM papers")}
+    assert "[E121]" in notes[1] and "more than one" in notes[1], notes
+    assert "[E122]" in notes[2] and "ZZ" in notes[2], notes
+    dup = [notes[p] for p in (3, 4) if notes[p]]
+    assert len(dup) == 1 and "[E126]" in dup[0] and "duplicate" in dup[0], notes
+    assert _events(db, "%[E121]%") and _events(db, "%[E126]%")
+
+
+@e2e
+def test_pairing_break_note_keeps_its_e107_prefix(env):
+    """E107 notes must start with 'E107' (recheck-review skips those) – not be re-tagged as E120 'no certificate'."""
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    g.add("pair.pdf", PDF, _vendor_folder(g, s), samples.merged([
+        samples.scanned_front("RAJASTHAN", "S 254201", 195), samples.scanned_back("RAJASTHAN"),
+        samples.scanned_front("RAJASTHAN", "(serial smudged)", 195), samples.scanned_back("RAJASTHAN")]))
+    assert run_cycle(_ctx(s, db, g))
+    p = db.q1("SELECT notes FROM papers WHERE page_from=3")
+    assert p["notes"].startswith("E107") and "E120" not in p["notes"], p
+
+
+@e2e
+def test_ocr_failure_event_carries_e111(env):
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeOcr
+    s, db, g = env
+    _stock(g, s, "MH", 200, 2)
+    assert run_cycle(Ctx(s, db, g, ocr=FakeOcr(fail={"vendor_MH_200_1.pdf_p2": RuntimeError("OCR API HTTP 503")})))
+    ev = _events(db, "%[E111]%")
+    assert ev and "503" in ev[0] and "inbox" in ev[0], ev
+
+
+@e2e
+def test_split_failure_event_carries_e110(env):
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeOcr
+
+    class BrokenSplitter:
+        def split(self, data, name, split_size=1):
+            raise RuntimeError("split API HTTP 502: bad gateway")
+
+    s, db, g = env
+    _stock(g, s, "MH", 200, 2)
+    assert run_cycle(Ctx(s, db, g, ocr=FakeOcr(), splitter=BrokenSplitter()))
+    ev = _events(db, "%[E110]%")
+    assert ev and "502" in ev[0], ev
+    assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
+
+
+@e2e
+def test_ocr_auth_failure_event_carries_e113(env):
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeOcr
+    s, db, g = env
+    _stock(g, s, "MH", 200, 1)
+    assert run_cycle(Ctx(s, db, g, ocr=FakeOcr(fail={"vendor_MH_200_1.pdf_p1": ApiAuthError("refused (HTTP 401)")})))
+    ev = [e["details"] for e in db.q("SELECT details FROM events WHERE level='ERROR' AND details LIKE '%[E113]%'")]
+    assert ev and "401" in ev[0], ev

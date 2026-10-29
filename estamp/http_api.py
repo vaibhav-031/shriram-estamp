@@ -20,6 +20,7 @@ from collections import deque
 
 import requests
 
+from .errors import line
 from .settings import Settings
 
 log = logging.getLogger("estamp")
@@ -99,10 +100,12 @@ def call_with_retry(fn, limiter: RateLimiter, retries: int = 3, backoff_s: float
         if res.status_code == 429 or res.status_code >= 500:
             if attempt == retries or (max_total_s is not None and clock() - start >= max_total_s):
                 return res
+            msg = f"{name}: HTTP {res.status_code} – retry {attempt + 1}/{retries} in {wait:.0f} s"
             if res.status_code == 429:
                 wait = _retry_after(res, wait)
                 limiter.pause(wait)
-            log.warning(f"{name}: HTTP {res.status_code} – retry {attempt + 1}/{retries} in {wait:.0f} s")
+                msg = line("E112", f"{name}: HTTP 429 – pausing {wait:.0f} s, retry {attempt + 1}/{retries}")
+            log.warning(msg)
             sleep(wait)
             continue
         return res

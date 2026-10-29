@@ -233,6 +233,25 @@ class PaperAnalysis:
         return not self.issues
 
 
+def review_code(a: PaperAnalysis) -> str:
+    """The error-catalogue code for a paper that failed its checks ('' = none fits, e.g. state inactive). Matches the
+    issue wording written in this module; the strongest reason wins (a duplicate beats a bad amount)."""
+    text = " ".join(a.issues)
+    if "duplicate certificate" in text:
+        return "E126"
+    if "more than one certificate" in text:
+        return "E121"
+    if "is not in state_config.csv" in text:
+        return "E122"
+    if not a.cert:
+        return "E120"
+    if "amount not readable" in text:
+        return "E124"
+    if "not an allowed amount" in text:
+        return "E125"
+    return ""
+
+
 def _check_state_and_amount(a: "PaperAnalysis", settings: Settings) -> None:
     st = settings.states.get(a.state) if a.state else None
     if st:
