@@ -137,7 +137,11 @@ class FakeGoogle:
         self.sheets_data.setdefault(sid, {}).setdefault(title, []).extend([list(r) for r in rows])
 
     def create_sheet(self, folder_id, name, header):
+        """M-1: like the real client, an existing sheet of that name in the folder is reused, never duplicated."""
         with self.lock:
+            hit = [f for f in self.children(folder_id) if f["name"] == name and f["mimeType"] == GSHEET]
+            if hit:
+                return hit[0]["id"]
             sid = self.add(name, GSHEET, folder_id)
-        self.sheets_data[sid] = {name: [list(header)]}
+            self.sheets_data[sid] = {name: [list(header)]}
         return sid

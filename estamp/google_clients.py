@@ -33,6 +33,11 @@ XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 XLS = "application/vnd.ms-excel"
 CSV = "text/csv"
 R = 5  # retries per call
+# M-5: move_rename reads a file's parents then updates them; a striped per-file-id lock serialises the two so
+# concurrent moves of ONE file in this process can't both strip the same stale parent and leave it in two folders.
+# (Across processes the single-run advisory lock is the guard.) Striped → bounded, no per-id dict to grow.
+_MOVE_LOCKS = [threading.Lock() for _ in range(64)]
+UNUSED_SUFFIX = " (unused duplicate)"
 
 
 def shared_account(settings: Settings) -> str:
@@ -211,12 +216,13 @@ class Google:
                                        supportsAllDrives=True, fields="id").execute(num_retries=R)["id"]
 
     def move_rename(self, file_id: str, new_parent: str, new_name: str | None = None) -> None:
-        """Rename and move in ONE call, so a file is never left half-renamed."""
-        current = self.get_file(file_id).get("parents", [])
-        body = {"name": new_name} if new_name else {}
-        self.drive.files().update(fileId=file_id, body=body, addParents=new_parent,
-                                  removeParents=",".join(p for p in current if p != new_parent),
-                                  supportsAllDrives=True, fields="id").execute(num_retries=R)
+        """Rename and move in ONE call, so a file is never left half-renamed. Read + update under a per-file lock (M-5)."""
+        with _MOVE_LOCKS[hash(file_id) % len(_MOVE_LOCKS)]:
+            current = self.get_file(file_id).get("parents", [])
+            body = {"name": new_name} if new_name else {}
+            self.drive.files().update(fileId=file_id, body=body, addParents=new_parent,
+                                      removeParents=",".join(p for p in current if p != new_parent),
+                                      supportsAllDrives=True, fields="id").execute(num_retries=R)
 
     # ---------------------------------------------------------------- Sheets
     def tab_titles(self, sid: str) -> list[str]:
@@ -270,13 +276,43 @@ class Google:
                 spreadsheetId=sid, range=f"{_tab(title)}!A1", valueInputOption="RAW",
                 insertDataOption="INSERT_ROWS", body={"values": rows}).execute(num_retries=R)
 
-    def create_sheet(self, folder_id: str, name: str, header: list[str]) -> str:
-        sid = self.drive.files().create(body={"name": name, "mimeType": GSHEET, "parents": [folder_id]},
-                                        supportsAllDrives=True, fields="id").execute(num_retries=R)["id"]
+    def _sheets_named(self, folder_id: str, name: str) -> list[str]:
+        """Ids of the Google Sheets called `name` in the folder, oldest first."""
+        res = self.drive.files().list(
+            q=f"'{folder_id}' in parents and name='{_q(name)}' and mimeType='{GSHEET}' and trashed=false",
+            orderBy="createdTime", pageSize=10, supportsAllDrives=True, includeItemsFromAllDrives=True,
+            fields="files(id)").execute(num_retries=R)
+        return [f["id"] for f in res.get("files", [])]
+
+    def _name_tab(self, sid: str, name: str) -> None:
         self.sheets.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests": [
             {"updateSheetProperties": {"properties": {"sheetId": 0, "title": name, "gridProperties": {"frozenRowCount": 1}},
                                        "fields": "title,gridProperties.frozenRowCount"}}]}).execute(num_retries=R)
+
+    def _ready(self, sid: str, name: str, header: list[str]) -> str:
+        """Finish a reused sheet that a crashed / racing create may have left half set up (tab not renamed, no
+        header). Idempotent – a sheet already set up is left exactly as it is."""
+        if name not in self.tab_titles(sid):
+            self._name_tab(sid, name)
+        if not self.read_range(sid, f"{_tab(name)}!A1:A1"):
+            self.write_range(sid, f"{_tab(name)}!A1", [header])
+        return sid
+
+    def create_sheet(self, folder_id: str, name: str, header: list[str]) -> str:
+        """The sheet `name` in the folder, created if missing (M-1). Like folder_path, an existing one is reused, so
+        a re-run or a racing create lands on the same sheet. Drive's list-then-create isn't atomic, so after creating
+        we look again and everyone settles on the OLDEST; a copy that lost the race is renamed (never deleted)."""
+        found = self._sheets_named(folder_id, name)
+        if found:
+            return self._ready(found[0], name, header)
+        sid = self.drive.files().create(body={"name": name, "mimeType": GSHEET, "parents": [folder_id]},
+                                        supportsAllDrives=True, fields="id").execute(num_retries=R)["id"]
+        self._name_tab(sid, name)
         self.write_range(sid, f"{_tab(name)}!A1", [header])
+        oldest = (self._sheets_named(folder_id, name) or [sid])[0]
+        if oldest != sid:
+            self.move_rename(sid, folder_id, name + UNUSED_SUFFIX)
+            return self._ready(oldest, name, header)
         return sid
 
 

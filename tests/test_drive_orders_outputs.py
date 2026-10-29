@@ -115,6 +115,164 @@ def test_order_file_without_modified_time_waits_out_the_settle_window(env, monke
     assert db.q1("SELECT count(*) n FROM orders")["n"] == 1
 
 
+# ============================================================ M-1: create_sheet reuses an existing sheet
+
+@e2e
+def test_output_sheet_already_in_drive_is_reused_not_duplicated(env):
+    # Another run (or a crash between create_sheet and save_output_sheet) already made the sheet in Drive,
+    # but this ledger never recorded it: the next create must land on that same sheet.
+    from estamp.outputs import OUTPUT_HEADER, output_sheet_id
+    s, db, g = env
+    d = date(2026, 10, 29)
+    folder = g.folder_path(s.folder("output_root"), [d.isoformat(), "MH"])
+    first = g.create_sheet(folder, "MH-500", OUTPUT_HEADER)
+    sid = output_sheet_id(_ctx(s, db, g), d, "MH", 500)
+    assert sid == first
+    assert [f["name"] for f in g.children(folder)] == ["MH-500"]
+
+
+class _StubDrive:
+    """Just enough of the Drive v3 files() surface for Google.create_sheet / move_rename, no network."""
+
+    def __init__(self, files, hide_until_created=False, slow_get=0.0):
+        self.files_ = files                # id -> {id, name, mimeType, parents, createdTime}
+        self.hide = hide_until_created     # first list call sees nothing (a racing create not yet visible)
+        self.slow_get = slow_get
+        self.updates = []
+        self.lock = threading.Lock()
+
+    def files(self):
+        return self
+
+    def _exec(self, value):
+        return SimpleNamespace(execute=lambda num_retries=0: value() if callable(value) else value)
+
+    def list(self, q, orderBy=None, **kw):
+        parent = re.search(r"'([^']+)' in parents", q).group(1)
+        name = re.search(r"name='([^']*)'", q).group(1)
+        if self.hide:
+            self.hide = False
+            return self._exec({"files": []})
+        hits = sorted((f for f in self.files_.values() if parent in f["parents"] and f["name"] == name
+                       and f["mimeType"] == GSHEET), key=lambda f: f["createdTime"])
+        return self._exec({"files": [{"id": f["id"]} for f in hits]})
+
+    def create(self, body, **kw):
+        fid = f"new{len(self.files_)}"
+        self.files_[fid] = dict(id=fid, name=body["name"], mimeType=body["mimeType"], parents=body["parents"],
+                                createdTime=datetime.now(timezone.utc).isoformat())
+        return self._exec({"id": fid})
+
+    def get(self, fileId, **kw):
+        def value():
+            parents = list(self.files_[fileId]["parents"])
+            time.sleep(self.slow_get)      # widen the read-then-update window
+            return {"id": fileId, "parents": parents}
+        return self._exec(value)
+
+    def update(self, fileId, body, addParents=None, removeParents="", **kw):
+        def value():
+            with self.lock:
+                f = self.files_[fileId]
+                f["parents"] = [p for p in f["parents"] if p not in removeParents.split(",")]
+                if addParents and addParents not in f["parents"]:
+                    f["parents"].append(addParents)
+                if body.get("name"):
+                    f["name"] = body["name"]
+                self.updates.append((fileId, body, addParents, removeParents))
+            return {"id": fileId}
+        return self._exec(value)
+
+
+class _StubSheets:
+    """Sheets surface: `tabs` maps a spreadsheet id to (tab titles, A1 rows). Unknown ids are fully set up."""
+
+    def __init__(self, tabs=None):
+        self.calls = []
+        self.tabs = tabs or {}
+
+    def spreadsheets(self):
+        return self
+
+    def values(self):
+        return self
+
+    def get(self, spreadsheetId, range=None, **kw):
+        titles, a1 = self.tabs.get(spreadsheetId, (["MH-500"], [["LAN ID"]]))
+        if range is None:      # spreadsheets().get → tab titles
+            return SimpleNamespace(execute=lambda num_retries=0: {"sheets": [{"properties": {"title": t}} for t in titles]})
+        return SimpleNamespace(execute=lambda num_retries=0: {"values": a1})
+
+    def batchUpdate(self, **kw):
+        self.calls.append(("batchUpdate", kw))
+        return SimpleNamespace(execute=lambda num_retries=0: {})
+
+    def update(self, **kw):
+        self.calls.append(("update", kw))
+        return SimpleNamespace(execute=lambda num_retries=0: {})
+
+
+def _google(settings, monkeypatch, drive, sheets=None) -> Google:
+    monkeypatch.setattr(Google, "account_email", lambda self: str(settings.get("google.account") or ""))
+    sheets = sheets or _StubSheets()
+    monkeypatch.setattr(Google, "drive", property(lambda self: drive))     # every thread, not just this one
+    monkeypatch.setattr(Google, "sheets", property(lambda self: sheets))
+    return Google(settings, credentials=object())
+
+
+def test_create_sheet_reuses_an_existing_sheet_of_that_name(settings, monkeypatch):
+    drive = _StubDrive({"old": dict(id="old", name="MH-500", mimeType=GSHEET, parents=["fold"],
+                                    createdTime="2026-10-29T00:00:00+00:00")})
+    sheets = _StubSheets()
+    g = _google(settings, monkeypatch, drive, sheets)
+    assert g.create_sheet("fold", "MH-500", ["LAN ID"]) == "old"
+    assert set(drive.files_) == {"old"} and sheets.calls == []   # nothing created, header not rewritten
+
+
+def test_reused_sheet_left_half_made_by_a_crash_is_finished(settings, monkeypatch):
+    # A crash between files.create and the tab rename / header write leaves "Sheet1" with nothing in it. Reusing it
+    # as-is would make every output append fail on the missing tab – so finish setting it up.
+    drive = _StubDrive({"old": dict(id="old", name="MH-500", mimeType=GSHEET, parents=["fold"],
+                                    createdTime="2026-10-29T00:00:00+00:00")})
+    sheets = _StubSheets({"old": (["Sheet1"], [])})
+    g = _google(settings, monkeypatch, drive, sheets)
+    assert g.create_sheet("fold", "MH-500", ["LAN ID"]) == "old"
+    assert [c[0] for c in sheets.calls] == ["batchUpdate", "update"]
+    assert sheets.calls[1][1]["body"] == {"values": [["LAN ID"]]}
+
+
+def test_racing_create_sheet_converges_on_the_oldest_and_marks_its_own_copy_unused(settings, monkeypatch):
+    # The racer's sheet was not yet visible when we looked, so we create too; the re-list then shows both and
+    # every racer picks the oldest. Our empty copy is renamed (never deleted) so nobody mistakes it for the real one.
+    drive = _StubDrive({"racer": dict(id="racer", name="MH-500", mimeType=GSHEET, parents=["fold"],
+                                      createdTime="2026-10-29T00:00:00+00:00")}, hide_until_created=True)
+    g = _google(settings, monkeypatch, drive)
+    assert g.create_sheet("fold", "MH-500", ["LAN ID"]) == "racer"
+    ours = [f for f in drive.files_.values() if f["id"] != "racer"]
+    assert len(ours) == 1 and "unused duplicate" in ours[0]["name"] and ours[0]["parents"] == ["fold"]
+
+
+# ============================================================ M-5: move_rename serialised per file id
+
+def test_concurrent_moves_of_one_file_never_leave_it_in_two_folders(settings, monkeypatch):
+    drive = _StubDrive({"p": dict(id="p", name="x.pdf", mimeType=PDF, parents=["A"], createdTime="")}, slow_get=0.05)
+    g = _google(settings, monkeypatch, drive)
+    ts = [threading.Thread(target=g.move_rename, args=("p", dest)) for dest in ("B", "C")]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert len(drive.files_["p"]["parents"]) == 1, drive.files_["p"]["parents"]
+
+
+def test_move_rename_still_moves_and_renames_in_one_call(settings, monkeypatch):
+    drive = _StubDrive({"p": dict(id="p", name="x.pdf", mimeType=PDF, parents=["A"], createdTime="")})
+    g = _google(settings, monkeypatch, drive)
+    g.move_rename("p", "B", "CERT1.pdf")
+    assert drive.files_["p"]["parents"] == ["B"] and drive.files_["p"]["name"] == "CERT1.pdf"
+    assert len(drive.updates) == 1
+
+
 # ============================================================ recheck_review: E107 papers stay put
 
 @e2e
