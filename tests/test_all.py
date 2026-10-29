@@ -2342,3 +2342,21 @@ def test_paper_approved_with_a_typed_cert_is_trusted_at_issue_others_are_verifie
     assert p["ocr_via"] == "ops", p                      # stamp over the number: the typed cert is used at issue
     res, p = _review_result(ctx, s, g, plain, ["APPROVE", "", "", "", ""])
     assert p["ocr_via"] != "ops", p                      # nothing typed: second OCR as usual
+
+
+@e2e
+def test_vendor_register_number_on_a_mp_back_page_does_not_break_the_pairing(env):
+    """Real MP paper (2026-10-29): front DX 594001; the back carries the stamp vendor's register no. 1691735, which
+    the OCR API returns as certification_no. Only a serial-shaped number on a back page breaks the pairing."""
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeApiOcr
+    s, db, g = env
+    pages = []
+    for serial, register in (("DX 594001", "1691735"), ("DX 594002", "1691736")):
+        pages += [samples.api_page(certification_no=serial, state_code="MP", stamp_duty_amount="100"),
+                  samples.api_page(certification_no=register, state_code="MP")]
+    g.add("page185-186.pdf", PDF, _vendor_folder(g, s), samples.merged(pages))
+    assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr()))
+    rows = db.q("SELECT cert_no, page_from, page_to, status FROM papers ORDER BY page_from")
+    assert [(r["cert_no"], r["page_from"], r["page_to"], r["status"]) for r in rows] == [
+        ("MP-DX594001", 1, 2, "AVAILABLE"), ("MP-DX594002", 3, 4, "AVAILABLE")], rows

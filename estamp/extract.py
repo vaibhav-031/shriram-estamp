@@ -395,6 +395,18 @@ def pages_per_paper(h: IdHit, settings: Settings) -> int:
 # ============================== PAIRING (ADR-0003) ==============================
 
 
+def counts_on_back_page(h: IdHit, settings: Settings) -> bool:
+    """Whether an ID read on a back page means the pages have shifted. The back of a traditional paper often carries
+    other numbers (e.g. the stamp vendor's register no. 1691735 on MP papers), which the OCR API may return as
+    certification_no – only an e-stamp ID or a serial matching the configured serial pattern counts."""
+    if h.kind == "estamp":
+        return True
+    serial = h.cert.split("-", 1)[1] if "-" in h.cert else h.cert
+    patterns = settings.get("intake.serial_patterns") or {}
+    pat = patterns.get(h.state) or patterns.get("DEFAULT")
+    return bool(pat) and re.fullmatch(pat, serial) is not None
+
+
 def first_broken_pair(id_counts: list[tuple[int, int]]) -> int | None:
     """id_counts: (IDs found on the front page, IDs found on the back page) per traditional pair, in file order.
     A good pair has exactly one serial on the front and none on the back. Returns the index of the first bad pair

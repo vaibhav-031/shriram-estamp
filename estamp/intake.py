@@ -23,7 +23,8 @@ from .db import UniqueViolation
 from .errors import line
 from dataclasses import asdict, dataclass
 
-from .extract import (MAX_OCR_TEXT, PaperAnalysis, analyze_fields, analyze_paper, first_broken_pair, ids_in_reading,
+from .extract import (MAX_OCR_TEXT, PaperAnalysis, analyze_fields, analyze_paper, counts_on_back_page,
+                      first_broken_pair, ids_in_reading,
                       pages_per_paper, review_code, safe_file_name)
 from .google_clients import FOLDER, PDF, parse_time
 from .http_api import ApiAuthError
@@ -275,7 +276,8 @@ def _read_units(ctx: Ctx, data: bytes, name: str, deadline: float | None = None)
 
     units = [unit(p) for p in pieces]
     if size == 2:
-        counts = [(len(page_ids[u.page_from]), len(page_ids[u.page_to])) for u in units]
+        counts = [(len(page_ids[u.page_from]), sum(counts_on_back_page(h, s) for h in page_ids[u.page_to]))
+                  for u in units]
         k = first_broken_pair(counts)
         if k is not None:
             at = pieces[k].page_from
