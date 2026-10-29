@@ -61,8 +61,11 @@ class StateResolver:
 
 # ============================== OCR TEXT ==============================
 
+MAX_OCR_TEXT = 20000    # chars of OCR text we parse and store per paper (L-4: bounds the regex passes below)
+
+
 def normalize_ocr(text: str) -> str:
-    t = str(text or "").upper()
+    t = str(text or "")[:MAX_OCR_TEXT].upper()
     t = re.sub(r"(\d)[ \t]+(?=\d)", r"\1", t)              # "1234 5678" → "12345678"
     t = re.sub(r"\bI\s*N\s*-\s*", "IN-", t)                 # "I N -" → "IN-"
     t = re.sub(r"\bIN-([A-Z])\s+([A-Z])", r"IN-\1\2", t)     # "IN-M H" → "IN-MH"

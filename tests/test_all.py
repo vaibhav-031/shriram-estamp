@@ -2085,6 +2085,15 @@ def test_oversized_upload_goes_whole_to_review_before_any_ocr_call(env, monkeypa
     assert ocr.calls == [] and "E108" in CATALOGUE
 
 
+# ------------------------------------------------------------ L-4: OCR text fed to the regexes is capped
+
+def test_normalize_ocr_caps_its_input_at_the_storage_cap():
+    from estamp.extract import MAX_OCR_TEXT
+    assert MAX_OCR_TEXT == 20000
+    assert len(normalize_ocr("x" * (MAX_OCR_TEXT * 3))) == MAX_OCR_TEXT
+    assert normalize_ocr("in-mh 1234") == "IN-MH1234"          # short text unchanged in behaviour
+
+
 # ------------------------------------------------------------ H-5: the E-06 retry reading survives a crash
 
 def _retry_calls(ocr):

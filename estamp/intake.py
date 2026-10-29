@@ -23,7 +23,7 @@ from .db import UniqueViolation
 from .errors import line
 from dataclasses import asdict, dataclass
 
-from .extract import (PaperAnalysis, analyze_fields, analyze_paper, first_broken_pair, ids_in_reading,
+from .extract import (MAX_OCR_TEXT, PaperAnalysis, analyze_fields, analyze_paper, first_broken_pair, ids_in_reading,
                       pages_per_paper, review_code, safe_file_name)
 from .google_clients import FOLDER, PDF, parse_time
 from .http_api import ApiAuthError
@@ -423,7 +423,7 @@ def _stock_unit(ctx: Ctx, up: dict, upload_name: str, u: Unit, vendor_code: str 
     review_name = f"{safe_file_name(upload_name.rsplit('.', 1)[0])}__p{u.page_from}-{u.page_to}.pdf"
     fields = dict(upload_id=up["id"], page_from=u.page_from, page_to=u.page_to, cert_no=a.cert or None,
                   cert_state=a.cert_state or None, state=a.state or None, denomination=a.amount or None,
-                  ocr_amount=a.amount or None, ocr_via=u.via, ocr_text=u.text[:20000], ocr_raw=u.raw,
+                  ocr_amount=a.amount or None, ocr_via=u.via, ocr_text=u.text[:MAX_OCR_TEXT], ocr_raw=u.raw,
                   vendor_code=vendor_code or None)
 
     if a.ok:
