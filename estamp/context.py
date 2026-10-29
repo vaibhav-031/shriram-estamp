@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import smtplib
 import threading
 from dataclasses import dataclass, field
@@ -20,6 +21,17 @@ from .settings import Settings
 log = logging.getLogger("estamp")
 
 _LEVELS = ("ERROR", "WARN", "INFO")
+
+# H-1: a Postgres error echoes the failing row ("Failing row contains (…)") or the JSON / bound parameters
+# ("CONTEXT: …") – for a papers write that is the customer's page text. Everything from such a marker up to the
+# next traceback header (or the end) is hidden; a multi-line row can't leak past the first line this way, and a
+# traceback cut short by [-1500:] (no header left) is hidden entirely.
+_PG_ECHO = re.compile(r"(Failing row contains|CONTEXT:)(?:(?!\nTraceback \(most recent call last\):).)*", re.S)
+
+
+def redact(details: str) -> str:
+    """Event/alert text with Postgres row and parameter echoes removed (cert numbers, states, files stay)."""
+    return _PG_ECHO.sub(r"\1 … (hidden – may hold customer page text)", details)
 
 
 def alert_channels(settings: Settings) -> list[str]:
@@ -135,6 +147,7 @@ class Ctx:
         a still-stuck condition re-alerts each hour, so ops keep hearing about it (#4); dedup="day" is for alerts
         that are only worth one-a-day (shortage, low stock – HANDOFF §12 "first shortage of the day").
         """
+        details = redact(details)   # H-1: no customer page text in the log file, Log tab or alerts
         getattr(log, {"ERROR": "error", "WARN": "warning"}.get(level, "info"))(f"{action}: {details}")
         try:
             self.db.event(level, action, details, ref)

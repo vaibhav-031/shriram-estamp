@@ -12,6 +12,10 @@ loop_seconds: 120          # `run` mode: start a new cycle every N seconds
 cycle:
   max_seconds: 900         # time budget per cycle (intake is time-boxed inside this)
 
+retention:                 # H-1: pruned once a day by the cycle (not in dry run); 0 switches a window off
+  ocr_text_days: 30        # stored page text (papers.ocr_text, ocr_raw minus `fields`) cleared N days after stocking
+  events_days: 90          # events (Log tab rows) deleted after N days – only the dashboard reads them (last 500)
+
 db:
   url_env: ESTAMP_DB_URL   # name of the env var holding the Postgres URL
   schema: shriram_estamp   # everything lives in this schema only

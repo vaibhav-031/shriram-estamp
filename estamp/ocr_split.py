@@ -186,7 +186,8 @@ def _ocr_zoop(data: bytes, name: str, settings: Settings) -> OcrResult:
         raise RuntimeError(f"OCR API HTTP {res.status_code} returned something that is not JSON")
     if res.status_code != 200 or not j.get("success"):
         err = j.get("error") if isinstance(j.get("error"), dict) else {}
-        msg = err.get("message") or j.get("message") or res.content[:200].decode("utf-8", "replace")
+        # H-1: never echo the raw body – it can hold the page reading, and this text goes to events/alerts
+        msg = err.get("message") or j.get("message") or "no error message in the response"
         raise RuntimeError(f"OCR API HTTP {res.status_code}: {msg}")
     fields = ((j.get("data") or {}).get("provider_response") or {}).get("fields")
     if not isinstance(fields, dict):
