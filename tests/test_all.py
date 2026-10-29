@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -1676,8 +1677,8 @@ def test_second_ocr_attempt_rescues_a_paper_that_failed_the_first_reading(env):
 
 @e2e
 def test_paper_failing_both_ocr_attempts_goes_to_needs_review(env):
-    """When the retry reading also fails the checks, the paper lands in Needs Review (coded E124 for a bad amount) –
-    the API output is still on the row, and no third attempt is made."""
+    """When the retry reading also fails the checks, the paper lands in Needs Review (coded E125: the amount read
+    fine but is not allowed for the state) – the API output is still on the row, and no third attempt is made."""
     from estamp.cycle import run_cycle
     from fake_apis import ScriptedOcr
     s, db, g = env
@@ -1685,7 +1686,7 @@ def test_paper_failing_both_ocr_attempts_goes_to_needs_review(env):
     ocr = ScriptedOcr(script={}, default=_hp_fields(amount="999"))   # valid cert, bad amount both times
     run_cycle(Ctx(s, db, g, ocr=ocr))
     p = db.q1("SELECT * FROM papers")
-    assert p["status"] == "NEEDS_REVIEW" and "E124" in (p["notes"] or ""), p
+    assert p["status"] == "NEEDS_REVIEW" and "[E125]" in (p["notes"] or ""), p
     assert len(ocr.calls) == 2, ocr.calls
 
 
@@ -1980,3 +1981,309 @@ def test_cancel_sheet_marker_failure_is_loud_not_silent(env):
     assert db.q1("SELECT count(*) n FROM events WHERE level='ERROR' AND action='Cancel' "
                  "AND details LIKE '%do not use%'")["n"] >= 1
     assert db.q1("SELECT count(*) n FROM events WHERE level='ERROR'")["n"] > err_before
+
+
+# ------------------------------------------------------------ error codes on every intake path (catalogue wiring)
+
+@pytest.mark.parametrize("issues,cert,code", [
+    (["duplicate certificate IN-X – already in stock or used"], "IN-X", "E126"),
+    (["more than one certificate / serial number on this paper: A, B"], "", "E121"),
+    (["certificate state code 'ZZ' is not in state_config.csv"], "IN-ZZ1", "E122"),
+    (["state of 'X1' is not in state_config.csv", "stamp duty amount not readable"], "X1", "E122"),
+    (["no certificate / serial number found", "stamp duty amount not readable"], "", "E120"),
+    (["stamp duty amount not readable"], "IN-X", "E124"),
+    (["stamp duty ₹999 is not an allowed amount for HP [100]"], "IN-X", "E125"),
+    (["state KL is marked inactive in state_config.csv (x)"], "IN-X", ""),
+])
+def test_review_code_picks_the_catalogue_code(issues, cert, code):
+    from estamp.extract import PaperAnalysis, review_code
+    assert review_code(PaperAnalysis(cert=cert, issues=issues)) == code
+
+
+def _events(db, like):
+    return [e["details"] for e in db.q("SELECT details FROM events WHERE details LIKE %s", (like,))]
+
+
+@e2e
+def test_paper_review_notes_carry_e121_e122_e126(env):
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    two = f"{samples.cert('MH', 1)} {samples.cert('MH', 2)}"
+    g.add("codes.pdf", PDF, _vendor_folder(g, s), samples.merged([
+        samples.paper_page(two, 200), samples.paper_page(samples.cert("ZZ", 3), 200),
+        samples.paper_page(samples.cert("MH", 4), 200), samples.paper_page(samples.cert("MH", 4), 200)]))
+    assert run_cycle(_ctx(s, db, g))
+    notes = {r["page_from"]: r["notes"] or "" for r in db.q("SELECT page_from, notes FROM papers")}
+    assert "[E121]" in notes[1] and "more than one" in notes[1], notes
+    assert "[E122]" in notes[2] and "ZZ" in notes[2], notes
+    dup = [notes[p] for p in (3, 4) if notes[p]]
+    assert len(dup) == 1 and "[E126]" in dup[0] and "duplicate" in dup[0], notes
+    assert _events(db, "%[E121]%") and _events(db, "%[E126]%")
+
+
+@e2e
+def test_pairing_break_note_keeps_its_e107_prefix(env):
+    """E107 notes must start with 'E107' (recheck-review skips those) – not be re-tagged as E120 'no certificate'."""
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    g.add("pair.pdf", PDF, _vendor_folder(g, s), samples.merged([
+        samples.scanned_front("RAJASTHAN", "S 254201", 195), samples.scanned_back("RAJASTHAN"),
+        samples.scanned_front("RAJASTHAN", "(serial smudged)", 195), samples.scanned_back("RAJASTHAN")]))
+    assert run_cycle(_ctx(s, db, g))
+    p = db.q1("SELECT notes FROM papers WHERE page_from=3")
+    assert p["notes"].startswith("E107") and "E120" not in p["notes"], p
+
+
+@e2e
+def test_ocr_failure_event_carries_e111(env):
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeOcr
+    s, db, g = env
+    _stock(g, s, "MH", 200, 2)
+    assert run_cycle(Ctx(s, db, g, ocr=FakeOcr(fail={"vendor_MH_200_1.pdf_p2": RuntimeError("OCR API HTTP 503")})))
+    ev = _events(db, "%[E111]%")
+    assert ev and "503" in ev[0] and "inbox" in ev[0], ev
+
+
+@e2e
+def test_split_failure_event_carries_e110(env):
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeOcr
+
+    class BrokenSplitter:
+        def split(self, data, name, split_size=1):
+            raise RuntimeError("split API HTTP 502: bad gateway")
+
+    s, db, g = env
+    _stock(g, s, "MH", 200, 2)
+    assert run_cycle(Ctx(s, db, g, ocr=FakeOcr(), splitter=BrokenSplitter()))
+    ev = _events(db, "%[E110]%")
+    assert ev and "502" in ev[0], ev
+    assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
+
+
+@e2e
+def test_ocr_auth_failure_event_carries_e113(env):
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeOcr
+    s, db, g = env
+    _stock(g, s, "MH", 200, 1)
+    assert run_cycle(Ctx(s, db, g, ocr=FakeOcr(fail={"vendor_MH_200_1.pdf_p1": ApiAuthError("refused (HTTP 401)")})))
+    ev = [e["details"] for e in db.q("SELECT details FROM events WHERE level='ERROR' AND details LIKE '%[E113]%'")]
+    assert ev and "401" in ev[0], ev
+
+
+# ------------------------------------------------------------ M-4: unreadable / oversized PDFs go whole to review, early
+
+def _encrypted_pdf() -> bytes:
+    import io as _io
+    from pypdf import PdfReader, PdfWriter
+    w = PdfWriter()
+    for p in PdfReader(_io.BytesIO(samples.paper_page(samples.cert("MH", 1), 200))).pages:
+        w.add_page(p)
+    w.encrypt("secret")
+    buf = _io.BytesIO()
+    w.write(buf)
+    return buf.getvalue()
+
+
+@e2e
+@pytest.mark.parametrize("data,needle", [(_encrypted_pdf(), "password-protected"),
+                                         (b"%PDF-1.4\n not really a pdf", "can't be opened")], ids=["encrypted", "corrupt"])
+def test_unreadable_pdf_goes_whole_to_review_with_e103(env, data, needle):
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeOcr
+    s, db, g = env
+    g.add("locked.pdf", PDF, _vendor_folder(g, s), data)
+    ocr = FakeOcr()
+    assert run_cycle(Ctx(s, db, g, ocr=ocr))
+    status, notes, path = _upload_review(db, g, s, "locked.pdf")
+    assert status == "REVIEW" and "E103" in notes and needle in notes and path.startswith("needs_review/"), notes
+    assert ocr.calls == [] and db.q1("SELECT count(*) n FROM papers")["n"] == 0
+    assert _events(db, "%[E103]%")
+
+
+@e2e
+def test_oversized_upload_goes_whole_to_review_before_any_ocr_call(env, monkeypatch):
+    from estamp.cycle import run_cycle
+    from estamp.errors import CATALOGUE
+    from fake_apis import FakeOcr
+    s, db, g = env
+    monkeypatch.setitem(s.raw["intake"], "max_upload_mb", 0.001)       # ~1 KB, smaller than any sample PDF
+    _stock(g, s, "MH", 200, 2)
+    ocr = FakeOcr()
+    assert run_cycle(Ctx(s, db, g, ocr=ocr))
+    status, notes, path = _upload_review(db, g, s, "vendor_MH_200_1.pdf")
+    assert status == "REVIEW" and "E108" in notes and "MB" in notes and path.startswith("needs_review/"), notes
+    assert ocr.calls == [] and "E108" in CATALOGUE
+
+
+# ------------------------------------------------------------ L-2: a Drive file without modifiedTime
+
+@e2e
+def test_upload_without_modified_time_is_read_not_crashed(env):
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    up = _stock(g, s, "MH", 200, 2)
+    del g.files[up]["modifiedTime"]
+    assert run_cycle(_ctx(s, db, g))
+    assert db.q1("SELECT count(*) n FROM papers WHERE status='AVAILABLE'")["n"] == 2
+    assert len(_events(db, "%no modifiedTime%")) == 1
+
+
+@e2e
+def test_upload_without_modified_time_waits_out_the_settle_window_and_logs_once(env, monkeypatch):
+    import estamp.intake as intake
+    from datetime import datetime, timedelta, timezone
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    monkeypatch.setitem(s.raw["intake"], "settle_minutes", 5)
+    up = _stock(g, s, "MH", 200, 1)
+    del g.files[up]["modifiedTime"]
+    for _ in range(2):
+        assert run_cycle(_ctx(s, db, g))
+        assert [f["id"] for f in _inbox_files(g, s)] == [up], "still settling"
+    assert len(_events(db, "%no modifiedTime%")) == 1, "logged once, not every cycle"
+    intake._first_seen[up] = datetime.now(timezone.utc) - timedelta(minutes=6)      # the window has passed
+    assert run_cycle(_ctx(s, db, g))
+    assert db.q1("SELECT count(*) n FROM papers WHERE status='AVAILABLE'")["n"] == 1
+
+
+# ------------------------------------------------------------ intake deadline is checked while reading pages
+
+@e2e
+def test_page_reading_stops_at_the_intake_deadline_and_leaves_the_upload_untouched(env, monkeypatch):
+    """A big upload must not hold the cycle past the intake budget: once the deadline passes no further page is
+    read, nothing is stocked, and the upload stays in the inbox (PROCESSING) to be read again next cycle."""
+    import types
+    import estamp.intake as intake
+    from fake_apis import FakeOcr
+    s, db, g = env
+    clock = [0.0]
+    monkeypatch.setattr(intake, "time", types.SimpleNamespace(time=lambda: clock[0]))
+    monkeypatch.setitem(s.raw, "workers", 1)                 # pages read in order, so the cut-off is exact
+    up = _stock(g, s, "MH", 200, 5)
+
+    class SlowOcr(FakeOcr):
+        def read(self, data, name):
+            if name.endswith("_p2"):
+                clock[0] = 2000.0                            # reading page 2 runs past the deadline
+            return super().read(data, name)
+
+    ocr = SlowOcr()
+    intake.run_intake(Ctx(s, db, g, ocr=ocr), deadline=1000.0)
+    assert sorted(ocr.calls) == ["vendor_MH_200_1.pdf_p1", "vendor_MH_200_1.pdf_p2"], ocr.calls
+    assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
+    assert [f["id"] for f in _inbox_files(g, s)] == [up]
+    assert db.q1("SELECT status FROM uploads")["status"] == "PROCESSING"
+    assert _events(db, "%time budget%2 of 5%"), _events(db, "%")
+    assert db.q1("SELECT count(*) n FROM events WHERE level IN ('ERROR','WARN')")["n"] == 0
+
+    clock[0] = 0.0                                            # next cycle, fresh budget: the whole file is read
+    intake.run_intake(Ctx(s, db, g, ocr=FakeOcr()), deadline=1000.0)
+    assert db.q1("SELECT count(*) n FROM papers WHERE status='AVAILABLE'")["n"] == 5
+    assert not _inbox_files(g, s)
+
+
+@e2e
+def test_an_upload_that_never_fits_the_budget_gives_up_like_a_failing_read(env, monkeypatch):
+    """No new retry loop: an upload cut off by the deadline for longer than the A-08 give-up window goes whole to
+    Needs Review, the same as one whose OCR keeps failing."""
+    import estamp.intake as intake
+    from fake_apis import FakeOcr
+    s, db, g = env
+    _stock(g, s, "MH", 200, 2)
+    intake.run_intake(Ctx(s, db, g, ocr=FakeOcr()), deadline=0.0)       # the deadline has already passed
+    assert db.q1("SELECT count(*) n FROM uploads")["n"] == 0, "deadline before the first file: nothing touched"
+
+    def cut_off(*a, **k):
+        raise intake.OutOfTime("intake time budget ran out")
+    monkeypatch.setattr(intake, "_read_units", cut_off)
+    later = time.time() + 3600
+    intake.run_intake(Ctx(s, db, g, ocr=FakeOcr()), deadline=later)
+    assert db.q1("SELECT status FROM uploads")["status"] == "PROCESSING"
+    db.q("UPDATE uploads SET created_at = now() - interval '31 minutes'")
+    intake.run_intake(Ctx(s, db, g, ocr=FakeOcr()), deadline=later)
+    assert db.q1("SELECT status FROM uploads")["status"] == "REVIEW"
+    assert not _inbox_files(g, s)
+
+
+# ------------------------------------------------------------ whole-file reviews show up in the cycle stats
+
+@e2e
+def test_whole_file_review_is_counted_in_the_cycle_summary(env):
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    g.add("odd.pdf", PDF, _vendor_folder(g, s), samples.merged([
+        samples.scanned_front("RAJASTHAN", "S 254201", 195), samples.scanned_back("RAJASTHAN"),
+        samples.scanned_front("RAJASTHAN", "S 254202", 195)]))
+    ctx = _ctx(s, db, g)
+    assert run_cycle(ctx)
+    assert ctx.stats.uploads_review == 1 and ctx.stats.papers_review == 0
+    assert db.q1("SELECT summary FROM runs")["summary"]["uploads_review"] == 1
+    assert _events(db, "summary:%1 whole file%"), _events(db, "summary:%")
+
+
+# ------------------------------------------------------------ L-4: OCR text fed to the regexes is capped
+
+def test_normalize_ocr_caps_its_input_at_the_storage_cap():
+    from estamp.extract import MAX_OCR_TEXT
+    assert MAX_OCR_TEXT == 20000
+    assert len(normalize_ocr("x" * (MAX_OCR_TEXT * 3))) == MAX_OCR_TEXT
+    assert normalize_ocr("in-mh 1234") == "IN-MH1234"          # short text unchanged in behaviour
+
+
+# ------------------------------------------------------------ H-5: the E-06 retry reading survives a crash
+
+def _retry_calls(ocr):
+    return [c for c in ocr.calls if c.endswith("#retry")]
+
+
+@e2e
+def test_crash_after_the_second_ocr_attempt_does_not_bill_it_again(env, monkeypatch):
+    """Crash after _reread's OCR call but before insert_paper: the re-run adopts the stored retry reading instead of
+    calling OCR a second time for the same paper – and still stocks it from that (good) reading."""
+    from estamp.cycle import run_cycle
+    from fake_apis import ScriptedOcr
+    s, db, g = env
+    g.add("retry_crash.pdf", PDF, _vendor_folder(g, s), samples.api_page(state_code="HP"))
+    ocr = ScriptedOcr(script={"retry_crash.pdf_p1": [_hp_fields(amount="999")]}, default=_hp_fields(amount="100"))
+
+    def boom(**f):
+        raise RuntimeError("crash after the retry OCR, before the ledger insert")
+    monkeypatch.setattr(db, "insert_paper", boom)
+    run_cycle(Ctx(s, db, g, ocr=ocr))
+    monkeypatch.undo()
+    assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
+    assert any(f["name"] == "retry_crash.pdf" for f in _inbox_files(g, s))
+
+    assert run_cycle(Ctx(s, db, g, ocr=ocr))
+    assert len(_retry_calls(ocr)) == 1, ocr.calls
+    p = db.q1("SELECT * FROM papers")
+    assert p["status"] == "AVAILABLE" and p["denomination"] == 100, p
+
+
+@e2e
+def test_a_failed_second_ocr_attempt_is_not_repeated_after_a_crash(env, monkeypatch):
+    from estamp.cycle import run_cycle
+    from fake_apis import ScriptedOcr
+    s, db, g = env
+    g.add("retry_fail.pdf", PDF, _vendor_folder(g, s), samples.api_page(state_code="HP"))
+
+    class FailingRetry(ScriptedOcr):
+        def read(self, data, name):
+            r = super().read(data, name)
+            if name in _retry_calls(self):
+                raise RuntimeError("OCR API HTTP 503")
+            return r
+
+    ocr = FailingRetry(script={}, default=_hp_fields(amount="999"))
+
+    def boom(**f):
+        raise RuntimeError("crash before the ledger insert")
+    monkeypatch.setattr(db, "insert_paper", boom)
+    run_cycle(Ctx(s, db, g, ocr=ocr))
+    monkeypatch.undo()
+    assert run_cycle(Ctx(s, db, g, ocr=ocr))
+    assert len(_retry_calls(ocr)) == 1, ocr.calls
+    assert db.q1("SELECT status FROM papers")["status"] == "NEEDS_REVIEW"

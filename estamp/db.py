@@ -111,6 +111,7 @@ ALTER TABLE papers ADD COLUMN IF NOT EXISTS api_state TEXT;
 ALTER TABLE papers ADD COLUMN IF NOT EXISTS ops_edited_by TEXT;
 ALTER TABLE papers ADD COLUMN IF NOT EXISTS ops_edited_at TIMESTAMPTZ;
 ALTER TABLE papers ADD COLUMN IF NOT EXISTS vendor_code TEXT;   -- D-1: which inbox vendor folder the upload came from
+ALTER TABLE uploads ADD COLUMN IF NOT EXISTS retry_readings JSONB;  -- H-5: E-06 second OCR reading per page (no re-bill after a crash)
 CREATE INDEX IF NOT EXISTS alloc_unwritten_idx ON allocations(alloc_date, state, denomination) WHERE NOT output_written;
 -- One live allocation per order, ever: the DB backstop against double-issuing a LAN (#6). A cancelled
 -- allocation (cancelled_at set) is excluded so a later re-order of a cancelled LAN is still allowed.
@@ -326,6 +327,11 @@ class DB:
     def upload_finish(self, upload_id: int, status: str, papers: int, notes: str = "") -> None:
         self.q("UPDATE uploads SET status=%s, papers_found=%s, notes=%s, updated_at=now() WHERE id=%s",
                (status, papers, notes, upload_id))
+
+    def upload_save_retry(self, upload_id: int, page_from: int, reading: dict) -> None:
+        """H-5: keep a paper's E-06 retry reading (or its failure) so a re-run after a crash adopts it, never re-bills."""
+        self.q("UPDATE uploads SET retry_readings = coalesce(retry_readings, '{}'::jsonb) || %s WHERE id=%s",
+               (Jsonb({str(page_from): reading}), upload_id))
 
     def pages_done(self, upload_id: int) -> set[int]:
         return {r["page_from"] for r in self.q("SELECT page_from FROM papers WHERE upload_id=%s", (upload_id,))}

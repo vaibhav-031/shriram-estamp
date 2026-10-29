@@ -208,3 +208,10 @@ def test_a_pause_does_not_freeze_other_threads():
     for t in ts:
         t.join(2)
     assert peak[0] >= 2, f"a pause serialized callers (peak={peak[0]}) – the lock is held during sleep (H-4)"
+
+
+def test_429_log_line_carries_the_e112_code(caplog):
+    """A rate-limit pause is logged with its catalogue code, so ops can look it up (`explain E112`)."""
+    with caplog.at_level("WARNING", logger="estamp"):
+        _run([Resp(429, {"Retry-After": "2"}), Resp(200)])
+    assert any("[E112]" in r.getMessage() for r in caplog.records), [r.getMessage() for r in caplog.records]

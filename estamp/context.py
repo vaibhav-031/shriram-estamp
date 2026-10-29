@@ -82,6 +82,7 @@ class Stats:
     uploads: int = 0
     papers_in: int = 0
     papers_review: int = 0
+    uploads_review: int = 0     # whole uploads sent to Needs Review (E103/E105/E106/E108, A-08 give-up)
     orders_in: int = 0
     rows_rejected: int = 0
     duplicates: int = 0

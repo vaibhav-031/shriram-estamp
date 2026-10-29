@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 import requests
 from pypdf import PdfReader, PdfWriter
+from pypdf.errors import FileNotDecryptedError
 
 from .http_api import api_call
 from .settings import Settings
@@ -63,20 +64,35 @@ def merge_pdfs(parts: list[bytes]) -> bytes:
     return buf.getvalue()
 
 
+class PdfUnreadable(Exception):
+    """pypdf can't open the file (password-protected, corrupt, no pages). Retrying never helps – a human must
+    get a clean file (M-4)."""
+
+
 def _split_local(data: bytes, per: int) -> list[PaperPdf]:
-    reader = PdfReader(io.BytesIO(data))
-    n = len(reader.pages)
-    if n <= per:
-        return [PaperPdf(1, n, data)]
-    out = []
-    for start in range(0, n, per):
-        w = PdfWriter()
-        for i in range(start, min(start + per, n)):
-            w.add_page(reader.pages[i])
-        buf = io.BytesIO()
-        w.write(buf)
-        out.append(PaperPdf(start + 1, min(start + per, n), buf.getvalue()))
-    return out
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        n = len(reader.pages)
+        if n == 0:
+            raise PdfUnreadable("PDF has no pages – get a clean file from the vendor and upload it again")
+        if n <= per:
+            return [PaperPdf(1, n, data)]
+        out = []
+        for start in range(0, n, per):
+            w = PdfWriter()
+            for i in range(start, min(start + per, n)):
+                w.add_page(reader.pages[i])
+            buf = io.BytesIO()
+            w.write(buf)
+            out.append(PaperPdf(start + 1, min(start + per, n), buf.getvalue()))
+        return out
+    except PdfUnreadable:
+        raise
+    except FileNotDecryptedError:
+        raise PdfUnreadable("PDF is password-protected – remove the password and re-upload")
+    except Exception as e:      # pypdf raises many types on a malformed file
+        raise PdfUnreadable(f"PDF can't be opened ({type(e).__name__}) – get a clean file from the vendor and "
+                            "upload it again")
 
 
 _PART_NAME = re.compile(r"-(\d+)-(\d+)\.pdf$")

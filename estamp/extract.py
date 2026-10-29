@@ -61,8 +61,11 @@ class StateResolver:
 
 # ============================== OCR TEXT ==============================
 
+MAX_OCR_TEXT = 20000    # chars of OCR text we parse and store per paper (L-4: bounds the regex passes below)
+
+
 def normalize_ocr(text: str) -> str:
-    t = str(text or "").upper()
+    t = str(text or "")[:MAX_OCR_TEXT].upper()
     t = re.sub(r"(\d)[ \t]+(?=\d)", r"\1", t)              # "1234 5678" → "12345678"
     t = re.sub(r"\bI\s*N\s*-\s*", "IN-", t)                 # "I N -" → "IN-"
     t = re.sub(r"\bIN-([A-Z])\s+([A-Z])", r"IN-\1\2", t)     # "IN-M H" → "IN-MH"
@@ -231,6 +234,25 @@ class PaperAnalysis:
     @property
     def ok(self) -> bool:
         return not self.issues
+
+
+def review_code(a: PaperAnalysis) -> str:
+    """The error-catalogue code for a paper that failed its checks ('' = none fits, e.g. state inactive). Matches the
+    issue wording written in this module; the strongest reason wins (a duplicate beats a bad amount)."""
+    text = " ".join(a.issues)
+    if "duplicate certificate" in text:
+        return "E126"
+    if "more than one certificate" in text:
+        return "E121"
+    if "is not in state_config.csv" in text:
+        return "E122"
+    if not a.cert:
+        return "E120"
+    if "amount not readable" in text:
+        return "E124"
+    if "not an allowed amount" in text:
+        return "E125"
+    return ""
 
 
 def _check_state_and_amount(a: "PaperAnalysis", settings: Settings) -> None:

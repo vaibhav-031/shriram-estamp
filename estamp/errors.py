@@ -7,8 +7,8 @@ the one-line terminal/Log message; `explain()` prints the full breakdown (used b
 `python -m estamp explain <code>`). Pure module: no Google, no DB, no estamp imports –
 keep it that way so the catalogue stays the single source of wording.
 
-Call sites still emit codes their own way for now; rewiring them onto this catalogue
-is a follow-up slice.
+Intake (E1xx) routes its events and paper notes through `line()`; other call sites still
+emit codes their own way for now.
 """
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ CATALOGUE: dict[str, Err] = {
     "E105": Err("Paper type unclear / mixed file", "Whole file to Needs Review", "Split digital and scanned into separate files, upload again"),
     "E106": Err("Traditional file with odd page count", "Whole file to Needs Review", "Find the missing page, upload again"),
     "E107": Err("Pairing broken at page N", "That pair + later pairs to Needs Review", "Upload those papers as separate 2-page PDFs; REJECT broken entries"),
+    "E108": Err("File too large to read (intake.max_upload_mb)", "Whole file to Needs Review, no OCR call", "Split it into smaller files, upload again"),
     "E110": Err("Split API failed", "Retries; then Needs Review", "Nothing; tell tech if repeating"),
     "E111": Err("OCR API failed / timeout", "Retries; then Needs Review + alert", "Nothing; tell tech if repeating 30 min"),
     "E112": Err("OCR rate-limited", "Slows down automatically (info)", "Nothing"),
