@@ -17,6 +17,8 @@ Order Actions:   LAN ID | Action (CANCEL / RETRY / KEEP_STATE) | State | Result 
 """
 from __future__ import annotations
 
+import re
+
 from .allocate import label_for
 from .constants import INVENTORY_ROOT
 from .context import Ctx
@@ -28,6 +30,7 @@ REVIEW_TAB, ORDER_TAB, MANUAL_TAB = "Review Actions", "Order Actions", "Manual I
 REVIEW_HEADER = ["Paper ID", "Action", "Cert No", "State", "Stamp Duty", "Edited By", "Result", "Processed At"]
 ORDER_HEADER = ["LAN ID", "Action", "State", "Result", "Processed At"]
 MANUAL_HEADER = ["LAN ID", "Certificate No", "Issued By", "Result", "Processed At"]
+_E107 = re.compile(r"\bE107\b")
 
 
 def run_actions(ctx: Ctx) -> None:
@@ -248,13 +251,15 @@ def _manual_issue(ctx: Ctx, row: list[str]) -> str:
 def recheck_review(ctx: Ctx) -> tuple[int, int]:
     """Re-run the checks on every NEEDS_REVIEW paper using its saved reading – the OCR API's fields, or the saved
     text (no re-upload, no new OCR). Use after a config fix (new pattern, corrected amount). Passing papers move into
-    Inventory. Papers held for a file-level reason (E105/E107 pairing) are not rechecked: they need a re-upload."""
+    Inventory. Papers held for broken pairing (E107) are not rechecked: each half may read fine on its own, but the
+    pairing is suspect, so they need a re-upload. (E105 is whole-file only – it never lands on a paper row.)"""
     from .extract import analyze_fields, analyze_paper
     db, g, s = ctx.db, ctx.google, ctx.settings
     moved = still = 0
     for p in db.q("SELECT * FROM papers WHERE status='NEEDS_REVIEW' ORDER BY id"):
         fields = (p.get("ocr_raw") or {}).get("fields")
-        if (not p["ocr_text"] and fields is None) or (p["notes"] or "").startswith(("E105", "E107")):
+        # Search, don't prefix-match: intake stamps "✗ [E120] …" in front of the E107 reason (the unit has no cert).
+        if (not p["ocr_text"] and fields is None) or _E107.search(p["notes"] or ""):
             still += 1
             continue
         if fields is not None:
