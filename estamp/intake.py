@@ -113,7 +113,7 @@ def run_intake(ctx: Ctx, deadline: float) -> None:
                       ref=f["id"], alert_key=f"intakevendor|{f['id']}")
             continue
         try:
-            _process_upload(ctx, f, vendor.code)
+            _process_upload(ctx, f, vendor.code, deadline)
         except Exception as e:
             ctx.event("ERROR", "Intake", f"'{f['name']}' failed: {e} – stays in the inbox and is retried next cycle",
                       ref=f["id"], alert_key=f"intakefail|{f['id']}")
@@ -169,11 +169,16 @@ class ReadFailed(RuntimeError):
         self.code = code
 
 
+class OutOfTime(RuntimeError):
+    """The intake deadline passed while reading pages: the whole upload stays in the inbox, untouched, and is read
+    again next cycle – exactly like a failed read (A-08), so the same give-up window applies."""
+
+
 def _coded(code: str, text: str) -> str:
     return line(code, text) if code else text
 
 
-def _read_units(ctx: Ctx, data: bytes, name: str) -> list[Unit]:
+def _read_units(ctx: Ctx, data: bytes, name: str, deadline: float | None = None) -> list[Unit]:
     """OCR every page → pages per paper from the IDs (ADR-0006) → split → papers.
 
     The first page with exactly one ID decides the file: an e-stamp (IN-… / SUBIN-…) → 1 page per paper; any other
@@ -193,9 +198,13 @@ def _read_units(ctx: Ctx, data: bytes, name: str) -> list[Unit]:
     except PdfUnreadable as e:
         raise WholeUploadReview("E103", str(e))
     ctx.event("INFO", "Intake", f"'{name}': {len(singles)} page(s) – reading them now")
-    done = [0]
+    done, late = [0], []
 
     def read(no):
+        if deadline is not None and time.time() > deadline:
+            with ctx._lock:
+                late.append(no)         # no new OCR call once the intake budget is spent
+            return no, (None, "", None)
         try:
             return no, (ctx.ocr.read(singles[no - 1].data, f"{name}_p{no}"), "", None)
         except ApiAuthError as e:
@@ -219,6 +228,9 @@ def _read_units(ctx: Ctx, data: bytes, name: str) -> list[Unit]:
     first_err = next((reads[no][1] for no in sorted(reads) if reads[no][1]), "")
     if first_err:
         raise ReadFailed("E111", first_err)
+    if late:
+        raise OutOfTime(f"intake time budget ran out after reading {len(singles) - len(late)} of {len(singles)} "
+                        "page(s) – nothing stocked")
 
     # Past this point every page read cleanly (any failure raised above).
     def ids(no):
@@ -313,7 +325,7 @@ def _adopt(u: Unit, r: OcrResult) -> None:
     u.via = r.via
 
 
-def _process_upload(ctx: Ctx, f: dict, vendor_code: str = "") -> None:
+def _process_upload(ctx: Ctx, f: dict, vendor_code: str = "", deadline: float | None = None) -> None:
     g, s, db = ctx.google, ctx.settings, ctx.db
     today = ctx.today().isoformat()
     if f.get("mimeType") != PDF:
@@ -324,11 +336,14 @@ def _process_upload(ctx: Ctx, f: dict, vendor_code: str = "") -> None:
 
     if ctx.dry:
         try:
-            units = _read_units(ctx, g.download(f["id"]), f["name"])
+            units = _read_units(ctx, g.download(f["id"]), f["name"], deadline)
         except WholeUploadReview as w:
             ctx.preview.append(["UPLOAD", f["name"], "all pages", "", "", "", "Needs Review (whole file)", str(w)])
             ctx.event("WARN", "Intake",
                       line(w.code, f"'{f['name']}' would go to Needs Review as a whole – {w.reason}"), ref=f["id"])
+            return
+        except OutOfTime as e:
+            ctx.event("INFO", "Intake", f"'{f['name']}': {e} – read again next cycle", ref=f["id"])
             return
         rows = []
         for u in units:
@@ -362,7 +377,7 @@ def _process_upload(ctx: Ctx, f: dict, vendor_code: str = "") -> None:
         return
 
     try:
-        units = _read_units(ctx, g.download(f["id"]), f["name"])
+        units = _read_units(ctx, g.download(f["id"]), f["name"], deadline)
     except WholeUploadReview as w:
         db.upload_finish(up["id"], "REVIEW", 0, str(w))
         g.move_rename(f["id"], g.folder_path(s.folder(NEEDS_REVIEW), [today]))
@@ -381,6 +396,10 @@ def _process_upload(ctx: Ctx, f: dict, vendor_code: str = "") -> None:
         code = getattr(e, "code", "")
         give_up = int(s.get("intake.ocr_fail_give_up_minutes", 30))
         failing_for = (datetime.now(timezone.utc) - up["created_at"]).total_seconds()
+        if failing_for < give_up * 60 and isinstance(e, OutOfTime):
+            ctx.event("INFO", "Intake", f"'{f['name']}': {e} – whole upload stays in the inbox, read again next cycle",
+                      ref=f["id"])
+            return
         if failing_for < give_up * 60:
             ctx.event("WARN", "Intake", _coded(code, f"'{f['name']}': {e} – whole upload stays in the inbox, retried "
                       "next cycle"), ref=f["id"], alert_key=f"intakefail|{f['id']}")

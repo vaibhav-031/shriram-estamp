@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -2114,6 +2115,65 @@ def test_upload_without_modified_time_waits_out_the_settle_window_and_logs_once(
     intake._first_seen[up] = datetime.now(timezone.utc) - timedelta(minutes=6)      # the window has passed
     assert run_cycle(_ctx(s, db, g))
     assert db.q1("SELECT count(*) n FROM papers WHERE status='AVAILABLE'")["n"] == 1
+
+
+# ------------------------------------------------------------ intake deadline is checked while reading pages
+
+@e2e
+def test_page_reading_stops_at_the_intake_deadline_and_leaves_the_upload_untouched(env, monkeypatch):
+    """A big upload must not hold the cycle past the intake budget: once the deadline passes no further page is
+    read, nothing is stocked, and the upload stays in the inbox (PROCESSING) to be read again next cycle."""
+    import types
+    import estamp.intake as intake
+    from fake_apis import FakeOcr
+    s, db, g = env
+    clock = [0.0]
+    monkeypatch.setattr(intake, "time", types.SimpleNamespace(time=lambda: clock[0]))
+    monkeypatch.setitem(s.raw, "workers", 1)                 # pages read in order, so the cut-off is exact
+    up = _stock(g, s, "MH", 200, 5)
+
+    class SlowOcr(FakeOcr):
+        def read(self, data, name):
+            if name.endswith("_p2"):
+                clock[0] = 2000.0                            # reading page 2 runs past the deadline
+            return super().read(data, name)
+
+    ocr = SlowOcr()
+    intake.run_intake(Ctx(s, db, g, ocr=ocr), deadline=1000.0)
+    assert sorted(ocr.calls) == ["vendor_MH_200_1.pdf_p1", "vendor_MH_200_1.pdf_p2"], ocr.calls
+    assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
+    assert [f["id"] for f in _inbox_files(g, s)] == [up]
+    assert db.q1("SELECT status FROM uploads")["status"] == "PROCESSING"
+    assert _events(db, "%time budget%2 of 5%"), _events(db, "%")
+    assert db.q1("SELECT count(*) n FROM events WHERE level IN ('ERROR','WARN')")["n"] == 0
+
+    clock[0] = 0.0                                            # next cycle, fresh budget: the whole file is read
+    intake.run_intake(Ctx(s, db, g, ocr=FakeOcr()), deadline=1000.0)
+    assert db.q1("SELECT count(*) n FROM papers WHERE status='AVAILABLE'")["n"] == 5
+    assert not _inbox_files(g, s)
+
+
+@e2e
+def test_an_upload_that_never_fits_the_budget_gives_up_like_a_failing_read(env, monkeypatch):
+    """No new retry loop: an upload cut off by the deadline for longer than the A-08 give-up window goes whole to
+    Needs Review, the same as one whose OCR keeps failing."""
+    import estamp.intake as intake
+    from fake_apis import FakeOcr
+    s, db, g = env
+    _stock(g, s, "MH", 200, 2)
+    intake.run_intake(Ctx(s, db, g, ocr=FakeOcr()), deadline=0.0)       # the deadline has already passed
+    assert db.q1("SELECT count(*) n FROM uploads")["n"] == 0, "deadline before the first file: nothing touched"
+
+    def cut_off(*a, **k):
+        raise intake.OutOfTime("intake time budget ran out")
+    monkeypatch.setattr(intake, "_read_units", cut_off)
+    later = time.time() + 3600
+    intake.run_intake(Ctx(s, db, g, ocr=FakeOcr()), deadline=later)
+    assert db.q1("SELECT status FROM uploads")["status"] == "PROCESSING"
+    db.q("UPDATE uploads SET created_at = now() - interval '31 minutes'")
+    intake.run_intake(Ctx(s, db, g, ocr=FakeOcr()), deadline=later)
+    assert db.q1("SELECT status FROM uploads")["status"] == "REVIEW"
+    assert not _inbox_files(g, s)
 
 
 # ------------------------------------------------------------ L-4: OCR text fed to the regexes is capped
