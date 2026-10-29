@@ -382,6 +382,7 @@ def _process_upload(ctx: Ctx, f: dict, vendor_code: str = "", deadline: float | 
         db.upload_finish(up["id"], "REVIEW", 0, str(w))
         g.move_rename(f["id"], g.folder_path(s.folder(NEEDS_REVIEW), [today]))
         ctx.stats.uploads += 1
+        ctx.stats.uploads_review += 1
         ctx.event("WARN", "Needs review", line(w.code, f"'{f['name']}' (whole file): {w.reason}"), ref=f["id"])
         return
     except ApiAuthError as e:
@@ -409,6 +410,7 @@ def _process_upload(ctx: Ctx, f: dict, vendor_code: str = "", deadline: float | 
         db.upload_finish(up["id"], "REVIEW", 0, reason)
         g.move_rename(f["id"], g.folder_path(s.folder(NEEDS_REVIEW), [today]))
         ctx.stats.uploads += 1
+        ctx.stats.uploads_review += 1
         ctx.event("WARN", "Needs review", f"'{f['name']}' (whole file): {reason}", ref=f["id"],
                   alert_key=f"intakegiveup|{f['id']}")
         return

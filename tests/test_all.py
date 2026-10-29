@@ -2176,6 +2176,22 @@ def test_an_upload_that_never_fits_the_budget_gives_up_like_a_failing_read(env, 
     assert not _inbox_files(g, s)
 
 
+# ------------------------------------------------------------ whole-file reviews show up in the cycle stats
+
+@e2e
+def test_whole_file_review_is_counted_in_the_cycle_summary(env):
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    g.add("odd.pdf", PDF, _vendor_folder(g, s), samples.merged([
+        samples.scanned_front("RAJASTHAN", "S 254201", 195), samples.scanned_back("RAJASTHAN"),
+        samples.scanned_front("RAJASTHAN", "S 254202", 195)]))
+    ctx = _ctx(s, db, g)
+    assert run_cycle(ctx)
+    assert ctx.stats.uploads_review == 1 and ctx.stats.papers_review == 0
+    assert db.q1("SELECT summary FROM runs")["summary"]["uploads_review"] == 1
+    assert _events(db, "summary:%1 whole file%"), _events(db, "summary:%")
+
+
 # ------------------------------------------------------------ L-4: OCR text fed to the regexes is capped
 
 def test_normalize_ocr_caps_its_input_at_the_storage_cap():
