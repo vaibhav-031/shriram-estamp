@@ -30,7 +30,7 @@ from .extract import canonical_lan, id_format_ok, parse_amount
 from .outputs import output_sheet_id
 
 REVIEW_TAB, ORDER_TAB, MANUAL_TAB = "Review Actions", "Order Actions", "Manual Issues"
-REVIEW_HEADER = ["Paper ID", "Action", "Cert No", "State", "Stamp Duty", "Edited By", "Result", "Processed At"]
+REVIEW_HEADER = ["Paper ID or File name", "Action", "Cert No", "State", "Stamp Duty", "Edited By", "Result", "Processed At"]
 ORDER_HEADER = ["LAN ID", "Action", "State", "Result", "Processed At"]
 MANUAL_HEADER = ["LAN ID", "Certificate No", "Issued By", "Result", "Processed At"]
 _E107 = re.compile(r"\bE107\b")
