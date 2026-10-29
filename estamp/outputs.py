@@ -11,6 +11,7 @@ from itertools import groupby
 from .allocate import label_for
 from .constants import OUTPUT_ROOT
 from .context import Ctx
+from .extract import canonical_lan
 
 OUTPUT_HEADER = ["LAN ID", "Certificate No", "PDF Name", "PDF Link", "Processed At", "Status"]
 _sheet_lock = threading.Lock()
@@ -41,13 +42,16 @@ def run_outputs(ctx: Ctx) -> None:
             # in the sheet yet the allocation unwritten, so the next cycle re-fetches it. Columns A/B hold the LAN
             # and its certificate; keying on BOTH means a re-run skips the exact same issued row, while a
             # legitimately reissued cert for a LAN (after a CANCEL) still appears. Dedupes within the batch too.
-            present = {(row[0], row[1]) for row in ctx.google.read_range(sid, f"{label}!A2:B") if len(row) >= 2}
+            # The LAN is compared in canonical form (ADR-0008), so a row whose spacing/case was tidied still counts.
+            present = {(canonical_lan(row[0]), row[1]) for row in ctx.google.read_range(sid, f"{label}!A2:B")
+                       if len(row) >= 2}
             to_write, seen = [], set(present)
             for r in grp:
                 cert = r["verified_cert"] or r["cert_no"]
-                if (r["lan"], cert) in seen:
+                key = (canonical_lan(r["lan"]), cert)
+                if key in seen:
                     continue
-                seen.add((r["lan"], cert))
+                seen.add(key)
                 to_write.append([r["lan"], cert, r["pdf_name"], r["pdf_link"],
                                  r["created_at"].astimezone(ctx.tz).strftime("%Y-%m-%d %H:%M:%S"), "ISSUED"])
             if to_write:
