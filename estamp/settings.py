@@ -5,12 +5,16 @@ import csv
 import logging
 import os
 import re
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 from dotenv import load_dotenv
+
+from .constants import (BACKUP_ROOT, INVENTORY_ROOT, NEEDS_REVIEW, ORDERS_INCOMING, ORDERS_PROCESSED,
+                        ORDERS_REJECTED, OUTPUT_ROOT, UPLOAD_ARCHIVE, UPLOAD_INBOX)
 
 log = logging.getLogger("estamp")
 
@@ -144,3 +148,56 @@ def load_settings(config_path: str | os.PathLike = "config.yaml") -> Settings:
     else:
         log.warning("vendors_file not set or not a file (%s) – loading no vendors", vpath)
     return s
+
+
+# Folders a cycle touches. reconciliation_root is `report`-only (config.dryrun.yaml deliberately omits it) and
+# ocr_temp went away with Drive OCR, so neither is required to run.
+RUN_FOLDERS = (UPLOAD_INBOX, UPLOAD_ARCHIVE, NEEDS_REVIEW, INVENTORY_ROOT, ORDERS_INCOMING, ORDERS_PROCESSED,
+               ORDERS_REJECTED, OUTPUT_ROOT, BACKUP_ROOT)
+SECRET_FILE_KEYS = ("google.oauth_client_file", "google.oauth_token_file", "google.service_account_file")
+
+
+def startup_problems(s: Settings) -> list[str]:
+    """Everything a cycle needs that config.yaml / .env lack, checked once before any Drive/DB work (L-1) – a
+    missing key must stop `run` up front, not fail mid-cycle after intake already moved files. [] = good to go.
+    Mirrors the lazy checks in Settings.folder(), ocr_split._ocr_zoop/_split_zoop and DB()."""
+    out = []
+    for key in RUN_FOLDERS:
+        try:
+            s.folder(key)
+        except ValueError as e:
+            out.append(str(e))
+    if not s.env("db.url_env"):
+        out.append(f"{s.get('db.url_env') or 'db.url_env'} is not set in .env (the Postgres URL)")
+    ocr = s.get("zoop_api.ocr") or {}
+    if not (s.env("zoop_api.ocr.url_env") or ocr.get("url")) or not ocr.get("config_id"):
+        out.append("OCR endpoint not set – set ESTAMP_OCR_URL in .env (or zoop_api.ocr.url) and zoop_api.ocr.config_id")
+    for k in ("api_key_env", "org_acc_env"):
+        if not s.env(f"zoop_api.ocr.{k}"):
+            out.append(f"{ocr.get(k) or 'zoop_api.ocr.' + k} is not set in .env (OCR API)")
+    if s.get("intake.split_provider", "local") == "zoop_api" and not s.get("zoop_api.split.url"):
+        out.append("zoop_api.split.url is not set (intake.split_provider is zoop_api)")
+    sa = s.get("google.auth", "oauth") == "service_account"
+    cred = "google.service_account_file" if sa else "google.oauth_token_file"
+    if not s.get(cred) or not s.path(cred).is_file():
+        out.append(f"{cred} ({s.get(cred) or 'unset'}) does not exist"
+                   + ("" if sa else " – run `python -m estamp login` first"))
+    return out
+
+
+def secret_file_problems(s: Settings) -> list[str]:
+    """.env and the Google credential files that exist, if group/other can read them (H-2): on a shared host a
+    readable token is a full-Drive compromise. Stats modes only – never reads contents. Skipped on Windows,
+    where st_mode carries no real group/other bits (ACLs guard those files instead)."""
+    if os.name == "nt":
+        return []
+    paths = [s.base_dir / ".env"] + [s.path(k) for k in SECRET_FILE_KEYS if s.get(k)]
+    out = []
+    for p in dict.fromkeys(paths):
+        try:
+            mode = p.stat().st_mode
+        except OSError:
+            continue                  # not there (optional, or caught by startup_problems)
+        if p.is_file() and mode & 0o077:
+            out.append(f"{p} is readable by other users (mode {mode & 0o777:o}) – run: chmod 600 {shlex.quote(str(p))}")
+    return out

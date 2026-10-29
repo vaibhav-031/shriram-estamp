@@ -80,7 +80,7 @@ def _cli_on_test_db(tmp_path, monkeypatch):
     s.raw["folders"] = {k: "" for k in s.raw["folders"]}
     s.raw["control_sheet_id"] = ""
     s.raw["db"]["schema"] = "estamp_test"
-    monkeypatch.setattr(cli, "_build", lambda args, need_google=True: (s, DB(DB_URL, "estamp_test", max_size=2), None))
+    monkeypatch.setattr(cli, "_build", lambda args, need_google=True, **kw: (s, DB(DB_URL, "estamp_test", max_size=2), None))
     return cli
 
 
