@@ -58,6 +58,14 @@ the Log tab shows event details that may echo cert/text fragments.
 whole page; or encrypt/omit `ocr_text` and keep it out of the dashboard. Add a retention policy that
 prunes `events` and `ocr_text`/`ocr_raw` after N days (the `ponytail:` note at `context.py:149` already
 flags `alerts_sent` growth — same pruning job can cover these).
+**Fixed:** (PO decision "keep fields, prune text") the checks and `recheck-review` run on the stored OCR API
+`fields`; free page text is not needed (only legacy text-reader papers have no fields – once pruned, recheck-review
+leaves them in review as before; Re-OCR / Approve still work). A cycle step (`cycle._prune` → `DB.prune_retention`,
+idempotent, once a day, not in dry run) clears `papers.ocr_text` and everything in `ocr_raw` except `fields`
+`retention.ocr_text_days` (30) after stocking, and deletes `events` older than `retention.events_days` (90 – only the Log tab reads
+events, newest 500; the ledger tables, not events, are the record of issue). `Ctx.event` now redacts Postgres
+row/parameter echoes (`Failing row contains …`, `CONTEXT: …`) before the log file, events, Log tab and alerts, and a
+failed OCR call no longer echoes the raw response body. Tests: `tests/test_retention.py`. `alerts_sent` is not pruned.
 
 ### H-2 — Token-file / secrets permissions are never checked or enforced
 **File:** `estamp/settings.py:128-137` (loads `.env`), service-account/token loading in

@@ -312,6 +312,27 @@ class DB:
         self.q("UPDATE runs SET finished_at=now(), ok=%s, summary=%s WHERE id=%s",
                (ok, json.dumps(summary, default=str), run_id))
 
+    def prune_retention(self, text_days: int, events_days: int) -> tuple[int, int]:
+        """H-1 retention, idempotent: clear the stored page text of papers stocked more than `text_days` ago (ocr_text,
+        and everything in ocr_raw except the OCR API `fields` the checks / recheck-review use) and delete events older
+        than `events_days`. Aged by added_at, so later edits never keep text alive. A window <= 0 switches that half
+        off. updated_at is left alone – not a business change. Returns (papers pruned, events deleted)."""
+        papers = events = 0
+        if text_days > 0:
+            papers = len(self.q("""
+                UPDATE papers SET ocr_text = NULL,
+                       ocr_raw = CASE WHEN jsonb_typeof(ocr_raw) = 'object' AND ocr_raw ? 'fields'
+                                      THEN jsonb_build_object('fields', ocr_raw -> 'fields') END
+                 WHERE added_at < now() - make_interval(days => %s)
+                   AND (ocr_text IS NOT NULL
+                        OR ocr_raw IS DISTINCT FROM jsonb_build_object('fields', ocr_raw -> 'fields'))
+                   AND (ocr_text IS NOT NULL OR ocr_raw IS NOT NULL)
+                RETURNING id""", (text_days,)))
+        if events_days > 0:
+            events = len(self.q("DELETE FROM events WHERE ts < now() - make_interval(days => %s) RETURNING id",
+                                (events_days,)))
+        return papers, events
+
     # ---------------------------------------------------------------- uploads / papers
     def upload_get_or_create(self, file_id: str, name: str, md5: str) -> dict:
         row = self.q1("""INSERT INTO uploads(drive_file_id, file_name, md5) VALUES (%s,%s,%s)

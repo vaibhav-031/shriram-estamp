@@ -9,6 +9,7 @@
   7. outputs   – Output sheets for everything issued
   8. alerts    – low stock, cycle summary (errors/warnings), daily summary, heartbeat
   9. dashboard – control sheet tabs
+  (after low stock: retention – once a day, clear stored page text / events past their window, H-1; not in dry run)
 
 The advisory lock is re-checked before every step: if its connection dropped, another process may already be
 running a cycle, so this one stops (ERROR) rather than work alongside it (M-2).
@@ -68,6 +69,7 @@ def run_cycle(ctx: Ctx) -> bool:
             ("Allocate", lambda: run_allocation(ctx, t0 + budget * 0.95)),
             ("Outputs", lambda: run_outputs(ctx)),
             ("Low stock", lambda: low_stock_alerts(ctx)),
+            *([("Retention", lambda: _prune(ctx))] if not ctx.dry else []),
         ):
             if not db.lock_held():
                 raise LockLost(name)
@@ -109,6 +111,23 @@ def run_cycle(ctx: Ctx) -> bool:
 
 class LockLost(RuntimeError):
     """The cycle lock was gone before a step started (M-2); the message is that step's name."""
+
+
+def _prune(ctx: Ctx) -> None:
+    """H-1 retention: stored page text after retention.ocr_text_days (OCR API fields kept), events after
+    retention.events_days. Checked every cycle, but the scan runs once a day (windows are in days; a failed run is
+    retried the next day). Idempotent."""
+    s = ctx.settings
+    if not ctx.db.alert_once("retention", ctx.today()):
+        return
+
+    def days(key: str, default: int) -> int:
+        v = s.get(key)
+        return default if v is None else int(v)   # missing/blank → default; 0 → that window off
+
+    papers, events = ctx.db.prune_retention(days("retention.ocr_text_days", 30), days("retention.events_days", 90))
+    if papers or events:
+        ctx.event("INFO", "Retention", f"cleared stored page text of {papers} paper(s), deleted {events} old event(s)")
 
 
 def _step(ctx: Ctx, name: str, fn) -> None:
