@@ -2327,3 +2327,18 @@ def test_whole_file_review_is_approved_by_file_name_and_issued_without_ocr_verif
     assert run_cycle(ctx)
     o = db.q1("SELECT status FROM orders WHERE lan_key='TGHYDTW2610260001'")
     assert o["status"] == "DONE", o
+
+
+@e2e
+def test_paper_approved_with_a_typed_cert_is_trusted_at_issue_others_are_verified(env):
+    s, db, g = env
+    typed = _needs_review_paper(db, g, s, samples.paper_page("", 200), cert="", state="MH", amount=200,
+                                notes="no certificate / serial number found")
+    plain = _needs_review_paper(db, g, s, samples.paper_page(samples.cert("MH", 6), 200), cert=samples.cert("MH", 6),
+                                state="MH", amount=200, notes="duplicate certificate – held")
+    ctx = _ctx(s, db, g)
+    res, p = _review_result(ctx, s, g, typed, ["APPROVE", "99AB 794915", "MH", "200", "sanket"])
+    assert res[6].startswith("DONE: approved"), res
+    assert p["ocr_via"] == "ops", p                      # stamp over the number: the typed cert is used at issue
+    res, p = _review_result(ctx, s, g, plain, ["APPROVE", "", "", "", ""])
+    assert p["ocr_via"] != "ops", p                      # nothing typed: second OCR as usual

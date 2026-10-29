@@ -5,6 +5,8 @@ Review Actions:  Paper ID | Action (APPROVE / REJECT / RE-OCR) | Cert No | State
    APPROVE – optional corrected Cert No / State / Stamp Duty; checks run again, then the paper moves to
              Inventory/<STATE>/<AMOUNT>/<CERT>.pdf and becomes AVAILABLE. A correction records an audit trail
              (the pre-edit API values + who/when) for the Corrections tab (E-07).
+             A Cert No typed here is trusted at issue (no second OCR – the OCR couldn't read it); with no
+             Cert No typed the paper is OCR-verified at issue as usual.
    REJECT  – paper is never used (stays in Needs Review for the vendor dispute).
    RE-OCR  – re-reads the paper from its stored PDF (a NEW OCR call, unlike recheck) and either moves it to
              Inventory if it now passes, or refreshes its Needs Review notes with the new reading.
@@ -79,7 +81,11 @@ def _review(ctx: Ctx, row: list[str]) -> str:
     if action != "APPROVE":
         return "ERROR: Action must be APPROVE, REJECT or RE-OCR"
 
-    cert = (row[2].strip().upper() or p["cert_no"] or "")
+    typed = row[2].strip().upper()
+    cert = (_typed_cert(ctx, typed, state_hint := (ctx.resolver.resolve(row[3]) if row[3].strip() else (p["state"] or "")))
+            if typed else (p["cert_no"] or ""))
+    if typed and not cert:
+        return f"ERROR: '{typed}' is not a valid certificate / serial for {state_hint}"
     state = ctx.resolver.resolve(row[3]) if row[3].strip() else (p["state"] or "")
     amount = parse_amount(row[4]) if row[4].strip() else (p["denomination"] or 0)
     st = s.states.get(state)
@@ -89,7 +95,7 @@ def _review(ctx: Ctx, row: list[str]) -> str:
         return f"ERROR: state {state} is inactive"
     if amount not in st.amounts:
         return f"ERROR: ₹{amount} not allowed for {state} {st.amounts}"
-    if not id_format_ok(cert, state, s, ctx.matcher):
+    if not typed and not id_format_ok(cert, state, s, ctx.matcher):
         return f"ERROR: '{cert}' is not a valid certificate / serial for {state} (physical paper: {state}-<SERIAL>, e.g. {state}-S254201)"
     # E-07: a correction (cert/state/amount changed) records an audit trail of the pre-edit API values + who/when.
     audit: dict = {}
@@ -98,6 +104,10 @@ def _review(ctx: Ctx, row: list[str]) -> str:
             audit.update(api_cert_no=p["cert_no"], api_state=p["state"], api_denomination=p["denomination"])
         audit.update(ops_edited_by=(row[5].strip() or "ops"), ops_edited_at=ctx.now())
     try:
+        # A cert ops typed is trusted at issue instead of the second OCR (it reached review because the OCR couldn't
+        # read it – e.g. a stamp over the number – so a re-read would fail again). Nothing typed: verified as usual.
+        if typed:
+            audit["ocr_via"] = "ops"
         db.update_paper(p["id"], cert_no=cert, state=state, denomination=amount, status="AVAILABLE",
                         notes=f"approved by ops | was: {p['notes']}", **audit)
     except UniqueViolation:
@@ -109,6 +119,18 @@ def _review(ctx: Ctx, row: list[str]) -> str:
         ctx.event("WARN", "Review", f"paper {pid} approved but could not be moved into Inventory: {e}")
     ctx.event("INFO", "Review", f"paper {pid} approved as {cert} {state} ₹{amount}")
     return f"DONE: approved → {state}/{amount}/{cert}.pdf"
+
+
+def _typed_cert(ctx: Ctx, typed: str, state: str) -> str:
+    """A cert ops typed: an e-stamp cert is kept as typed; otherwise a plausible serial becomes STATE-SERIAL (spaces
+    dropped) – these papers reach review because the OCR couldn't read the number (e.g. a stamp over it, or a serial
+    with no configured pattern). '' if it doesn't look like an id at all."""
+    if id_format_ok(typed, state, ctx.settings, ctx.matcher):
+        return typed
+    serial = re.sub(r"\s+", "", typed)
+    if serial.startswith(f"{state}-"):
+        serial = serial[len(state) + 1:]
+    return f"{state}-{serial}" if re.fullmatch(r"[A-Z0-9][A-Z0-9/-]{4,30}", serial) else ""
 
 
 def _review_upload(ctx: Ctx, name: str, action: str, row: list[str]) -> str:
@@ -135,11 +157,7 @@ def _review_upload(ctx: Ctx, name: str, action: str, row: list[str]) -> str:
     if amount not in st.amounts:
         return f"ERROR: ₹{amount} not allowed for {state} {st.amounts}"
     typed = row[2].strip().upper()
-    # The OCR couldn't read this file, often because its serial has no configured pattern – so a plausible typed serial
-    # is accepted as STATE-SERIAL (spaces dropped); an e-stamp cert is kept as typed.
-    serial = re.sub(r"\s+", "", typed)
-    cert = typed if id_format_ok(typed, state, s, ctx.matcher) else (
-        f"{state}-{serial}" if re.fullmatch(r"[A-Z0-9][A-Z0-9/-]{4,30}", serial) else "")
+    cert = _typed_cert(ctx, typed, state)
     if not cert:
         return f"ERROR: '{typed}' is not a valid certificate / serial for {state}"
     pages = len(_split_local(g.download(u["drive_file_id"]), 1))
