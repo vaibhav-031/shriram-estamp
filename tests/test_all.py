@@ -2083,3 +2083,59 @@ def test_oversized_upload_goes_whole_to_review_before_any_ocr_call(env, monkeypa
     status, notes, path = _upload_review(db, g, s, "vendor_MH_200_1.pdf")
     assert status == "REVIEW" and "E108" in notes and "MB" in notes and path.startswith("needs_review/"), notes
     assert ocr.calls == [] and "E108" in CATALOGUE
+
+
+# ------------------------------------------------------------ H-5: the E-06 retry reading survives a crash
+
+def _retry_calls(ocr):
+    return [c for c in ocr.calls if c.endswith("#retry")]
+
+
+@e2e
+def test_crash_after_the_second_ocr_attempt_does_not_bill_it_again(env, monkeypatch):
+    """Crash after _reread's OCR call but before insert_paper: the re-run adopts the stored retry reading instead of
+    calling OCR a second time for the same paper – and still stocks it from that (good) reading."""
+    from estamp.cycle import run_cycle
+    from fake_apis import ScriptedOcr
+    s, db, g = env
+    g.add("retry_crash.pdf", PDF, _vendor_folder(g, s), samples.api_page(state_code="HP"))
+    ocr = ScriptedOcr(script={"retry_crash.pdf_p1": [_hp_fields(amount="999")]}, default=_hp_fields(amount="100"))
+
+    def boom(**f):
+        raise RuntimeError("crash after the retry OCR, before the ledger insert")
+    monkeypatch.setattr(db, "insert_paper", boom)
+    run_cycle(Ctx(s, db, g, ocr=ocr))
+    monkeypatch.undo()
+    assert db.q1("SELECT count(*) n FROM papers")["n"] == 0
+    assert any(f["name"] == "retry_crash.pdf" for f in _inbox_files(g, s))
+
+    assert run_cycle(Ctx(s, db, g, ocr=ocr))
+    assert len(_retry_calls(ocr)) == 1, ocr.calls
+    p = db.q1("SELECT * FROM papers")
+    assert p["status"] == "AVAILABLE" and p["denomination"] == 100, p
+
+
+@e2e
+def test_a_failed_second_ocr_attempt_is_not_repeated_after_a_crash(env, monkeypatch):
+    from estamp.cycle import run_cycle
+    from fake_apis import ScriptedOcr
+    s, db, g = env
+    g.add("retry_fail.pdf", PDF, _vendor_folder(g, s), samples.api_page(state_code="HP"))
+
+    class FailingRetry(ScriptedOcr):
+        def read(self, data, name):
+            r = super().read(data, name)
+            if name in _retry_calls(self):
+                raise RuntimeError("OCR API HTTP 503")
+            return r
+
+    ocr = FailingRetry(script={}, default=_hp_fields(amount="999"))
+
+    def boom(**f):
+        raise RuntimeError("crash before the ledger insert")
+    monkeypatch.setattr(db, "insert_paper", boom)
+    run_cycle(Ctx(s, db, g, ocr=ocr))
+    monkeypatch.undo()
+    assert run_cycle(Ctx(s, db, g, ocr=ocr))
+    assert len(_retry_calls(ocr)) == 1, ocr.calls
+    assert db.q1("SELECT status FROM papers")["status"] == "NEEDS_REVIEW"

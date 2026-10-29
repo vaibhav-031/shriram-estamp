@@ -21,13 +21,13 @@ from .constants import INVENTORY_ROOT, NEEDS_REVIEW, UPLOAD_ARCHIVE, UPLOAD_INBO
 from .context import Ctx, log
 from .db import UniqueViolation
 from .errors import line
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from .extract import (PaperAnalysis, analyze_fields, analyze_paper, first_broken_pair, ids_in_reading,
                       pages_per_paper, review_code, safe_file_name)
 from .google_clients import FOLDER, PDF, parse_time
 from .http_api import ApiAuthError
-from .ocr_split import PdfUnreadable, _split_local, merge_pdfs
+from .ocr_split import OcrResult, PdfUnreadable, _split_local, merge_pdfs
 
 
 def _collect(g, folder_id: str, vendor: str | None = None, depth: int = 0,
@@ -269,13 +269,26 @@ def _reread(ctx: Ctx, up: dict, upload_name: str, u: Unit) -> None:
     (no cert, amount not allowed, …) often reads clean on a retry – before the paper lands in Needs Review we re-OCR
     its own PDF once and adopt the retry's reading. On a traditional (2-page) paper the retry reads the merged PDF as
     one call, like the live OCR API. A read FAILURE here is left to Needs Review – it is not the A-08 transient-call
-    case (that keeps the WHOLE upload in the inbox and is handled in _read_units before any paper is stocked)."""
+    case (that keeps the WHOLE upload in the inbox and is handled in _read_units before any paper is stocked).
+    H-5: the retry's outcome is saved on the upload row before the paper lands, so a re-run after a crash adopts it
+    instead of calling (and billing) OCR again – at most one retry per paper, ever."""
+    stored = (up.get("retry_readings") or {}).get(str(u.page_from))
+    if stored is not None:
+        if "failed" not in stored:
+            _adopt(u, OcrResult(**stored))
+        return
     try:
         r = ctx.ocr.read(u.data, f"{upload_name}_p{u.page_from}-{u.page_to}#retry")
     except Exception as e:
+        ctx.db.upload_save_retry(up["id"], u.page_from, {"failed": str(e)})
         ctx.event("INFO", "Intake", f"{upload_name} pages {u.page_from}-{u.page_to}: second OCR attempt failed ({e}) "
                   "– keeping the first reading", ref=up.get("drive_file_id"))
         return
+    ctx.db.upload_save_retry(up["id"], u.page_from, asdict(r))
+    _adopt(u, r)
+
+
+def _adopt(u: Unit, r: OcrResult) -> None:
     if r.fields is not None:
         u.fields, u.raw = r.fields, {"fields": r.fields, "responses": {str(u.page_from): r.raw}}
     else:
