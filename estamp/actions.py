@@ -8,6 +8,9 @@ Review Actions:  Paper ID | Action (APPROVE / REJECT / RE-OCR) | Cert No | State
    REJECT  – paper is never used (stays in Needs Review for the vendor dispute).
    RE-OCR  – re-reads the paper from its stored PDF (a NEW OCR call, unlike recheck) and either moves it to
              Inventory if it now passes, or refreshes its Needs Review notes with the new reading.
+   A whole-file review (E105 etc. – no Paper ID) is approved by its FILE NAME in the Paper ID column, with Cert No,
+   State and Stamp Duty all filled: the one-paper file is stocked as typed (ocr_via 'ops'), and at issue its cert is
+   trusted, not OCR-verified (the OCR couldn't read it). REJECT by file name closes the upload.
 
 Order Actions:   LAN ID | Action (CANCEL / RETRY / KEEP_STATE) | State | Result | Processed At
    CANCEL     – unfulfilled LAN → CANCELLED. Fulfilled LAN → paper goes back to stock (renamed to its cert),
@@ -61,7 +64,7 @@ def _review(ctx: Ctx, row: list[str]) -> str:
     db, g, s = ctx.db, ctx.google, ctx.settings
     pid, action = row[0].strip(), row[1].strip().upper()
     if not pid.isdigit():
-        return "ERROR: Paper ID must be a number (see Needs Review tab)"
+        return _review_upload(ctx, pid, action, row)
     p = db.q1("SELECT * FROM papers WHERE id=%s", (int(pid),))
     if not p:
         return "ERROR: no such paper"
@@ -105,6 +108,56 @@ def _review(ctx: Ctx, row: list[str]) -> str:
     except Exception as e:  # paper is usable anyway; allocation moves it from wherever it is
         ctx.event("WARN", "Review", f"paper {pid} approved but could not be moved into Inventory: {e}")
     ctx.event("INFO", "Review", f"paper {pid} approved as {cert} {state} ₹{amount}")
+    return f"DONE: approved → {state}/{amount}/{cert}.pdf"
+
+
+def _review_upload(ctx: Ctx, name: str, action: str, row: list[str]) -> str:
+    """APPROVE / REJECT a whole-file review by its file name (it has no paper row, so no Paper ID)."""
+    from .ocr_split import _split_local
+    db, g, s = ctx.db, ctx.google, ctx.settings
+    u = db.q1("SELECT * FROM uploads WHERE status='REVIEW' AND file_name IN (%s, %s) ORDER BY id DESC LIMIT 1",
+              (name, f"{name}.pdf"))
+    if not u:
+        return f"ERROR: '{name}' is not a Paper ID (number from Needs Review) nor a file waiting in whole-file review"
+    if action == "REJECT":
+        db.upload_finish(u["id"], "REJECTED", 0, f"rejected by ops | was: {u['notes']}")
+        return "DONE: rejected"
+    if action != "APPROVE":
+        return "ERROR: a whole file can only be APPROVED (with Cert No, State, Stamp Duty) or REJECTED – else re-upload it"
+    if not (row[2].strip() and row[3].strip() and row[4].strip()):
+        return "ERROR: approving a whole file needs Cert No, State and Stamp Duty all filled"
+    state, amount = ctx.resolver.resolve(row[3]), parse_amount(row[4])
+    st = s.states.get(state)
+    if not st:
+        return f"ERROR: unknown state '{row[3]}'"
+    if not st.active:
+        return f"ERROR: state {state} is inactive"
+    if amount not in st.amounts:
+        return f"ERROR: ₹{amount} not allowed for {state} {st.amounts}"
+    typed = row[2].strip().upper()
+    # The OCR couldn't read this file, often because its serial has no configured pattern – so a plausible typed serial
+    # is accepted as STATE-SERIAL (spaces dropped); an e-stamp cert is kept as typed.
+    serial = re.sub(r"\s+", "", typed)
+    cert = typed if id_format_ok(typed, state, s, ctx.matcher) else (
+        f"{state}-{serial}" if re.fullmatch(r"[A-Z0-9][A-Z0-9/-]{4,30}", serial) else "")
+    if not cert:
+        return f"ERROR: '{typed}' is not a valid certificate / serial for {state}"
+    pages = len(_split_local(g.download(u["drive_file_id"]), 1))
+    if pages not in (1, st.pages_per_paper):
+        return f"ERROR: the file has {pages} pages – only a one-paper file can be approved by name; split it and re-upload"
+    try:
+        pid = db.insert_paper(upload_id=u["id"], page_from=1, page_to=pages, drive_file_id=u["drive_file_id"],
+                              file_name=f"{cert}.pdf", cert_no=cert, state=state, denomination=amount,
+                              status="AVAILABLE", ocr_via="ops", ops_edited_by=(row[5].strip() or "ops"),
+                              ops_edited_at=ctx.now(), notes=f"ops-entered from whole-file review | was: {u['notes']}")
+    except UniqueViolation:
+        return f"ERROR: certificate {cert} is already in stock / used – this looks like a duplicate"
+    db.upload_finish(u["id"], "DONE", 1, f"approved by ops as {cert}")
+    try:
+        g.move_rename(u["drive_file_id"], g.folder_path(s.folder(INVENTORY_ROOT), [state, str(amount)]), f"{cert}.pdf")
+    except Exception as e:  # paper is usable anyway; allocation moves it from wherever it is
+        ctx.event("WARN", "Review", f"'{name}' approved but could not be moved into Inventory: {e}")
+    ctx.event("WARN", "Review", f"'{name}' approved by ops as paper {pid}: {cert} {state} ₹{amount} – typed, not OCR-read")
     return f"DONE: approved → {state}/{amount}/{cert}.pdf"
 
 

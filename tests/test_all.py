@@ -2287,3 +2287,43 @@ def test_a_failed_second_ocr_attempt_is_not_repeated_after_a_crash(env, monkeypa
     assert run_cycle(Ctx(s, db, g, ocr=ocr))
     assert len(_retry_calls(ocr)) == 1, ocr.calls
     assert db.q1("SELECT status FROM papers")["status"] == "NEEDS_REVIEW"
+
+
+# ------------------------------------------------------------ whole-file review approved by file name
+
+def _review_upload(db, g, s, name, data):
+    """A whole-file review (E105) upload: the file sits in Needs Review, no paper row exists for it."""
+    fid = g.add(name, PDF, s.folder("needs_review"), data)
+    up = db.upload_get_or_create(fid, name, "")
+    db.upload_finish(up["id"], "REVIEW", 0, "E105 no page has a readable certificate / serial")
+    return fid
+
+
+@e2e
+def test_whole_file_review_is_approved_by_file_name_and_issued_without_ocr_verify(env):
+    s, db, g = env
+    fid = _review_upload(db, g, s, "page62.pdf", samples.paper_page("", 200))
+    ctx = _ctx(s, db, g)
+    from estamp.actions import run_actions
+    sid = s.get("control_sheet_id")
+    g.ensure_tabs(sid, {"Review Actions": ["Paper ID", "Action", "Cert No", "State", "Stamp Duty", "Edited By",
+                                           "Result", "Processed At"]})
+    g.sheets_data[sid]["Review Actions"].append(["page62.pdf", "APPROVE", "99AB 794915", "MH", "200", "sanket"])
+    run_actions(ctx)
+    res = g.sheets_data[sid]["Review Actions"][-1]
+    assert res[6].startswith("DONE: approved"), res
+    p = db.q1("SELECT * FROM papers WHERE drive_file_id=%s", (fid,))
+    assert (p["cert_no"], p["state"], p["denomination"], p["status"]) == ("MH-99AB794915", "MH", 200, "AVAILABLE"), p
+    assert p["ocr_via"] == "ops" and p["ops_edited_by"] == "sanket"
+    assert g.path_of(fid).startswith("inventory_root/MH/200/")
+    # second time: same name again is not approved twice
+    g.sheets_data[sid]["Review Actions"].append(["page62.pdf", "APPROVE", "99AB 794915", "MH", "200", "sanket"])
+    run_actions(ctx)
+    assert g.sheets_data[sid]["Review Actions"][-1][6].startswith("ERROR"), g.sheets_data[sid]["Review Actions"][-1]
+    # issue: the PDF has no readable cert, but an ops-entered paper is not OCR-verified – it is issued, not ERROR
+    from estamp.cycle import run_cycle
+    g.add("TEST_Shriram_MH_LANs", GSHEET, s.folder("orders_incoming"),
+          tabs={"x": [["LOAN NO", "STATE", "STAMP DUTY"], ["TGHYDTW2610260001", "MH", "200"]]}, age_min=20)
+    assert run_cycle(ctx)
+    o = db.q1("SELECT status FROM orders WHERE lan_key='TGHYDTW2610260001'")
+    assert o["status"] == "DONE", o

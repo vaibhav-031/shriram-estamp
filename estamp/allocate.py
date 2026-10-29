@@ -144,7 +144,9 @@ def _allocate_one(ctx: Ctx, order: dict) -> str:
         step = "rename + move"
         g.move_rename(paper["drive_file_id"], out_folder, pdf_name)
         verified, via = None, None
-        if s.get("allocation.verify_ocr", True):
+        if paper.get("ocr_via") == "ops":   # ops typed this cert for a file the OCR couldn't read – trusted, not re-read
+            verified, via = paper["cert_no"], "ops"
+        elif s.get("allocation.verify_ocr", True):
             step = "verify OCR on issued PDF"
             try:
                 verified, via = verify_issued(ctx, paper["drive_file_id"],
