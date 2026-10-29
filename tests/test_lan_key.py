@@ -26,7 +26,9 @@ SPACED = "TGHYDTW 2610260001"
 
 @pytest.fixture(scope="session")
 def settings():
-    return load_settings(ROOT / "config.yaml")
+    s = load_settings(ROOT / "config.yaml")
+    s.states["MH"].amounts = [200]      # these scenarios stock MH ₹200 (pre vendor sheet; shipped MH is ₹100)
+    return s
 
 
 # ============================================================ pure logic
