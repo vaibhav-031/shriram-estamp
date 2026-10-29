@@ -27,7 +27,7 @@ from .extract import (PaperAnalysis, analyze_fields, analyze_paper, first_broken
                       pages_per_paper, review_code, safe_file_name)
 from .google_clients import FOLDER, PDF, parse_time
 from .http_api import ApiAuthError
-from .ocr_split import _split_local, merge_pdfs
+from .ocr_split import PdfUnreadable, _split_local, merge_pdfs
 
 
 def _collect(g, folder_id: str, vendor: str | None = None, depth: int = 0,
@@ -166,9 +166,15 @@ def _read_units(ctx: Ctx, data: bytes, name: str) -> list[Unit]:
     exactly one ID, or whose back carries one, breaks the pairing → that pair and every later pair to Needs Review
     (E107) – one missing page shifts every pair after it."""
     s = ctx.settings
-    singles = _split_local(data, 1)
-    if not singles:
-        raise RuntimeError("PDF has no pages")
+    # M-4: a file that can never be read goes whole to Needs Review up front – no OCR call, no retry loop.
+    max_mb = float(s.get("intake.max_upload_mb", 50))
+    if len(data) > max_mb * 1024 * 1024:
+        raise WholeUploadReview("E108", f"file is {len(data) / 1024 / 1024:.1f} MB, over the {max_mb:g} MB limit "
+                                        "(intake.max_upload_mb) – split it into smaller files and upload again")
+    try:
+        singles = _split_local(data, 1)
+    except PdfUnreadable as e:
+        raise WholeUploadReview("E103", str(e))
     ctx.event("INFO", "Intake", f"'{name}': {len(singles)} page(s) – reading them now")
     done = [0]
 

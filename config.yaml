@@ -60,6 +60,7 @@ intake:
   # A-08/D1: an upload whose OCR keeps failing stays in the inbox and is retried next cycle; once it has been
   # failing for longer than this window the WHOLE upload moves to Needs Review (alert + reason), not forever.
   ocr_fail_give_up_minutes: 30
+  max_upload_mb: 50           # M-4: a bigger upload goes whole to Needs Review (E108) before any OCR call
   # Switched to the in-house APIs 2026-10-27 (A-05, A-07, Phase B green). D1: one reader, no silent fallback.
   # Pages per paper are decided from the OCR'd IDs (ADR-0006) – state_config.csv → pages_per_paper.
   split_provider: zoop_api    # local (pypdf) | zoop_api

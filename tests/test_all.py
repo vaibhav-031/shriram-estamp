@@ -2038,3 +2038,48 @@ def test_ocr_auth_failure_event_carries_e113(env):
     assert run_cycle(Ctx(s, db, g, ocr=FakeOcr(fail={"vendor_MH_200_1.pdf_p1": ApiAuthError("refused (HTTP 401)")})))
     ev = [e["details"] for e in db.q("SELECT details FROM events WHERE level='ERROR' AND details LIKE '%[E113]%'")]
     assert ev and "401" in ev[0], ev
+
+
+# ------------------------------------------------------------ M-4: unreadable / oversized PDFs go whole to review, early
+
+def _encrypted_pdf() -> bytes:
+    import io as _io
+    from pypdf import PdfReader, PdfWriter
+    w = PdfWriter()
+    for p in PdfReader(_io.BytesIO(samples.paper_page(samples.cert("MH", 1), 200))).pages:
+        w.add_page(p)
+    w.encrypt("secret")
+    buf = _io.BytesIO()
+    w.write(buf)
+    return buf.getvalue()
+
+
+@e2e
+@pytest.mark.parametrize("data,needle", [(_encrypted_pdf(), "password-protected"),
+                                         (b"%PDF-1.4\n not really a pdf", "can't be opened")], ids=["encrypted", "corrupt"])
+def test_unreadable_pdf_goes_whole_to_review_with_e103(env, data, needle):
+    from estamp.cycle import run_cycle
+    from fake_apis import FakeOcr
+    s, db, g = env
+    g.add("locked.pdf", PDF, _vendor_folder(g, s), data)
+    ocr = FakeOcr()
+    assert run_cycle(Ctx(s, db, g, ocr=ocr))
+    status, notes, path = _upload_review(db, g, s, "locked.pdf")
+    assert status == "REVIEW" and "E103" in notes and needle in notes and path.startswith("needs_review/"), notes
+    assert ocr.calls == [] and db.q1("SELECT count(*) n FROM papers")["n"] == 0
+    assert _events(db, "%[E103]%")
+
+
+@e2e
+def test_oversized_upload_goes_whole_to_review_before_any_ocr_call(env, monkeypatch):
+    from estamp.cycle import run_cycle
+    from estamp.errors import CATALOGUE
+    from fake_apis import FakeOcr
+    s, db, g = env
+    monkeypatch.setitem(s.raw["intake"], "max_upload_mb", 0.001)       # ~1 KB, smaller than any sample PDF
+    _stock(g, s, "MH", 200, 2)
+    ocr = FakeOcr()
+    assert run_cycle(Ctx(s, db, g, ocr=ocr))
+    status, notes, path = _upload_review(db, g, s, "vendor_MH_200_1.pdf")
+    assert status == "REVIEW" and "E108" in notes and "MB" in notes and path.startswith("needs_review/"), notes
+    assert ocr.calls == [] and "E108" in CATALOGUE
