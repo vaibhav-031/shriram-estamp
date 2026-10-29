@@ -150,3 +150,28 @@ def test_alerts_go_out_error_first_so_the_cap_never_drops_a_critical():
     assert bullets[:2] == ["• ERROR · Allocate: critical A", "• ERROR · Cycle: critical B"]
     assert bullets[2:] == [f"• WARN · Intake: w{i}" for i in range(38)]          # stable within a level
     assert sent[0][-1] == "… 8 more – see the Log tab"
+
+
+def test_lock_connection_has_tcp_keepalives(monkeypatch):
+    # A half-open lock session must error out (→ lock_held False) rather than hang the cycle forever.
+    import psycopg
+
+    from estamp.db import DB
+    seen = {}
+
+    class Conn:
+        def execute(self, *a):
+            return self
+
+        def fetchone(self):
+            return (True,)
+
+    def fake_connect(url, **kw):
+        seen.update(kw)
+        return Conn()
+
+    db = DB.__new__(DB)
+    db.url, db.schema, db._lock_conn = "postgresql://x", "estamp_test", None
+    monkeypatch.setattr(psycopg, "connect", fake_connect)
+    assert db.try_lock()
+    assert seen.get("keepalives") == 1 and seen.get("connect_timeout")

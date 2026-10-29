@@ -47,7 +47,7 @@ def run_cycle(ctx: Ctx) -> bool:
         return True
     crashed = db.close_crashed_runs()   # we hold the lock, so any still-open run died hard (M-7)
     if crashed:
-        ctx.event("INFO", "Recovery", f"{len(crashed)} earlier cycle(s) never finished (process killed?) – "
+        ctx.event("WARN", "Recovery", f"{len(crashed)} earlier cycle(s) never finished (process killed?) – "
                   "marked as crashed; stuck LANs/papers are handled by the recovery step.")
     run_id = db.start_run()
     ok = True

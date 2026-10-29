@@ -202,3 +202,24 @@ def test_login_leaves_the_token_owner_only(tmp_path, monkeypatch):
     monkeypatch.setattr(gc, "Google", FakeGoogle)
     assert cli.main(["login", "--config", str(cfg)]) == 0
     assert token.stat().st_mode & 0o077 == 0
+
+
+def test_only_the_credential_file_run_loads_is_checked(tmp_path, monkeypatch):
+    # client_secret.json (browser download, usually 0644) is only read by `login`, and a stray service_account.json
+    # is unused under oauth – neither may block run/run-once.
+    s, _ = _with_env_file(tmp_path, monkeypatch, 0o600)
+    for name in ("client_secret.json", "service_account.json"):
+        f = tmp_path / "secrets" / name
+        f.write_text("{}")
+        f.chmod(0o644)
+    s.raw["google"]["service_account_file"] = "secrets/service_account.json"
+    assert secret_file_problems(s) == []
+    s.raw["google"]["auth"] = "service_account"
+    assert [p for p in secret_file_problems(s) if "service_account.json" in p]
+
+
+def test_recheck_review_also_refuses_before_any_drive_or_db_work(tmp_path, monkeypatch):
+    _no_db_or_google(monkeypatch)
+    cfg = _config(tmp_path, monkeypatch, env=False)
+    with pytest.raises(SystemExit, match="T_OCR_KEY"):
+        cli.main(["recheck-review", "--config", str(cfg)])

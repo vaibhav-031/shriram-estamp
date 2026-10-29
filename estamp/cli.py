@@ -100,7 +100,7 @@ def main(argv=None) -> int:
             db.close()
 
     s, db, google = _build(args, need_google=args.command not in ("status",),
-                           startup_checks=args.command in ("run-once", "run"))
+                           startup_checks=args.command in ("run-once", "run", "recheck-review"))
     try:
         if args.command == "check-setup":
             return _check(s, db, google)
@@ -163,7 +163,7 @@ def _reset_test_data(s, db, confirm: bool, force: bool) -> int:
 
 # config and env check
 def _startup_checks(s) -> None:
-    """Refuse run/run-once with one message listing every missing key and readable secret (L-1, H-2)."""
+    """Refuse run/run-once/recheck-review with one message listing every missing key and readable secret (L-1, H-2)."""
     problems = startup_problems(s) + secret_file_problems(s)
     if not s.dry_run and not alert_channels(s):
         # same rule check-setup applies (#2); a dry run legitimately has no channel (config.dryrun.yaml)

@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shlex
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -154,7 +155,6 @@ def load_settings(config_path: str | os.PathLike = "config.yaml") -> Settings:
 # ocr_temp went away with Drive OCR, so neither is required to run.
 RUN_FOLDERS = (UPLOAD_INBOX, UPLOAD_ARCHIVE, NEEDS_REVIEW, INVENTORY_ROOT, ORDERS_INCOMING, ORDERS_PROCESSED,
                ORDERS_REJECTED, OUTPUT_ROOT, BACKUP_ROOT)
-SECRET_FILE_KEYS = ("google.oauth_client_file", "google.oauth_token_file", "google.service_account_file")
 
 
 def startup_problems(s: Settings) -> list[str]:
@@ -177,27 +177,33 @@ def startup_problems(s: Settings) -> list[str]:
             out.append(f"{ocr.get(k) or 'zoop_api.ocr.' + k} is not set in .env (OCR API)")
     if s.get("intake.split_provider", "local") == "zoop_api" and not s.get("zoop_api.split.url"):
         out.append("zoop_api.split.url is not set (intake.split_provider is zoop_api)")
-    sa = s.get("google.auth", "oauth") == "service_account"
-    cred = "google.service_account_file" if sa else "google.oauth_token_file"
+    sa, cred = _credential_key(s)
     if not s.get(cred) or not s.path(cred).is_file():
         out.append(f"{cred} ({s.get(cred) or 'unset'}) does not exist"
                    + ("" if sa else " – run `python -m estamp login` first"))
     return out
 
 
+def _credential_key(s: Settings) -> tuple[bool, str]:
+    """(service account?, config key of the one Google credential file a run loads)."""
+    sa = s.get("google.auth", "oauth") == "service_account"
+    return sa, "google.service_account_file" if sa else "google.oauth_token_file"
+
+
 def secret_file_problems(s: Settings) -> list[str]:
-    """.env and the Google credential files that exist, if group/other can read them (H-2): on a shared host a
-    readable token is a full-Drive compromise. Stats modes only – never reads contents. Skipped on Windows,
-    where st_mode carries no real group/other bits (ACLs guard those files instead)."""
+    """.env and the Google credential file a run loads, if group/other can read them (H-2): on a shared host a
+    readable token is a full-Drive compromise. Stats modes only – never reads contents. client_secret.json is only
+    read by `login`, so it isn't checked here. Skipped on Windows, where st_mode carries no real group/other bits."""
     if os.name == "nt":
         return []
-    paths = [s.base_dir / ".env"] + [s.path(k) for k in SECRET_FILE_KEYS if s.get(k)]
+    _, cred = _credential_key(s)
+    paths = [s.base_dir / ".env"] + ([s.path(cred)] if s.get(cred) else [])
     out = []
-    for p in dict.fromkeys(paths):
+    for p in paths:
         try:
             mode = p.stat().st_mode
         except OSError:
             continue                  # not there (optional, or caught by startup_problems)
-        if p.is_file() and mode & 0o077:
+        if stat.S_ISREG(mode) and mode & 0o077:
             out.append(f"{p} is readable by other users (mode {mode & 0o777:o}) – run: chmod 600 {shlex.quote(str(p))}")
     return out

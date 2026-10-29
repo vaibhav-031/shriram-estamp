@@ -246,7 +246,9 @@ class DB:
         return zlib.crc32(f"estamp:{self.schema}".encode())
 
     def try_lock(self) -> bool:
-        self._lock_conn = psycopg.connect(self.url, autocommit=True)
+        # keepalives: a half-open session (NAT/network drop) must error out so lock_held() says False, not hang (M-2)
+        self._lock_conn = psycopg.connect(self.url, autocommit=True, connect_timeout=10, keepalives=1,
+                                          keepalives_idle=30, keepalives_interval=10, keepalives_count=3)
         got = self._lock_conn.execute("SELECT pg_try_advisory_lock(%s)", (self._lock_key,)).fetchone()[0]
         if not got:
             self._lock_conn.close()
