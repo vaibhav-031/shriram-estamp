@@ -48,7 +48,8 @@ class FakeGoogle:
     # ---------------------------------------------------------------- Drive API surface
     def get_file(self, fid):
         f = self.files[fid]
-        return {k: f[k] for k in ("id", "name", "mimeType", "parents", "trashed", "modifiedTime", "md5Checksum")}
+        # a key a test deleted (e.g. modifiedTime, L-2) is left out, like Drive omitting a field
+        return {k: f[k] for k in ("id", "name", "mimeType", "parents", "trashed", "modifiedTime", "md5Checksum") if k in f}
 
     def list_children(self, folder_id, folders=None):
         out = []
@@ -58,7 +59,7 @@ class FakeGoogle:
             if folders is False and f["mimeType"] == FOLDER:
                 continue
             out.append(self.get_file(f["id"]))
-        return sorted(out, key=lambda f: f["modifiedTime"])
+        return sorted(out, key=lambda f: f.get("modifiedTime", ""))
 
     def child_exists(self, folder_id, name):
         return self.child_id(folder_id, name) is not None

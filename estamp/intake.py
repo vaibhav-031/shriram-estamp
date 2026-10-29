@@ -74,17 +74,34 @@ def _ensure_vendor_folders(ctx: Ctx) -> None:
             g.folder_path(inbox, [v.name])
 
 
+_first_seen: dict[str, datetime] = {}     # L-2: Drive file id → when we first saw it without a usable modifiedTime
+
+
+def _modified(ctx: Ctx, f: dict) -> datetime:
+    """Drive's modifiedTime; a file missing it (or with garbage) counts as uploaded when this process first saw it,
+    so it waits out the settle window instead of crashing the loop. Logged once per file."""
+    try:
+        return parse_time(f["modifiedTime"])
+    except (KeyError, TypeError, ValueError, AttributeError):
+        if f["id"] not in _first_seen:
+            _first_seen[f["id"]] = datetime.now(timezone.utc)
+            ctx.event("INFO", "Intake", f"'{f.get('name')}' came from Drive with no modifiedTime – treated as just "
+                      "uploaded (waits out the settle window)", ref=f["id"])
+        return _first_seen[f["id"]]
+
+
 def run_intake(ctx: Ctx, deadline: float) -> None:
     g, s = ctx.google, ctx.settings
     inbox = s.folder(UPLOAD_INBOX)
     settle = int(s.get("intake.settle_minutes", 5)) * 60
     _ensure_vendor_folders(ctx)
     files, folders = _collect(g, inbox)
-    for f in sorted(files, key=lambda x: x["modifiedTime"]):
+    when = {f["id"]: _modified(ctx, f) for f in files}
+    for f in sorted(files, key=lambda x: when[x["id"]]):
         if time.time() > deadline:
             ctx.event("INFO", "Intake", "time budget for intake reached – continuing next cycle")
             return
-        age = (datetime.now(timezone.utc) - parse_time(f["modifiedTime"])).total_seconds()
+        age = (datetime.now(timezone.utc) - when[f["id"]]).total_seconds()
         if age < settle:
             continue
         vendor = _resolve_vendor(s, f.get("_vendor_folder"))

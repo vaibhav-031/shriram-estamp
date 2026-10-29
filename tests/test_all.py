@@ -2085,6 +2085,37 @@ def test_oversized_upload_goes_whole_to_review_before_any_ocr_call(env, monkeypa
     assert ocr.calls == [] and "E108" in CATALOGUE
 
 
+# ------------------------------------------------------------ L-2: a Drive file without modifiedTime
+
+@e2e
+def test_upload_without_modified_time_is_read_not_crashed(env):
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    up = _stock(g, s, "MH", 200, 2)
+    del g.files[up]["modifiedTime"]
+    assert run_cycle(_ctx(s, db, g))
+    assert db.q1("SELECT count(*) n FROM papers WHERE status='AVAILABLE'")["n"] == 2
+    assert len(_events(db, "%no modifiedTime%")) == 1
+
+
+@e2e
+def test_upload_without_modified_time_waits_out_the_settle_window_and_logs_once(env, monkeypatch):
+    import estamp.intake as intake
+    from datetime import datetime, timedelta, timezone
+    from estamp.cycle import run_cycle
+    s, db, g = env
+    monkeypatch.setitem(s.raw["intake"], "settle_minutes", 5)
+    up = _stock(g, s, "MH", 200, 1)
+    del g.files[up]["modifiedTime"]
+    for _ in range(2):
+        assert run_cycle(_ctx(s, db, g))
+        assert [f["id"] for f in _inbox_files(g, s)] == [up], "still settling"
+    assert len(_events(db, "%no modifiedTime%")) == 1, "logged once, not every cycle"
+    intake._first_seen[up] = datetime.now(timezone.utc) - timedelta(minutes=6)      # the window has passed
+    assert run_cycle(_ctx(s, db, g))
+    assert db.q1("SELECT count(*) n FROM papers WHERE status='AVAILABLE'")["n"] == 1
+
+
 # ------------------------------------------------------------ L-4: OCR text fed to the regexes is capped
 
 def test_normalize_ocr_caps_its_input_at_the_storage_cap():
