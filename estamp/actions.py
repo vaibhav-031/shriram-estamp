@@ -21,7 +21,7 @@ from .allocate import label_for
 from .constants import INVENTORY_ROOT
 from .context import Ctx
 from .db import UniqueViolation
-from .extract import id_format_ok, parse_amount
+from .extract import canonical_lan, id_format_ok, parse_amount
 from .outputs import output_sheet_id
 
 REVIEW_TAB, ORDER_TAB, MANUAL_TAB = "Review Actions", "Order Actions", "Manual Issues"
@@ -139,7 +139,7 @@ def _re_ocr(ctx: Ctx, p: dict) -> str:
 
 def _order(ctx: Ctx, row: list[str]) -> str:
     db, g, s = ctx.db, ctx.google, ctx.settings
-    lan_key, action = row[0].strip().upper(), row[1].strip().upper()
+    lan_key, action = canonical_lan(row[0]), row[1].strip().upper()   # ops may type spaces / lowercase (ADR-0008)
     rows = db.q("SELECT * FROM orders WHERE lan_key=%s AND status <> 'CANCELLED' ORDER BY id", (lan_key,))
     if not rows:
         return "ERROR: LAN not found (or already cancelled)"
@@ -224,7 +224,7 @@ def _manual_issue(ctx: Ctx, row: list[str]) -> str:
     record it exactly like an auto issue (order→DONE, paper→ASSIGNED, allocation → Output sheet). The record
     is a single CAS-guarded transaction (db.record_manual_issue), so a race can never double-issue a LAN."""
     db = ctx.db
-    lan_key, cert, issued_by = row[0].strip().upper(), row[1].strip().upper(), row[2].strip()
+    lan_key, cert, issued_by = canonical_lan(row[0]), row[1].strip().upper(), row[2].strip()
     o = db.q1("SELECT * FROM orders WHERE lan_key=%s AND status='PENDING' ORDER BY id", (lan_key,))
     if not o:
         cur = db.q1("SELECT status FROM orders WHERE lan_key=%s ORDER BY id DESC LIMIT 1", (lan_key,))

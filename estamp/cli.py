@@ -82,8 +82,12 @@ def main(argv=None) -> int:
         return 0
 
     if args.command == "init-db":
+        from .db import LanKeyCollision
         s, db, _ = _build(args, need_google=False)
-        db.init_schema()
+        try:
+            db.init_schema()
+        except LanKeyCollision as e:   # ADR-0008: never auto-merge two open orders – a human decides
+            raise SystemExit(f"init-db stopped: {e}")
         print(f"Schema '{s.schema}' ready.")
         return 0
 
@@ -162,7 +166,8 @@ def _require_current_schema(s, db, warn_only: bool = False) -> None:
     missing = db.missing_schema()
     if missing:
         msg = (f"Postgres schema '{s.schema}' is out of date – missing: {', '.join(missing)}.\n"
-               f"Run `python -m estamp init-db` first (additive only: adds what is missing, changes no rows).")
+               f"Run `python -m estamp init-db` first (adds what is missing; the only rows it changes are order "
+               f"lan_keys re-keyed to the canonical LAN form, ADR-0008).")
         if not warn_only:
             raise SystemExit(msg)
         print("WARNING:", msg, "\n")

@@ -73,7 +73,8 @@ _Avoid_: override, manual fix
 ## Orders and issue
 
 **LAN**:
-A Shriram loan account number; each LAN receives at most one live paper.
+A Shriram loan account number; each LAN receives at most one live paper. Two LANs are the same LAN when their
+**LAN keys** (all whitespace removed, uppercased; leading zeros kept) are equal – ADR-0008.
 _Avoid_: order, loan, customer
 
 **Order file**:

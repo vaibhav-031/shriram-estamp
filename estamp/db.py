@@ -20,6 +20,8 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
+from .extract import canonical_lan
+
 SCHEMA_SQL = """
 CREATE SCHEMA IF NOT EXISTS {schema};
 SET search_path TO {schema};
@@ -152,6 +154,10 @@ CREATE TABLE IF NOT EXISTS runs (
 LIVE_ORDER_STATUSES = ("PENDING", "ALLOCATING", "DONE", "ERROR")
 
 
+class LanKeyCollision(RuntimeError):
+    """ADR-0008 re-key found open orders that were different LANs under the old key but are one LAN now."""
+
+
 def expected_schema() -> tuple[dict[str, set[str]], set[str]]:
     """({table: columns}, index names) that SCHEMA_SQL defines – read from SCHEMA_SQL itself, so a new
     column or index added there is checked automatically (no second list to keep in sync)."""
@@ -180,6 +186,49 @@ class DB:
     def init_schema(self) -> None:
         with psycopg.connect(self.url, autocommit=True) as c:
             c.execute(SCHEMA_SQL.format(schema=self.schema))
+        self.rekey_lans()
+
+    # Superset of the orders whose lan_key may not be canonical_lan(lan), so neither the schema check nor the
+    # re-key reads the whole (ever-growing) ledger: a row is skipped only if its key is plain [A-Z0-9_/-], equals
+    # upper(lan), and lan is printable ASCII – then lan has no whitespace and its key is already canonical.
+    _LAN_REKEY_CANDIDATES = r"""SELECT id, lan, lan_key, state, status FROM orders
+        WHERE lan_key !~ '^[A-Z0-9_/-]*$' OR lan_key IS DISTINCT FROM upper(lan) OR lan ~ '[^\x20-\x7E]'"""
+
+    def _stale_lan_rows(self, rows: list[dict]) -> list[dict]:
+        return [r for r in rows if r["lan_key"] != canonical_lan(r["lan"])]
+
+    def rekey_lans(self) -> int:
+        """ADR-0008 migration: key every order by the canonical LAN form. Idempotent – only rows whose lan_key
+        differs are touched; the raw lan is never changed. If open (non-CANCELLED) rows that were different keys
+        before would now share one key, that is a possible double issue: NOTHING is re-keyed or merged – raise
+        LanKeyCollision naming the rows for a human. Returns the number of rows re-keyed."""
+        with self.conn() as c, c.transaction():
+            c.execute("LOCK TABLE orders IN SHARE ROW EXCLUSIVE MODE")   # no ingest / action can slip in mid-way
+            stale = self._stale_lan_rows(c.execute(self._LAN_REKEY_CANDIDATES).fetchall())
+            if not stale:
+                return 0
+            # A clash needs a stale row, so only the open rows already holding (or about to get) its key matter.
+            rows = c.execute("""SELECT id, lan, lan_key, state, status FROM orders WHERE status <> 'CANCELLED'
+                                AND (lan_key = ANY(%s) OR id = ANY(%s)) ORDER BY id""",
+                             (sorted({canonical_lan(r["lan"]) for r in stale}), [r["id"] for r in stale])).fetchall()
+            groups: dict[str, list[dict]] = {}
+            for r in rows:
+                groups.setdefault(canonical_lan(r["lan"]), []).append(r)
+            clash = {k: g for k, g in groups.items() if len({r["lan_key"] for r in g}) > 1}
+            if clash:
+                raise LanKeyCollision(
+                    f"{len(clash)} LAN(s) would merge open orders under one canonical LAN key (ADR-0008). Schema "
+                    "changes were applied, but NO order was re-keyed and the service stays stopped. Check with Shriram "
+                    "which order is real, cancel the other(s) by hand – UPDATE orders SET status='CANCELLED', "
+                    "notes='ADR-0008 duplicate of order <id>', updated_at=now() WHERE id=<id> (a DONE order's paper "
+                    "also needs returning) – then run init-db again. Rows: "
+                    + " | ".join(f"{k}: " + ", ".join(f"order {r['id']} '{r['lan']}' {r['state']} {r['status']}"
+                                                      for r in g) for k, g in sorted(clash.items())))
+            with c.cursor() as cur:
+                cur.executemany("UPDATE orders SET lan_key=%s WHERE id=%s",
+                                [(canonical_lan(r["lan"]), r["id"]) for r in stale])
+        self.event("INFO", "Migration", f"{len(stale)} order(s) re-keyed to the canonical LAN form (ADR-0008)")
+        return len(stale)
 
     def missing_schema(self) -> list[str]:
         """What SCHEMA_SQL defines but this schema lacks ('table x', 'x.col', 'index y'); [] = up to date.
@@ -201,7 +250,12 @@ class DB:
                 missing.append(f"table {table}")
                 continue
             missing += [f"{table}.{c}" for c in sorted(cols) if (table, c) not in have]
-        return missing + [f"index {i}" for i in sorted(want_idx - have_idx)]
+        missing += [f"index {i}" for i in sorted(want_idx - have_idx)]
+        if ("orders", "lan_key") in have and ("orders", "lan") in have:   # data, not shape: ADR-0008 re-key pending
+            stale = len(self._stale_lan_rows(self.q(self._LAN_REKEY_CANDIDATES)))
+            if stale:
+                missing.append(f"orders.lan_key not canonical ({stale} rows) – ADR-0008")
+        return missing
 
     def table_counts(self) -> dict[str, int]:
         """Row count per table in this schema, enumerated from information_schema (not hardcoded)."""

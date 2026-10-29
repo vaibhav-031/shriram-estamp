@@ -404,6 +404,17 @@ def parse_amount(v: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+_ASCII_UPPER = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def canonical_lan(lan: str) -> str:
+    """The one LAN form every match uses (ADR-0008): ALL whitespace removed (internal spaces, tabs, non-breaking
+    spaces) + ASCII uppercase. Leading zeros stay significant. The raw LAN is kept separately for display.
+    ASCII-only on purpose: str.upper() turns 'ﬁ' into 'FI' and 'ß' into 'SS', which could make pasted junk
+    equal a real LAN."""
+    return re.sub(r"\s+", "", str(lan or "")).translate(_ASCII_UPPER)
+
+
 @dataclass
 class OrderRow:
     lan: str
@@ -414,7 +425,7 @@ class OrderRow:
 
     @property
     def lan_key(self) -> str:
-        return self.lan.strip().upper()
+        return canonical_lan(self.lan)
 
 
 @dataclass
@@ -447,11 +458,13 @@ def parse_order_tabs(tabs: Iterable[tuple[str, list[list[str]]]], file_name: str
                 continue
             where = f"{title}!row {r + 1}"
             cell = lambda k: row[cols[k]] if 0 <= cols.get(k, -1) < len(row) else ""
-            lan = cell("lan")
+            # Display form: whitespace runs (tabs, NBSP, 500 spaces) → one space – it names <LAN>.pdf and the
+            # Output sheet row. Matching and the format check use the canonical key ("AB 123" is AB123).
+            lan = re.sub(r"\s+", " ", cell("lan"))
             if not lan:
                 out.invalid.append(f"{where}: LAN blank")
                 continue
-            if not lan_rx.match(lan):
+            if not lan_rx.match(canonical_lan(lan)):
                 out.invalid.append(f"{where}: LAN '{lan}' fails format check")
                 continue
             state = resolver.resolve(cell("state")) if cols.get("state", -1) >= 0 else ""

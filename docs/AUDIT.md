@@ -212,6 +212,13 @@ the cross-state CONFLICT guard both miss it, and both could be issued papers.
 **Fix:** decide the canonical LAN form with Shriram and normalize into `lan_key` (strip all internal
 whitespace; decide on leading-zero policy). Keep the raw `lan` for display. This is a domain decision —
 record it in an ADR.
+**Fixed:** ADR-0008. `canonical_lan()` (`estamp/extract.py`) = all whitespace removed + ASCII uppercase; leading
+zeros stay significant (real LANs start with letters – Shriram sample sheets). Used for order ingest/duplicates/CONFLICT,
+`orders.lan_key` (live-order unique index), Order Actions + Manual Issues lookups and the Output-sheet re-append
+guard; `lan_regex` runs on the canonical key, so `"TGHYDTW 2610260001"` is accepted (it was rejected before). The
+displayed LAN keeps its spaces, collapsed to one plain space.
+`init-db` re-keys old rows idempotently and stops (no merge) if two open orders would collapse onto one key; the CLI
+refuses to run until then. Tests: `tests/test_lan_key.py`.
 
 ### M-7 — `active_run_age_seconds` can misreport a wedged run after a hard crash
 **File:** `estamp/db.py:240-246`, consumed at `cycle.py:31-36`.
