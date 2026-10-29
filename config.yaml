@@ -56,7 +56,7 @@ orders:
     denomination: [stamp duty amount, stamp duty, denomination, stamp value, stamp amount]
 
 intake:
-  settle_minutes: 0           # ignore uploads still being copied in
+  settle_minutes: 3           # ignore uploads still being copied in (Drive for Desktop syncs; grace to pull back a wrong upload)
   # A-08/D1: an upload whose OCR keeps failing stays in the inbox and is retried next cycle; once it has been
   # failing for longer than this window the WHOLE upload moves to Needs Review (alert + reason), not forever.
   ocr_fail_give_up_minutes: 30

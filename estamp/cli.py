@@ -19,7 +19,7 @@ import sys
 
 from .constants import (BACKUP_ROOT, INVENTORY_ROOT, NEEDS_REVIEW, ORDERS_INCOMING, ORDERS_PROCESSED,
                         ORDERS_REJECTED, OUTPUT_ROOT, RECONCILIATION_ROOT, UPLOAD_ARCHIVE, UPLOAD_INBOX)
-from .context import Ctx, alert_channels, setup_logging
+from .context import Ctx, alert_channels, safe_console, setup_logging
 from .db import DB
 from .settings import load_settings
 
@@ -55,6 +55,7 @@ def main(argv=None) -> int:
     ap.add_argument("--yes", action="store_true", help="reset-test-data: skip the typed confirmation (scripted use)")
     ap.add_argument("--force", action="store_true", help="reset-test-data: allow a production-looking schema")
     args = ap.parse_args(argv)
+    safe_console()   # before any print: explain / login / check-setup print ✓ ✗ …
 
     if args.command == "explain":
         # No DB/Google – just the catalogue (like login, works offline).

@@ -43,6 +43,7 @@ def env():
     import psycopg
     from estamp.db import DB
     settings = load_settings(ROOT / "config.yaml")
+    settings.states["MH"].amounts = [200]      # these scenarios stock MH ₹200 (pre vendor sheet; shipped MH is ₹100)
     with psycopg.connect(DB_URL, autocommit=True) as c:
         c.execute("DROP SCHEMA IF EXISTS estamp_test CASCADE")
     settings.raw["db"]["schema"] = "estamp_test"

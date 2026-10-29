@@ -27,15 +27,24 @@ from fake_google import FakeGoogle  # noqa: E402
 
 @pytest.fixture(scope="session")
 def settings():
-    return load_settings(ROOT / "config.yaml")
+    return pin_test_world(load_settings(ROOT / "config.yaml"))
+
+
+def pin_test_world(s):
+    """The fixtures predate the vendor sheet (2026-10-29): front + back tests use real traditional RJ scans, the
+    end-to-end world stocks MH at ₹200 (₹100 is its "wrong amount"), and KL is the inactive state. Pin that world
+    here; the shipped values are checked against the sheet in test_state_config_matches_vendor_sheet."""
+    s.states["RJ"].pages_per_paper = 2
+    s.states["MH"].amounts = [200]
+    s.states["KL"].active = False
+    return s
 
 
 # ============================================================ pure logic
 
 def test_projection_loaded(settings):
     assert len(settings.states) == 27
-    assert sum(s.daily_qty for s in settings.states.values()) == 10790
-    assert not settings.states["KL"].active and not settings.states["SK"].active
+    assert sum(s.daily_qty for s in settings.states.values()) == 12_330
     assert settings.states["RJ"].amounts == [195]
 
 
@@ -1013,11 +1022,34 @@ def test_analyze_fields_ok_and_failures(settings, rm):
     assert any("inactive" in i for i in inactive.issues)
 
 
+# Ops' vendor sheet "Shriram Finanace daily orders" (2026-10-29) is the source of truth for state_config.csv:
+# state → (stamp duty, qty for 10 days, pages per paper). Stamp type E → 1 page; T + S(ingle) → 1; T + D(ouble) → 2.
+VENDOR_SHEET = {
+    # AGREEMENT EXPRESS
+    "RJ": (195, 6250, 1), "OD": (100, 2000, 2), "HP": (100, 1200, 1), "CH": (350, 1200, 1), "DL": (100, 3800, 1),
+    "HR": (100, 3100, 1), "TN": (200, 8200, 1), "WB": (100, 3000, 2), "JH": (100, 1300, 1), "UP": (100, 18450, 1),
+    "MP": (100, 7900, 2), "MH": (100, 30800, 1),
+    # PAPER EASE
+    "GJ": (300, 3650, 1), "KA": (500, 2800, 1), "CG": (50, 3750, 2), "PB": (350, 3300, 1), "JK": (350, 3300, 1),
+    "KL": (200, 1750, 1), "SK": (100, 850, 2), "TR": (200, 850, 1), "BR": (1000, 4500, 1), "UK": (100, 1100, 1),
+    "TS": (100, 3300, 1), "AP": (100, 4400, 1),
+    # SABDA
+    "AS": (100, 850, 1), "ML": (100, 850, 1), "MN": (100, 850, 1),
+}
+
+
+def test_state_config_matches_vendor_sheet():
+    shipped = load_settings(ROOT / "config.yaml")             # not the session copy, which pins a test world
+    got = {c: (st.amounts, st.daily_qty, st.pages_per_paper, st.active) for c, st in shipped.states.items()}
+    assert got == {c: ([amt], qty10 // 10, pages, True) for c, (amt, qty10, pages) in VENDOR_SHEET.items()}
+
+
 @pytest.mark.parametrize("cert,state,kind,pages", [
     ("IN-HP90000000000001A", "HP", "estamp", 1),     # e-stamps are always one page
     ("MP-DH318899", "MP", "physical", 2),            # traditional paper: front + back
-    ("RJ-S254201", "RJ", "physical", 2),
+    ("OD-123456", "OD", "physical", 2),
     ("HR-G1K2026A999", "HR", "physical", 1),         # state_config.csv: HR papers are one page
+    ("MH-G1K2026A999", "MH", "physical", 1),         # MH stock is digital only, one page, no IN-… number
     ("XX-123456", "", "physical", 2),                # unknown state → the safe default
 ])
 def test_pages_per_paper(settings, cert, state, kind, pages):

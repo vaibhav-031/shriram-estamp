@@ -51,7 +51,17 @@ def slack_body(lines: list[str]) -> str:
     return "\n".join(out)
 
 
+def safe_console() -> None:
+    """Windows consoles and pipes (e.g. under `make`) are cp1252, which has no ✗ / ✓ / … – print those as '?'
+    instead of failing the log line or crashing the command."""
+    import sys
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
+
+
 def setup_logging(settings: Settings) -> None:
+    safe_console()
     if log.handlers:
         return
     log.setLevel(logging.INFO)
@@ -61,7 +71,8 @@ def setup_logging(settings: Settings) -> None:
     log.addHandler(sh)
     log_dir = settings.base_dir / "logs"
     log_dir.mkdir(exist_ok=True)
-    fh = RotatingFileHandler(log_dir / "estamp.log", maxBytes=20 * 1024 * 1024, backupCount=10)
+    fh = RotatingFileHandler(log_dir / "estamp.log", maxBytes=20 * 1024 * 1024, backupCount=10,
+                             encoding="utf-8")   # never the Windows locale (cp1252)
     fh.setFormatter(fmt)
     log.addHandler(fh)
 

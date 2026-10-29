@@ -88,8 +88,8 @@ certificate; optional required text (e.g. "SHRIRAM"). Anything else → Needs Re
 
 **1 page or front + back:** the service reads every page first and decides per uploaded file. An e-stamp
 (`IN-…` certificate / `SUBIN-…` reference) is 1 page per paper; a traditional paper is **front + back = 2 pages**
-(a few states print single-page papers – `pages_per_paper` in `state_config.csv`, e.g. HR = 1). Put only one kind
-of paper in a file.
+(`pages_per_paper` in `state_config.csv`, from ops' vendor sheet: only OD, WB, MP, CG and SK are front + back;
+every other state is 1 page). Put only one kind of paper in a file.
 
 | You see | Why | What you do |
 |---|---|---|
@@ -125,9 +125,10 @@ Logs: `logs/estamp.log` (rotating), the **Log** tab, and the `events` table.
 
 ## 5. Config you will touch
 
-* `state_config.csv` – one row per state from the daily projection: amount, article, daily qty,
-  `buffer_days` (low-stock alert below daily_qty × buffer_days), `active`, extra spellings, cert codes.
-  Kerala (challan) and Sikkim (legal risk) ship **inactive**.
+* `state_config.csv` – one row per state. Source of truth: ops' vendor sheet "Shriram Finanace daily orders"
+  (stamp duty, 10-day qty ÷ 10 = daily qty, E / T + S / T + D → pages per paper). Also `buffer_days` (low-stock
+  alert below daily_qty × buffer_days), `active`, extra spellings, cert codes. All states ship **active**
+  (2026-10-29); set `active` to `no` to quarantine a state's papers and orders.
 * `config.yaml → intake.cert_patterns` – add a per-state pattern once you have sample papers.
 * `config.yaml → intake.required_text` – e.g. `["SHRIRAM"]` once samples confirm the party name prints.
 * `config.yaml → zoop_api` + `intake.split_provider / ocr_provider: zoop_api` – when the in-house APIs are ready.

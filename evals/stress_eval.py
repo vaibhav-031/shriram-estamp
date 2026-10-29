@@ -331,6 +331,8 @@ def main(argv=None) -> int:
     settings = load_settings(args.config)
     if args.live:
         settings.raw["dry_run"] = False
+    # The eval uploads and cycles straight away – the production settle window (3 min) would skip every upload.
+    settings.raw.setdefault("intake", {})["settle_minutes"] = 0
     if settings.dry_run:
         print("dry_run is ON – pass --live to run a real e2e (nothing will be written otherwise). Aborting.")
         return 2   # abort before any DB/Google connection so a non-live run has zero side effects
