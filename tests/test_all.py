@@ -1886,6 +1886,20 @@ def test_send_alerts_logs_when_slack_returns_http_error(settings, monkeypatch, c
     assert any("Slack alert failed" in r.message for r in caplog.records), caplog.text
 
 
+def test_run_forever_says_when_safe_to_stop(monkeypatch, caplog):
+    # Ops stop `run` with Ctrl+C: between cycles (while sleeping) nothing is in flight, so the log must say so.
+    import estamp.cycle as _c
+    class Stop(Exception):
+        pass
+    def sleep(_):
+        raise Stop
+    monkeypatch.setattr(_c, "run_cycle", lambda ctx: True)
+    monkeypatch.setattr(_c.time, "sleep", sleep)
+    with caplog.at_level("INFO"), pytest.raises(Stop):
+        _c.run_forever(lambda: None, 120)
+    assert any("safe to stop" in r.message and "120s" in r.message for r in caplog.records), caplog.text
+
+
 @e2e
 def test_lock_released_even_if_send_raises(env):
     # If _send blows up in the finally block, the advisory lock must still be released and the run

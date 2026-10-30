@@ -175,4 +175,5 @@ def run_forever(ctx_factory, interval: int) -> None:
             run_cycle(ctx)
         except Exception:
             log.exception("cycle failed outside the safety net")
+        log.info(f"cycle ended – safe to stop now (Ctrl+C); next cycle in {interval}s")
         time.sleep(interval)
