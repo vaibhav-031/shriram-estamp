@@ -79,6 +79,8 @@ intake:
   # The paper id becomes STATE-SERIAL, e.g. RJ-S254201. Add per-state patterns as you see more samples.
   serial_patterns:
     DEFAULT: '\b[A-Z]{1,2} ?\d{6}\b'               # e.g. "S 254201", "AB 123456"
+    JH: '[0-9A-F]{20}'                              # Jharkhand: the "Receipt Number", 20 hex chars (0fab62dd369fee381b59)
+    KL: 'KL[A-Z0-9]{16}'                            # Kerala: the GRN, "KL" + 16 = 18 chars (KL034705972202627E)
   # Amount: tried in order – e-stamp line first, then the face value printed on physical paper
   # e-stamp fallback id when the certificate no. isn't readable as text (group 1 = state code)
   estamp_ref_patterns:
@@ -110,7 +112,8 @@ zoop_api:                     # fill in when the in-house APIs are ready
   ocr:                        # contract: docs/api-samples/ocr/README.md
     url_env: ESTAMP_OCR_URL   # PRODUCTION endpoint comes from .env; dev falls back to `url` below
     url: https://dev-ai.zoop.one/parsely-top-layer/v1/ocr/do   # dev fallback only – set ESTAMP_OCR_URL for go-live
-    config_id: ocrc_2f0e4e33ae22475f976e4787d62e08e2
+    config_id_env: ESTAMP_OCR_CONFIG_ID   # PRODUCTION OCR config id comes from .env; dev falls back below
+    config_id: ocrc_2f0e4e33ae22475f976e4787d62e08e2   # dev config id
     api_key_env: ZOOP_OCR_API_KEY       # names of the .env variables – never the values
     org_acc_env: ZOOP_OCR_ORG_ACC
     timeout_s: 60             # per try, per page (real pages took 1–3 s)

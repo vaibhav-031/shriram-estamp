@@ -238,6 +238,7 @@ def test_recheck_review_works_from_fields_after_text_was_pruned(env, monkeypatch
     from estamp.actions import recheck_review
     from estamp.cycle import run_cycle
     s, db, g = env
+    monkeypatch.setattr(s.states["HR"], "amounts", [100])   # ₹101 must start out not allowed
     g.add("hr101.pdf", PDF, _inbox(g, s),
           samples.api_page(certification_no="G1K2026A991", state_code="HR", stamp_duty_amount="101"))
     assert run_cycle(Ctx(s, db, g, ocr=FakeApiOcr()))

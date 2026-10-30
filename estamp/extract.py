@@ -338,7 +338,10 @@ def id_from_fields(fields: dict, settings: Settings, matcher: CertMatcher, resol
                 return IdHit(ref, resolver.from_cert_code(raw) or state, raw, "estamp")
         return IdHit(ref, state, "", "estamp")
     if cert:
-        serial = re.sub(r"[^A-Z0-9]", "", cert)
+        serial = re.sub(r"[^A-Z0-9]", "", cert.upper())
+        pat = (settings.get("intake.serial_patterns") or {}).get(state)
+        if pat and not re.fullmatch(pat, serial) and re.fullmatch(pat, serial.replace("O", "0")):
+            serial = serial.replace("O", "0")   # OCR reads 0 as O (JH receipt 0fab… → OFAB…); only when that makes it valid
         return IdHit(f"{state}-{serial}" if state else serial, state, state, "physical")
     return None
 

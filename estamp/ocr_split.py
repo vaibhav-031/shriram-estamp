@@ -182,11 +182,12 @@ def _ocr_zoop(data: bytes, name: str, settings: Settings) -> OcrResult:
     # Production endpoint comes from .env (ESTAMP_OCR_URL); dev falls back to zoop_api.ocr.url in config.yaml.
     url = settings.env("zoop_api.ocr.url_env") or c.get("url")
     key, org = settings.env("zoop_api.ocr.api_key_env"), settings.env("zoop_api.ocr.org_acc_env")
-    if not url or not c.get("config_id"):
+    config_id = settings.env("zoop_api.ocr.config_id_env") or c.get("config_id")   # production config from .env
+    if not url or not config_id:
         raise RuntimeError("OCR endpoint not set – set ESTAMP_OCR_URL in .env (or zoop_api.ocr.url) and zoop_api.ocr.config_id")
     if not key or not org:
         raise RuntimeError(f"{c.get('api_key_env')} / {c.get('org_acc_env')} must be set in .env")
-    body = {"mode": "sync", "ocr_config_id": c["config_id"], "documents": [{"data": base64.b64encode(data).decode()}]}
+    body = {"mode": "sync", "ocr_config_id": config_id, "documents": [{"data": base64.b64encode(data).decode()}]}
     timeout = int(c.get("timeout_s", 60))
     try:
         res = api_call(settings, "ocr", lambda: requests.post(

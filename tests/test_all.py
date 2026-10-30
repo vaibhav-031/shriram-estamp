@@ -38,6 +38,7 @@ def pin_test_world(s):
     s.states["RJ"].pages_per_paper = 2
     s.states["MH"].amounts = [200]
     s.states["KL"].active = False
+    s.states["HR"].amounts = [100]          # ops confirmed ₹101 on 2026-10-30; fixtures use 100
     return s
 
 
@@ -816,6 +817,8 @@ def ocr_api(settings, split_api, monkeypatch):
     """OCR API configured with fake credentials; requests.post is the split_api recorder."""
     monkeypatch.setenv("ZOOP_OCR_API_KEY", "test-key-not-real")
     monkeypatch.setenv("ZOOP_OCR_ORG_ACC", "test-org-not-real")
+    for k in ("ESTAMP_OCR_URL", "ESTAMP_OCR_CONFIG_ID"):   # a developer's .env must not leak production into tests
+        monkeypatch.delenv(k, raising=False)
     return split_api
 
 
@@ -1028,7 +1031,7 @@ def test_analyze_fields_ok_and_failures(settings, rm):
 VENDOR_SHEET = {
     # AGREEMENT EXPRESS
     "RJ": (195, 6250, 1), "OD": (100, 2000, 2), "HP": (100, 1200, 1), "CH": (350, 1200, 1), "DL": (100, 3800, 1),
-    "HR": (100, 3100, 1), "TN": (200, 8200, 1), "WB": (100, 3000, 2), "JH": (100, 1300, 1), "UP": (100, 18450, 1),
+    "HR": (101, 3100, 1), "TN": (200, 8200, 1), "WB": (100, 3000, 2), "JH": (100, 1300, 1), "UP": (100, 18450, 1),
     "MP": (100, 7900, 2), "MH": (100, 30800, 1),
     # PAPER EASE
     "GJ": (300, 3650, 1), "KA": (500, 2800, 1), "CG": (50, 3750, 2), "PB": (350, 3300, 1), "JK": (350, 3300, 1),
@@ -2360,3 +2363,42 @@ def test_vendor_register_number_on_a_mp_back_page_does_not_break_the_pairing(env
     rows = db.q("SELECT cert_no, page_from, page_to, status FROM papers ORDER BY page_from")
     assert [(r["cert_no"], r["page_from"], r["page_to"], r["status"]) for r in rows] == [
         ("MP-DX594001", 1, 2, "AVAILABLE"), ("MP-DX594002", 3, 4, "AVAILABLE")], rows
+
+
+def test_ocr_config_id_is_taken_from_env_over_config(settings, ocr_api, monkeypatch):
+    """Production has its own OCR config (ESTAMP_OCR_CONFIG_ID in .env); config.yaml's config_id is the dev fallback."""
+    from estamp.ocr_split import _ocr_zoop
+    calls, reply = ocr_api
+    reply["resp"] = _ocr_resp(_f(certification_no="IN-HP90000000000001A", state_code="HP", stamp_duty_amount="100"))
+    monkeypatch.setenv("ESTAMP_OCR_CONFIG_ID", "ocrc_prod_test")
+    _ocr_zoop(b"%PDF-page", "up.pdf_p1", settings)
+    assert calls[-1]["json"]["ocr_config_id"] == "ocrc_prod_test"
+
+
+def test_jharkhand_receipt_number_is_the_paper_id_even_with_o_for_zero(settings, rm):
+    resolver, matcher = rm
+    """JH: the Receipt Number (20 hex chars) is the ID. The OCR API reads its leading zero as the letter O."""
+    from estamp.extract import analyze_fields
+    a = analyze_fields(_f(certification_no="OFAB62DD369FEE381B59", state_code="JH", stamp_duty_amount="100"),
+                       settings, matcher, lambda c: False, resolver)
+    assert a.ok, a.issues
+    assert (a.cert, a.state, a.amount) == ("JH-0FAB62DD369FEE381B59", "JH", 100)
+
+
+def test_kerala_grn_format_is_valid():
+    settings = load_settings(ROOT / "config.yaml")      # shipped: KL active (the session copy pins it off)
+    resolver = StateResolver(settings.states)
+    matcher = CertMatcher(settings.get("intake.cert_patterns"), resolver)
+    """KL: the GRN – 'KL' + 16 = 18 characters (e.g. KL034705972202627E) – is the paper ID."""
+    from estamp.extract import analyze_fields
+    a = analyze_fields(_f(certification_no="KL034705972202627E", state_code="KL", stamp_duty_amount="200"),
+                       settings, matcher, lambda c: False, resolver)
+    assert a.ok, a.issues
+    bad = analyze_fields(_f(certification_no="KL0347059722026", state_code="KL", stamp_duty_amount="200"),
+                         settings, matcher, lambda c: False, resolver)
+    assert not bad.ok
+
+
+def test_haryana_papers_are_101():
+    shipped = load_settings(ROOT / "config.yaml")
+    assert shipped.states["HR"].amounts == [101]
