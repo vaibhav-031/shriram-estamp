@@ -81,6 +81,12 @@ intake:
     DEFAULT: '\b[A-Z]{1,2} ?\d{6}\b'               # e.g. "S 254201", "AB 123456"
     JH: '[0-9A-F]{20}'                              # Jharkhand: the "Receipt Number", 20 hex chars (0fab62dd369fee381b59)
     KL: 'KL[A-Z0-9]{16}'                            # Kerala: the GRN, "KL" + 16 = 18 chars (KL034705972202627E)
+  # STOPGAP until the OCR config extracts these: when the OCR API returns no ID for a page, read it from the PDF's
+  # own text layer with these rules (state → id / amount regex, group 1 = the value). Remove once the OCR does it.
+  text_layer_ids:
+    KL:                                             # Kerala eTreasury receipt: "GRN: KL0347…", "Total 200.00"
+      id: 'GRN\s*:?\s*(KL[A-Z0-9]{16})\b'
+      amount: '\bTotal\s+([\d,]+)(?:\.\d+)?'
   # Amount: tried in order – e-stamp line first, then the face value printed on physical paper
   # e-stamp fallback id when the certificate no. isn't readable as text (group 1 = state code)
   estamp_ref_patterns:

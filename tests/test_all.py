@@ -2402,3 +2402,31 @@ def test_kerala_grn_format_is_valid():
 def test_haryana_papers_are_101():
     shipped = load_settings(ROOT / "config.yaml")
     assert shipped.states["HR"].amounts == [101]
+
+
+KL_TEXT = ("GOVERNMENT OF KERALAM\nGRN: KL034705972202627E\nRemittance Details Amount\n"
+           "0030-02-102-99-00 Non judicial 200.00\nTotal 200.00\nAmount in Words :\nTwo Hundred Rupees Only\n")
+
+
+def test_text_layer_fields_read_the_kerala_grn_and_total(settings):
+    from estamp.extract import text_layer_fields
+    f = text_layer_fields(KL_TEXT, settings.get("intake.text_layer_ids"))
+    assert {k: v.get("value") for k, v in f.items() if v} == {
+        "certification_no": "KL034705972202627E", "state_code": "KL", "stamp_duty_amount": "200"}
+    assert text_layer_fields("INDIA NON JUDICIAL\nDX 594001", settings.get("intake.text_layer_ids")) is None
+
+
+def test_ocr_without_an_id_falls_back_to_the_text_layer_for_kerala(settings, monkeypatch):
+    """Until the OCR config extracts the GRN: an OCR reply with no ID → the PDF's own text layer (Kerala only)."""
+    import io
+    from reportlab.pdfgen import canvas
+    from estamp import ocr_split
+    from estamp.ocr_split import OcrResult, read_paper
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf)
+    for i, line in enumerate(KL_TEXT.splitlines()):
+        c.drawString(72, 750 - 14 * i, line)
+    c.save()
+    monkeypatch.setattr(ocr_split, "_ocr_zoop", lambda d, n, s: OcrResult("", "", "zoop_api", fields=_f(), raw={}))
+    r = read_paper(buf.getvalue(), "KERALA.pdf_p1", settings)
+    assert r.via == "zoop_api+text" and r.fields["certification_no"]["value"] == "KL034705972202627E", r

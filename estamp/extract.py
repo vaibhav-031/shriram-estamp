@@ -320,6 +320,20 @@ def _field(fields: dict, name: str) -> str:
     return str(((fields or {}).get(name) or {}).get("value") or "").strip().upper()
 
 
+def text_layer_fields(text: str, rules: dict | None) -> dict | None:
+    """STOPGAP (intake.text_layer_ids): OCR-API-shaped fields read from a PDF's own text layer, for papers whose ID
+    the OCR config doesn't extract yet (Kerala GRN). None when no rule matches."""
+    for state, rule in (rules or {}).items():
+        m = re.search(rule.get("id", "(?!)"), text or "")
+        if not m:
+            continue
+        amt = re.search(rule["amount"], text) if rule.get("amount") else None
+        fields = {"certification_no": {"value": m.group(1)}, "state_code": {"value": state}}
+        fields["stamp_duty_amount"] = {"value": amt.group(1).replace(",", "")} if amt else {}
+        return fields
+    return None
+
+
 def id_from_fields(fields: dict, settings: Settings, matcher: CertMatcher, resolver: StateResolver) -> IdHit | None:
     """The paper's ID from the API fields: an e-stamp certificate (IN-…) as is, else its Unique Doc. Reference
     (SUBIN-…), else a traditional serial as STATE-SERIAL (state from state_code / state_name). None = no ID."""

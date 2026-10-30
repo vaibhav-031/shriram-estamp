@@ -149,9 +149,21 @@ def _split_zoop(data: bytes, name: str, settings: Settings, split_size: int = 1)
 # ---------------------------------------------------------------------------------- OCR
 
 def read_paper(data: bytes, name: str, settings: Settings) -> OcrResult:
-    """Read one paper with the in-house OCR API only (D1). On failure it raises – never falls back to Drive OCR
-    or the PDF text layer, so a wrong reading can't be silently issued."""
-    return _ocr_zoop(data, name, settings)
+    """Read one paper with the in-house OCR API (D1). On failure it raises – never falls back to Drive OCR or the
+    PDF text layer, so a wrong reading can't be silently issued. One STOPGAP (intake.text_layer_ids): when the API
+    answered but found no ID, a configured state's ID (Kerala GRN) is read from the PDF's own text layer."""
+    r = _ocr_zoop(data, name, settings)
+    f = r.fields or {}
+    if not any((f.get(k) or {}).get("value") for k in ("certification_no", "unique_doc_reference")):
+        from .extract import text_layer_fields
+        try:
+            text = "\n".join(p.extract_text() or "" for p in PdfReader(io.BytesIO(data)).pages)
+        except Exception:
+            return r
+        tf = text_layer_fields(text, settings.get("intake.text_layer_ids"))
+        if tf:
+            return OcrResult("", "", "zoop_api+text", fields={**f, **tf}, raw=r.raw)
+    return r
 
 
 class ConfiguredOcr:
