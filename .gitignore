@@ -8,3 +8,4 @@ __pycache__/
 
 # real OCR API responses from real papers – never commit (Vaibhav, 2026-10-27)
 .local/
+.claude/worktrees/
